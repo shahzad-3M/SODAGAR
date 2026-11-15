@@ -22,6 +22,7 @@ import {
   computeCategoryLevel,
   getCategoryBreadcrumb,
   getCategoryDescendantIds,
+  isMuzaffarabadCity,
   isProductPurchaseBlocked,
   isUpcomingCategoryName,
   isUserAuthorizedForStockTransfer,
@@ -719,6 +720,14 @@ async function startServer() {
   });
 
   // 7. CITIES & AREAS LOCATION MANAGEMENT
+  const parseOptionalDeliveryCharge = (raw: unknown): number | null | 'invalid' | undefined => {
+    if (raw === undefined) return undefined;
+    if (raw === null || raw === '') return null;
+    const num = Number(raw);
+    if (!Number.isFinite(num) || num < 0) return 'invalid';
+    return Math.round(num);
+  };
+
   app.get('/api/locations', (_req, res) => {
     res.json({ cities: getAllCitiesFromDb() });
   });
@@ -730,7 +739,12 @@ async function startServer() {
       return;
     }
     const name = String(req.body?.name || '').trim();
-    const allowed = req.body?.allowed !== false;
+    const allowed = isMuzaffarabadCity(name) ? true : req.body?.allowed !== false;
+    const parsedCharge = parseOptionalDeliveryCharge(req.body?.deliveryCharge);
+    if (parsedCharge === 'invalid') {
+      res.status(400).json({ error: 'Delivery charge must be 0 or greater.' });
+      return;
+    }
     if (!name) {
       res.status(400).json({ error: 'City name is required.' });
       return;
@@ -745,14 +759,31 @@ async function startServer() {
 
     const id = slugifyId('city', name) + '_' + Date.now().toString(36).slice(-4);
     const now = new Date().toISOString();
-    db.prepare('INSERT INTO cities (id, name, allowed, display_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)').run(
-      id,
-      name,
-      allowed ? 1 : 0,
-      existing.length + 1,
-      now,
-      now
-    );
+    const chargeToSave = parsedCharge !== undefined ? parsedCharge : isMuzaffarabadCity(name) ? 50 : null;
+    db.prepare(
+      'INSERT INTO cities (id, name, allowed, delivery_charge, display_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+    ).run(id, name, allowed ? 1 : 0, chargeToSave, existing.length + 1, now, now);
+    const profile = syncDeliveryCitiesIntoBusinessProfile(db);
+    broadcastSyncEvent('locations', req.header('x-client-id'));
+    res.json({ ok: true, cities: profile.deliveryCities, syncVersion: getSyncVersion() });
+  });
+
+  // Bulk toggle ON/OFF for all cities except Muzaffarabad
+  app.put('/api/cities/toggle-other-cities', (req, res) => {
+    const actor = resolveActor(req);
+    if (actor.role !== 'super_admin' && actor.role !== 'admin' && actor.role !== 'manager') {
+      res.status(403).json({ error: 'Unauthorized to manage delivery cities.' });
+      return;
+    }
+    const allowOtherCities = Boolean(req.body?.allowOtherCities);
+    const db = getDb();
+    const now = new Date().toISOString();
+    db.prepare(
+      "UPDATE cities SET allowed = ?, updated_at = ? WHERE LOWER(TRIM(name)) != 'muzaffarabad'"
+    ).run(allowOtherCities ? 1 : 0, now);
+    db.prepare(
+      "UPDATE cities SET allowed = 1, updated_at = ? WHERE LOWER(TRIM(name)) = 'muzaffarabad'"
+    ).run(now);
     const profile = syncDeliveryCitiesIntoBusinessProfile(db);
     broadcastSyncEvent('locations', req.header('x-client-id'));
     res.json({ ok: true, cities: profile.deliveryCities, syncVersion: getSyncVersion() });
@@ -774,7 +805,27 @@ async function startServer() {
     }
 
     const nextName = typeof req.body?.name === 'string' ? req.body.name.trim() : target.name;
-    const nextAllowed = req.body?.allowed !== undefined ? Boolean(req.body.allowed) : target.allowed;
+    if (isMuzaffarabadCity(target.name) && req.body?.allowed === false) {
+      res.status(400).json({ error: 'Muzaffarabad is the default active delivery city and cannot be turned off.' });
+      return;
+    }
+    const nextAllowed = isMuzaffarabadCity(nextName)
+      ? true
+      : req.body?.allowed !== undefined
+      ? Boolean(req.body.allowed)
+      : target.allowed;
+    const parsedCharge = parseOptionalDeliveryCharge(req.body?.deliveryCharge);
+    if (parsedCharge === 'invalid') {
+      res.status(400).json({ error: 'Delivery charge must be 0 or greater.' });
+      return;
+    }
+    const nextCharge =
+      parsedCharge !== undefined
+        ? parsedCharge
+        : target.deliveryCharge !== undefined
+        ? target.deliveryCharge
+        : null;
+
     if (!nextName) {
       res.status(400).json({ error: 'City name cannot be empty.' });
       return;
@@ -785,9 +836,10 @@ async function startServer() {
     }
 
     const now = new Date().toISOString();
-    db.prepare('UPDATE cities SET name = ?, allowed = ?, updated_at = ? WHERE id = ?').run(
+    db.prepare('UPDATE cities SET name = ?, allowed = ?, delivery_charge = ?, updated_at = ? WHERE id = ?').run(
       nextName,
       nextAllowed ? 1 : 0,
+      nextCharge,
       now,
       target.id
     );
@@ -818,14 +870,22 @@ async function startServer() {
       res.status(409).json({ error: `Area "${areaName}" already exists under ${city.name}.` });
       return;
     }
+    const parsedCharge = parseOptionalDeliveryCharge(req.body?.deliveryCharge);
+    if (parsedCharge === 'invalid') {
+      res.status(400).json({ error: 'Delivery charge must be 0 or greater.' });
+      return;
+    }
 
     const areaId = slugifyId('area', `${city.name}_${areaName}`) + '_' + Date.now().toString(36).slice(-4);
     const now = new Date().toISOString();
-    db.prepare('INSERT INTO city_areas (id, city_id, name, allowed, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)').run(
+    db.prepare(
+      'INSERT INTO city_areas (id, city_id, name, allowed, delivery_charge, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+    ).run(
       areaId,
       city.id,
       areaName,
       req.body?.allowed !== false ? 1 : 0,
+      parsedCharge !== undefined ? parsedCharge : null,
       now,
       now
     );
@@ -848,6 +908,18 @@ async function startServer() {
     }
     const nextName = typeof req.body?.name === 'string' ? req.body.name.trim() : String(areaRow.name);
     const nextAllowed = req.body?.allowed !== undefined ? Boolean(req.body.allowed) : Boolean(areaRow.allowed);
+    const parsedCharge = parseOptionalDeliveryCharge(req.body?.deliveryCharge);
+    if (parsedCharge === 'invalid') {
+      res.status(400).json({ error: 'Delivery charge must be 0 or greater.' });
+      return;
+    }
+    const nextCharge =
+      parsedCharge !== undefined
+        ? parsedCharge
+        : areaRow.delivery_charge !== null && areaRow.delivery_charge !== undefined
+        ? Number(areaRow.delivery_charge)
+        : null;
+
     if (!nextName) {
       res.status(400).json({ error: 'Area name cannot be empty.' });
       return;
@@ -861,9 +933,10 @@ async function startServer() {
       return;
     }
 
-    db.prepare('UPDATE city_areas SET name = ?, allowed = ?, updated_at = ? WHERE id = ?').run(
+    db.prepare('UPDATE city_areas SET name = ?, allowed = ?, delivery_charge = ?, updated_at = ? WHERE id = ?').run(
       nextName,
       nextAllowed ? 1 : 0,
+      nextCharge,
       new Date().toISOString(),
       String(areaRow.id)
     );

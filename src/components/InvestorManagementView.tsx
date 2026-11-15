@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   TrendingUp,
   DollarSign,
@@ -17,6 +17,7 @@ import {
   Users,
   Handshake,
   Save,
+  MessageSquare,
 } from 'lucide-react';
 import {
   AppUser,
@@ -36,6 +37,7 @@ import {
   getResellers,
   saveInvestors,
   saveInvestorTransactions,
+  saveProducts,
   saveResellers,
 } from '../utils/storage';
 import { openWhatsAppDirect } from '../utils/whatsapp';
@@ -45,6 +47,9 @@ interface InvestorManagementViewProps {
   userRole: UserRole;
   products: ProductItem[];
   profile: BusinessProfile;
+  investorsList?: Investor[];
+  onInvestorsUpdated?: (updated: Investor[]) => void;
+  onProductInvestorSynced?: (updatedProducts: ProductItem[]) => void;
 }
 
 export const InvestorManagementView: React.FC<InvestorManagementViewProps> = ({
@@ -52,10 +57,25 @@ export const InvestorManagementView: React.FC<InvestorManagementViewProps> = ({
   userRole,
   products,
   profile,
+  investorsList,
+  onInvestorsUpdated,
+  onProductInvestorSynced,
 }) => {
-  const [investors, setInvestors] = useState<Investor[]>(getInvestors);
+  const [investors, setInvestors] = useState<Investor[]>(() => investorsList || getInvestors());
   const [transactions, setTransactions] = useState<InvestorTransaction[]>(getInvestorTransactions);
   const [resellers, setResellers] = useState<Reseller[]>(getResellers);
+
+  useEffect(() => {
+    if (investorsList) {
+      setInvestors(investorsList);
+    }
+  }, [investorsList]);
+
+  const commitInvestorsUpdate = (updatedList: Investor[]) => {
+    saveInvestors(updatedList);
+    setInvestors(updatedList);
+    onInvestorsUpdated?.(updatedList);
+  };
 
   const isAdmin = userRole === 'super_admin' || userRole === 'admin';
   const currentInvestor = investors.find(
@@ -121,6 +141,9 @@ export const InvestorManagementView: React.FC<InvestorManagementViewProps> = ({
   const [txNotes, setTxNotes] = useState('');
   const [txRef, setTxRef] = useState('');
 
+  // Inline quick WhatsApp number entry inside Investor Details strip
+  const [inlineWhatsapp, setInlineWhatsapp] = useState('');
+
   const showNotification = (type: 'success' | 'error', message: string) => {
     setNotification({ type, message });
     setTimeout(() => setNotification(null), 5000);
@@ -130,6 +153,14 @@ export const InvestorManagementView: React.FC<InvestorManagementViewProps> = ({
   const activeInvestor = isAdmin
     ? investors.find((inv) => inv.id === selectedInvestorId) || investors[0]
     : currentInvestor;
+
+  useEffect(() => {
+    if (activeInvestor) {
+      setInlineWhatsapp(activeInvestor.whatsapp || activeInvestor.phone || '');
+    } else {
+      setInlineWhatsapp('');
+    }
+  }, [activeInvestor?.id, activeInvestor?.whatsapp, activeInvestor?.phone]);
 
   // Helper: Get normalized product allocations for any investor
   const getInvestorAllocations = (inv: Investor | undefined): InvestorProductAllocation[] => {
@@ -361,8 +392,7 @@ export const InvestorManagementView: React.FC<InvestorManagementViewProps> = ({
     }
 
     const updated = [...investors, newInv];
-    saveInvestors(updated);
-    setInvestors(updated);
+    commitInvestorsUpdate(updated);
     setSelectedInvestorId(newInv.id);
     setIsAddInvestorModalOpen(false);
 
@@ -467,15 +497,75 @@ export const InvestorManagementView: React.FC<InvestorManagementViewProps> = ({
     const updatedList = investors.map((inv) =>
       inv.id === activeInvestor.id ? updatedInvestor : inv
     );
-    saveInvestors(updatedList);
-    setInvestors(updatedList);
+    commitInvestorsUpdate(updatedList);
+
+    // Sync updated WhatsApp number across products linked to this investor
+    const nextWhatsapp = updatedInvestor.whatsapp || updatedInvestor.phone;
+    const linkedProductIds = new Set([
+      ...(updatedInvestor.assignedProductIds || []),
+      ...(updatedInvestor.productAllocations || []).map((a) => a.productId),
+    ]);
+    let productsChanged = false;
+    const syncedProducts = products.map((p) => {
+      const isLinked = p.investorId === activeInvestor.id || linkedProductIds.has(p.id);
+      if (isLinked && p.investorWhatsApp !== nextWhatsapp) {
+        productsChanged = true;
+        return {
+          ...p,
+          investorId: p.investorId || activeInvestor.id,
+          investorWhatsApp: nextWhatsapp,
+        };
+      }
+      return p;
+    });
+    if (productsChanged) {
+      saveProducts(syncedProducts);
+      onProductInvestorSynced?.(syncedProducts);
+    }
+
     setIsEditInvestorModalOpen(false);
     showNotification(
       'success',
-      `Updated investor profile for '${updatedInvestor.name}'${
-        updatedInvestor.isReseller ? ` (Reseller Active: ${updatedInvestor.linkedResellerCode})` : ''
+      `Updated investor profile for '${updatedInvestor.name}' (Inquiry WhatsApp: ${nextWhatsapp})${
+        updatedInvestor.isReseller ? ` · Reseller Active: ${updatedInvestor.linkedResellerCode}` : ''
       }.`
     );
+  };
+
+  const handleSaveInlineWhatsapp = () => {
+    if (!activeInvestor || !isAdmin) return;
+    const trimmed = inlineWhatsapp.trim();
+    if (!trimmed) {
+      showNotification('error', 'Please enter a valid WhatsApp number for this investor.');
+      return;
+    }
+    const updatedList = investors.map((inv) =>
+      inv.id === activeInvestor.id ? { ...inv, whatsapp: trimmed } : inv
+    );
+    commitInvestorsUpdate(updatedList);
+
+    const linkedIds = new Set([
+      ...(activeInvestor.assignedProductIds || []),
+      ...(activeInvestor.productAllocations || []).map((a) => a.productId),
+    ]);
+    let productsChanged = false;
+    const syncedProducts = products.map((p) => {
+      const isLinked = p.investorId === activeInvestor.id || linkedIds.has(p.id);
+      if (isLinked && p.investorWhatsApp !== trimmed) {
+        productsChanged = true;
+        return {
+          ...p,
+          investorId: p.investorId || activeInvestor.id,
+          investorWhatsApp: trimmed,
+        };
+      }
+      return p;
+    });
+    if (productsChanged) {
+      saveProducts(syncedProducts);
+      onProductInvestorSynced?.(syncedProducts);
+    }
+    showNotification('success', `Saved inquiry WhatsApp (${trimmed}) for ${activeInvestor.name}.`);
   };
 
   // Handler: Open Product Ownership & Manual Units Modal
@@ -545,8 +635,7 @@ export const InvestorManagementView: React.FC<InvestorManagementViewProps> = ({
           }
         : inv
     );
-    saveInvestors(updatedInvestors);
-    setInvestors(updatedInvestors);
+    commitInvestorsUpdate(updatedInvestors);
     setIsAssignModalOpen(false);
     showNotification(
       'success',
@@ -567,8 +656,7 @@ export const InvestorManagementView: React.FC<InvestorManagementViewProps> = ({
     const updatedInvestors = investors.map((inv) =>
       inv.id === activeInvestor.id ? { ...inv, productAllocations: updatedAllocs } : inv
     );
-    saveInvestors(updatedInvestors);
-    setInvestors(updatedInvestors);
+    commitInvestorsUpdate(updatedInvestors);
   };
 
   // Handler: Record Transaction
@@ -599,16 +687,14 @@ export const InvestorManagementView: React.FC<InvestorManagementViewProps> = ({
           ? { ...inv, settledProfit: (inv.settledProfit || 0) + Number(txAmount) }
           : inv
       );
-      saveInvestors(updatedInvestors);
-      setInvestors(updatedInvestors);
+      commitInvestorsUpdate(updatedInvestors);
     } else if (txType === 'investment_deposit') {
       const updatedInvestors = investors.map((inv) =>
         inv.id === activeInvestor.id
           ? { ...inv, totalInvestment: (inv.totalInvestment || 0) + Number(txAmount) }
           : inv
       );
-      saveInvestors(updatedInvestors);
-      setInvestors(updatedInvestors);
+      commitInvestorsUpdate(updatedInvestors);
     }
 
     setIsRecordTxModalOpen(false);
@@ -730,9 +816,13 @@ export const InvestorManagementView: React.FC<InvestorManagementViewProps> = ({
                 )}
               </div>
 
-              <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-slate-600 dark:text-slate-400">
+              <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 text-[11px] text-slate-600 dark:text-slate-400">
                 <span className="inline-flex items-center gap-1 font-mono">
                   <Phone className="w-3 h-3 text-slate-400" /> {activeInvestor.phone}
+                </span>
+                <span className="inline-flex items-center gap-1 font-mono text-teal-700 dark:text-teal-300 font-bold bg-teal-50 dark:bg-teal-950/50 px-2 py-0.5 rounded border border-teal-200 dark:border-teal-800">
+                  <MessageSquare className="w-3 h-3 text-teal-600 dark:text-teal-400" />
+                  Inquiry WhatsApp: {activeInvestor.whatsapp || activeInvestor.phone}
                 </span>
                 {activeInvestor.email && (
                   <span className="inline-flex items-center gap-1">
@@ -745,6 +835,33 @@ export const InvestorManagementView: React.FC<InvestorManagementViewProps> = ({
                   </span>
                 )}
               </div>
+
+              {/* Manual Entry of Investor's WhatsApp for Product Inquiries */}
+              {isAdmin && (
+                <div className="flex flex-wrap items-center gap-2 pt-1.5">
+                  <label className="text-[11px] font-bold text-slate-700 dark:text-slate-300">
+                    Manual Inquiry WhatsApp:
+                  </label>
+                  <input
+                    type="text"
+                    value={inlineWhatsapp}
+                    onChange={(e) => setInlineWhatsapp(e.target.value)}
+                    placeholder="e.g. 0300 1234567"
+                    className="w-40 px-2.5 py-1 text-xs font-mono rounded-lg border border-teal-300 dark:border-teal-700 bg-white dark:bg-slate-900 text-slate-900 dark:text-white focus:ring-2 focus:ring-teal-500 focus:outline-hidden"
+                  />
+                  <button
+                    type="button"
+                    onClick={handleSaveInlineWhatsapp}
+                    className="px-2.5 py-1 bg-teal-600 hover:bg-teal-700 text-white font-bold text-[11px] rounded-lg flex items-center gap-1 cursor-pointer transition-colors"
+                  >
+                    <Save className="w-3 h-3" />
+                    Save WhatsApp
+                  </button>
+                  <span className="text-[10px] text-slate-500 dark:text-slate-400">
+                    Customer product inquiries automatically go to this number.
+                  </span>
+                </div>
+              )}
 
               {activeInvestor.notes && (
                 <p className="text-[11px] text-slate-500 dark:text-slate-400 italic">
@@ -1156,15 +1273,15 @@ export const InvestorManagementView: React.FC<InvestorManagementViewProps> = ({
                 </div>
 
                 <div>
-                  <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1">
-                    WhatsApp Number:
+                  <label className="block text-xs font-bold text-teal-700 dark:text-teal-300 mb-1">
+                    Inquiry WhatsApp Number (Manual Entry):
                   </label>
                   <input
                     type="text"
                     placeholder="0300 1234567"
                     value={newInvWhatsapp}
                     onChange={(e) => setNewInvWhatsapp(e.target.value)}
-                    className="w-full px-3 py-2 text-xs font-mono rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-amber-400 focus:outline-hidden"
+                    className="w-full px-3 py-2 text-xs font-mono rounded-lg border border-teal-300 dark:border-teal-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-teal-500 focus:outline-hidden"
                   />
                 </div>
               </div>
@@ -1402,14 +1519,15 @@ export const InvestorManagementView: React.FC<InvestorManagementViewProps> = ({
                   />
                 </div>
                 <div>
-                  <label className="block font-bold text-slate-700 dark:text-slate-300 mb-1">
-                    WhatsApp Number
+                  <label className="block font-bold text-teal-700 dark:text-teal-300 mb-1">
+                    Inquiry WhatsApp Number (Manual Entry)
                   </label>
                   <input
                     type="text"
+                    placeholder="0300 1234567"
                     value={editWhatsapp}
                     onChange={(e) => setEditWhatsapp(e.target.value)}
-                    className="w-full px-3 py-2 font-mono rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white"
+                    className="w-full px-3 py-2 font-mono rounded-lg border border-teal-300 dark:border-teal-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-teal-500 focus:outline-hidden"
                   />
                 </div>
                 <div>

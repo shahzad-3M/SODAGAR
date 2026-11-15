@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import {
   Search,
   Filter,
@@ -26,10 +26,15 @@ import {
   FolderTree,
   ChevronDown,
 } from 'lucide-react';
-import { BusinessProfile, CartItem, CategoryRecord, Customer, ProductItem } from '../types';
+import { AppUser, BusinessProfile, CartItem, CategoryRecord, Customer, Investor, ProductItem } from '../types';
 import { ProductDetailsModal } from './ProductDetailsModal';
-import { openWhatsAppDirect } from '../utils/whatsapp';
-import { getCategoryRecords } from '../utils/storage';
+import {
+  buildDirectProductWhatsAppMessage,
+  buildInvestorProductInquiryMessage,
+  openWhatsAppDirect,
+  resolveProductInvestorContact,
+} from '../utils/whatsapp';
+import { getCategoryRecords, getInvestors } from '../utils/storage';
 import {
   UPCOMING_CATEGORY_ID,
   UPCOMING_CATEGORY_NAME,
@@ -44,6 +49,10 @@ interface StoreCatalogViewProps {
   profile: BusinessProfile;
   cart: CartItem[];
   categoryRecords?: CategoryRecord[];
+  investors?: Investor[];
+  initialProductId?: string | null;
+  onClearInitialProduct?: () => void;
+  onUpdateProduct?: (updatedProduct: ProductItem) => void;
   onAddToCart: (product: ProductItem, qty?: number) => void;
   onUpdateCartQty: (productId: string, qty: number) => void;
   onRemoveFromCart: (productId: string) => void;
@@ -58,6 +67,7 @@ interface StoreCatalogViewProps {
   isCustomerView?: boolean;
   hideCostPrice?: boolean;
   userRole?: string;
+  currentUser?: AppUser;
 }
 
 export const StoreCatalogView: React.FC<StoreCatalogViewProps> = ({
@@ -66,6 +76,10 @@ export const StoreCatalogView: React.FC<StoreCatalogViewProps> = ({
   profile,
   cart,
   categoryRecords,
+  investors,
+  initialProductId,
+  onClearInitialProduct,
+  onUpdateProduct,
   onAddToCart,
   onUpdateCartQty,
   onRemoveFromCart,
@@ -80,6 +94,7 @@ export const StoreCatalogView: React.FC<StoreCatalogViewProps> = ({
   isCustomerView = false,
   hideCostPrice = false,
   userRole = 'customer',
+  currentUser,
 }) => {
   const [sortBy, setSortBy] = useState<'default' | 'winning_profit' | 'highest_savings' | 'price_low' | 'price_high'>('default');
   const [customerTypeFilter, setCustomerTypeFilter] = useState<'all' | 'individual' | 'retail'>('all');
@@ -88,6 +103,29 @@ export const StoreCatalogView: React.FC<StoreCatalogViewProps> = ({
   const [isMobileFilterOpen, setIsMobileFilterOpen] = useState(false);
   const [isConfirmClearCartOpen, setIsConfirmClearCartOpen] = useState(false);
   const [expandedSidebarCats, setExpandedSidebarCats] = useState<Record<string, boolean>>({});
+
+  const effectiveInvestors = useMemo(
+    () => (investors && investors.length > 0 ? investors : getInvestors()),
+    [investors]
+  );
+
+  // Open product modal automatically if ?product=<id> deep-link is active
+  useEffect(() => {
+    if (!initialProductId) return;
+    const target = products.find((p) => p.id === initialProductId);
+    if (target) {
+      setSelectedDetailProduct(target);
+      onClearInitialProduct?.();
+    }
+  }, [initialProductId, products, onClearInitialProduct]);
+
+  const activeDetailProduct = useMemo(() => {
+    if (!selectedDetailProduct) return null;
+    return products.find((p) => p.id === selectedDetailProduct.id) || selectedDetailProduct;
+  }, [selectedDetailProduct, products]);
+
+  const canEditProductDetails =
+    !isCustomerView && (userRole === 'super_admin' || userRole === 'admin' || userRole === 'manager');
 
   const effectiveCatRecords = useMemo(
     () => (categoryRecords && categoryRecords.length > 0 ? categoryRecords : getCategoryRecords()),
@@ -736,88 +774,118 @@ export const StoreCatalogView: React.FC<StoreCatalogViewProps> = ({
                           Arrival: {product.expectedArrivalDate}
                         </div>
                       )}
-                      {isUpcomingBlocked ? (
-                        <div className="flex items-center gap-1">
-                          <button
-                            type="button"
-                            disabled
-                            className="flex-1 py-1.5 px-2 bg-slate-200 dark:bg-slate-800 text-slate-500 dark:text-slate-400 text-[10px] sm:text-[11px] font-bold rounded-lg cursor-not-allowed text-center truncate"
-                          >
-                            Coming Soon · View Only
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              const text = `السلام علیکم! میں *${product.name}* (Coming Soon) کے بارے میں معلومات اور آمد کی تفصیل معلوم کرنا چاہتا ہوں۔`;
-                              openWhatsAppDirect(product.investorWhatsApp || profile.phone || '03125256266', text);
-                            }}
-                            className="p-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg cursor-pointer transition-colors shadow-2xs"
-                            title="WhatsApp Inquiry"
-                          >
-                            <Phone className="w-3.5 h-3.5" />
-                          </button>
-                        </div>
-                      ) : (
-                        <div className="flex items-center gap-1">
-                          {inCart ? (
-                            <div className="flex-1 flex items-center justify-between bg-amber-50 dark:bg-amber-950/40 border border-amber-300 dark:border-amber-700 rounded-lg p-0.5">
+                      {(() => {
+                        const invContact = resolveProductInvestorContact(
+                          product,
+                          effectiveInvestors,
+                          profile.phone || '03125256266'
+                        );
+                        const activeCustomerName =
+                          currentUser?.isAuthenticated ? currentUser.name : undefined;
+                        const handleInvestorInquiry = () => {
+                          const text = buildInvestorProductInquiryMessage(product, profile, {
+                            customerName: activeCustomerName,
+                            investorName: invContact.investorName,
+                            imageUrl: product.imageUrl,
+                          });
+                          openWhatsAppDirect(invContact.whatsapp, text);
+                        };
+                        const handleDirectProductWhatsApp = () => {
+                          const text = buildDirectProductWhatsAppMessage(product, profile, {
+                            customerName: activeCustomerName,
+                            imageUrl: product.imageUrl,
+                          });
+                          openWhatsAppDirect(profile.phone || '03125256266', text);
+                        };
+                        const inquiryTitle = invContact.isInvestorAssigned
+                          ? `Product Inquiry to Investor (${invContact.investorName ? `${invContact.investorName} · ` : ''}${invContact.whatsapp})`
+                          : `Product Inquiry (${invContact.whatsapp})`;
+
+                        if (isUpcomingBlocked) {
+                          return (
+                            <div className="flex items-center gap-1">
                               <button
-                                onClick={() => onUpdateCartQty(product.id, inCart.quantity - 1)}
-                                className="w-6 h-6 flex items-center justify-center bg-white dark:bg-slate-800 text-slate-800 dark:text-white rounded shadow-2xs hover:bg-slate-100 cursor-pointer"
+                                type="button"
+                                disabled
+                                className="flex-1 py-1.5 px-2 bg-slate-200 dark:bg-slate-800 text-slate-500 dark:text-slate-400 text-[10px] sm:text-[11px] font-bold rounded-lg cursor-not-allowed text-center truncate"
                               >
-                                <Minus className="w-3 h-3" />
+                                Coming Soon · View Only
                               </button>
-                              <span className="font-mono font-bold text-[10px] sm:text-xs text-amber-900 dark:text-amber-200">
-                                {inCart.quantity} in cart
-                              </span>
                               <button
-                                onClick={() => onUpdateCartQty(product.id, inCart.quantity + 1)}
-                                className="w-6 h-6 flex items-center justify-center bg-amber-500 text-slate-950 rounded shadow-2xs hover:bg-amber-400 cursor-pointer"
+                                type="button"
+                                onClick={handleDirectProductWhatsApp}
+                                className="p-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg cursor-pointer transition-colors shadow-2xs shrink-0"
+                                title="WhatsApp Store Desk"
                               >
-                                <Plus className="w-3 h-3" />
+                                <Phone className="w-3.5 h-3.5" />
+                              </button>
+                              <button
+                                type="button"
+                                onClick={handleInvestorInquiry}
+                                className="p-1.5 bg-teal-600 hover:bg-teal-500 text-white rounded-lg cursor-pointer transition-colors shadow-2xs shrink-0"
+                                title={inquiryTitle}
+                                aria-label={inquiryTitle}
+                              >
+                                <Tag className="w-3.5 h-3.5" />
                               </button>
                             </div>
-                          ) : (
-                            <button
-                              onClick={() => onAddToCart(product, 1)}
-                              className="flex-1 inline-flex items-center justify-center gap-1 py-1.5 sm:py-2 px-2 bg-slate-900 hover:bg-slate-800 dark:bg-amber-500 dark:text-slate-950 dark:hover:bg-amber-400 text-white text-[10px] sm:text-[11px] font-bold rounded-lg shadow-2xs transition-colors cursor-pointer truncate"
-                            >
-                              <ShoppingBag className="w-3 h-3 shrink-0" />
-                              <span className="truncate">Add to Cart</span>
-                            </button>
-                          )}
+                          );
+                        }
 
-                          {/* Direct WhatsApp Ordering Button (Merchant/Admin view only) */}
-                          {!isCustomerView && (
+                        return (
+                          <div className="flex items-center gap-1">
+                            {inCart ? (
+                              <div className="flex-1 flex items-center justify-between bg-amber-50 dark:bg-amber-950/40 border border-amber-300 dark:border-amber-700 rounded-lg p-0.5">
+                                <button
+                                  onClick={() => onUpdateCartQty(product.id, inCart.quantity - 1)}
+                                  className="w-6 h-6 flex items-center justify-center bg-white dark:bg-slate-800 text-slate-800 dark:text-white rounded shadow-2xs hover:bg-slate-100 cursor-pointer"
+                                >
+                                  <Minus className="w-3 h-3" />
+                                </button>
+                                <span className="font-mono font-bold text-[10px] sm:text-xs text-amber-900 dark:text-amber-200">
+                                  {inCart.quantity} in cart
+                                </span>
+                                <button
+                                  onClick={() => onUpdateCartQty(product.id, inCart.quantity + 1)}
+                                  className="w-6 h-6 flex items-center justify-center bg-amber-500 text-slate-950 rounded shadow-2xs hover:bg-amber-400 cursor-pointer"
+                                >
+                                  <Plus className="w-3 h-3" />
+                                </button>
+                              </div>
+                            ) : (
+                              <button
+                                onClick={() => onAddToCart(product, 1)}
+                                className="flex-1 inline-flex items-center justify-center gap-1 py-1.5 sm:py-2 px-2 bg-slate-900 hover:bg-slate-800 dark:bg-amber-500 dark:text-slate-950 dark:hover:bg-amber-400 text-white text-[10px] sm:text-[11px] font-bold rounded-lg shadow-2xs transition-colors cursor-pointer truncate"
+                              >
+                                <ShoppingBag className="w-3 h-3 shrink-0" />
+                                <span className="truncate">Add to Cart</span>
+                              </button>
+                            )}
+
+                            {/* Option 2: Direct Store WhatsApp Ordering Button */}
                             <button
                               type="button"
-                              onClick={() => {
-                                const text = `السلام علیکم! میں *${product.name}* کا آرڈر دینا چاہتا ہوں۔\nہول سیل قیمت: ${profile.currencySymbol}${product.ourPrice.toLocaleString('en-PK')}`;
-                                openWhatsAppDirect(profile.phone || '03125256266', text);
-                              }}
+                              onClick={handleDirectProductWhatsApp}
                               className="p-1.5 sm:p-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg cursor-pointer transition-colors shrink-0 shadow-2xs"
                               title="Order directly on WhatsApp"
+                              aria-label="Order directly on WhatsApp"
                             >
                               <Phone className="w-3.5 h-3.5" />
                             </button>
-                          )}
 
-                          {/* Investor WhatsApp ordering button (Merchant/Admin view only) */}
-                          {!isCustomerView && product.investorWhatsApp && (
+                            {/* Option 3: Product Inquiry sent directly to Investor WhatsApp with Product Link */}
                             <button
                               type="button"
-                              onClick={() => {
-                                const text = `السلام علیکم! میں انویسٹر پراڈکٹ *${product.name}* کا آرڈر دینا چاہتا ہوں۔\nہول سیل قیمت: ${profile.currencySymbol}${product.ourPrice.toLocaleString('en-PK')}`;
-                                openWhatsAppDirect(product.investorWhatsApp!, text);
-                              }}
+                              onClick={handleInvestorInquiry}
                               className="p-1.5 sm:p-2 bg-teal-600 hover:bg-teal-500 text-white rounded-lg cursor-pointer transition-colors shrink-0 shadow-2xs"
-                              title={`Order via Investor WhatsApp (${product.investorWhatsApp})`}
+                              title={inquiryTitle}
+                              aria-label={inquiryTitle}
                             >
                               <Tag className="w-3.5 h-3.5" />
                             </button>
-                          )}
-                        </div>
-                      )}
+                          </div>
+                        );
+                      })()}
                     </div>
                   </div>
                 </div>
@@ -927,12 +995,17 @@ export const StoreCatalogView: React.FC<StoreCatalogViewProps> = ({
 
       {/* PRODUCT DETAILS, PICTURES, SIZES & SPECS MODAL */}
       <ProductDetailsModal
-        product={selectedDetailProduct}
-        isOpen={!!selectedDetailProduct}
+        product={activeDetailProduct}
+        isOpen={!!activeDetailProduct}
         onClose={() => setSelectedDetailProduct(null)}
         onAddToCart={onAddToCart}
         profile={profile}
+        investors={effectiveInvestors}
+        currentUser={currentUser}
+        customers={customers}
         isCustomerView={isCustomerView}
+        canEditProduct={canEditProductDetails}
+        onUpdateProduct={onUpdateProduct}
       />
     </div>
   );

@@ -99,7 +99,9 @@ export const AddressFieldsGroup: React.FC<AddressFieldsGroupProps> = ({
             <option value="">-- Select City --</option>
             {visibleCities.map((c) => (
               <option key={c.id || c.name} value={c.name}>
-                {c.name} {!c.allowed ? '(Delivery Disabled)' : ''}
+                {c.name}
+                {typeof c.deliveryCharge === 'number' ? ` (Rs. ${c.deliveryCharge})` : ''}
+                {!c.allowed ? ' (Delivery Disabled)' : ''}
               </option>
             ))}
           </select>
@@ -140,6 +142,7 @@ export const AddressFieldsGroup: React.FC<AddressFieldsGroupProps> = ({
               {cityAreas.map((a) => (
                 <option key={a.id} value={a.name}>
                   {a.name}
+                  {typeof a.deliveryCharge === 'number' ? ` — Rs. ${a.deliveryCharge}` : ''}
                 </option>
               ))}
               {area && !hasMatchingPredefinedArea && (

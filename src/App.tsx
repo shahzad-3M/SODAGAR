@@ -13,6 +13,7 @@ import {
   Customer,
   Employee,
   GenderType,
+  Investor,
   LuckyDrawEvent,
   LuckyDrawWinner,
   PaymentMode,
@@ -40,6 +41,7 @@ import {
   getCustomers,
   getDefaultPinForPhone,
   getEmployees,
+  getInvestors,
   getLuckyDraws,
   getProductBroadcasts,
   getProducts,
@@ -156,6 +158,14 @@ export default function App() {
   const [employees, setEmployees] = useState<Employee[]>(getEmployees);
   const [attendance, setAttendance] = useState<AttendanceRecord[]>(getAttendance);
   const [resellers, setResellers] = useState<Reseller[]>(getResellers);
+  const [investors, setInvestors] = useState<Investor[]>(getInvestors);
+  const [initialProductId, setInitialProductId] = useState<string | null>(() => {
+    try {
+      return new URLSearchParams(window.location.search).get('product');
+    } catch {
+      return null;
+    }
+  });
   const [activeRole, setActiveRole] = useState<UserRole>(getActiveRole);
   const [currentUser, setCurrentUser] = useState<AppUser>(getCurrentUser);
   const [isRoleModalOpen, setIsRoleModalOpen] = useState(false);
@@ -348,6 +358,7 @@ export default function App() {
     const emps = getEmployees();
     const atts = getAttendance();
     const resells = getResellers();
+    const invs = getInvestors();
 
     const balanced = recalculateCustomerBalances(rawCusts, rawTxs);
 
@@ -367,6 +378,7 @@ export default function App() {
     setEmployees(emps);
     setAttendance(atts);
     setResellers(resells);
+    setInvestors(invs);
 
     const actRole = getActiveRole();
     const curUser = getCurrentUser();
@@ -539,6 +551,8 @@ export default function App() {
 
     const totalSavings = cart.reduce((acc, it) => acc + it.totalSavings, 0);
     const totalAmount = cart.reduce((acc, it) => acc + it.totalAmount, 0);
+    const deliveryFee = Math.max(0, Math.round(Number(saleData.deliveryFee || 0)));
+    const orderTotalWithDelivery = totalAmount + deliveryFee;
 
     const txItems = cart.map((it) => ({
       productId: it.product.id,
@@ -587,14 +601,21 @@ export default function App() {
       maxGraceDate = graceObj.toISOString().split('T')[0];
     }
 
+    const txNoteWithFee =
+      deliveryFee > 0
+        ? `${saleData.notes} [Delivery: ${saleData.buyerDetails.city}${
+            saleData.buyerDetails.area ? ` (${saleData.buyerDetails.area})` : ''
+          } +Rs. ${deliveryFee}]`
+        : saleData.notes;
+
     // 1. Create Transaction with Permanent Audit Trail
     const newTx: Transaction = {
       id: `tx_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
       customerId: customer.id,
       type: 'credit',
-      amount: totalAmount,
-      paidAmount: effectiveSaleType === 'full' ? totalAmount : 0,
-      dueBalance: effectiveSaleType === 'time_credit' ? totalAmount : 0,
+      amount: orderTotalWithDelivery,
+      paidAmount: effectiveSaleType === 'full' ? orderTotalWithDelivery : 0,
+      dueBalance: effectiveSaleType === 'time_credit' ? orderTotalWithDelivery : 0,
       saleType: effectiveSaleType,
       date: todayStr,
       dueDate: saleData.dueDate,
@@ -602,7 +623,7 @@ export default function App() {
       softReminderDate,
       maxGraceDate,
       invoiceNumber,
-      notes: saleData.notes,
+      notes: txNoteWithFee,
       paymentMode: effectiveSaleType === 'cod' ? 'cod' : effectiveSaleType === 'time_credit' ? 'other' : saleData.paymentMode,
       items: txItems,
       totalSavings,
@@ -614,11 +635,11 @@ export default function App() {
           timestamp: new Date().toISOString(),
           action: 'created',
           newStatus: initialStatus,
-          newAmount: totalAmount,
+          newAmount: orderTotalWithDelivery,
           changedBy: staffName,
           notes: `Order created via checkout (${effectiveSaleType.toUpperCase()}) with ${txItems.length} items${
-            effectiveSaleType === 'time_credit' ? ` [Credit authorized by ${staffName}]` : ''
-          }`,
+            deliveryFee > 0 ? ` + Rs. ${deliveryFee} delivery` : ''
+          }${effectiveSaleType === 'time_credit' ? ` [Credit authorized by ${staffName}]` : ''}`,
         },
       ],
       createdAt: new Date().toISOString(),
@@ -631,7 +652,7 @@ export default function App() {
     // 2. If COD sale: Build COD Order for Logistics Hub
     let newCODOrder: CODOrder | undefined;
     if (effectiveSaleType === 'cod') {
-      const codTotal = totalAmount + 250;
+      const codTotal = totalAmount + deliveryFee;
       const commissionAmount = saleData.resellerCode ? Math.floor(totalAmount / 1000) * 30 : 0;
       newCODOrder = {
         id: `cod_${Date.now()}`,
@@ -646,7 +667,7 @@ export default function App() {
         address: saleData.buyerDetails.address || customer.address || 'Address provided',
         items: txItems,
         subtotal: totalAmount,
-        deliveryFee: 250,
+        deliveryFee,
         totalAmount: codTotal,
         courierPartner: 'WASAL delivery',
         trackingNumber: `WSL-${Math.floor(100000 + Math.random() * 900000)}`,
@@ -1541,6 +1562,22 @@ export default function App() {
             isCustomerView={viewMode === 'customer' || activeRole === 'customer'}
             hideCostPrice={viewMode === 'customer' || activeRole === 'customer'}
             userRole={activeRole}
+            currentUser={currentUser}
+            investors={investors}
+            initialProductId={initialProductId}
+            onClearInitialProduct={() => {
+              setInitialProductId(null);
+              try {
+                const url = new URL(window.location.href);
+                if (url.searchParams.has('product')) {
+                  url.searchParams.delete('product');
+                  window.history.replaceState({}, '', url.pathname + url.search + url.hash);
+                }
+              } catch {
+                // ignore history errors
+              }
+            }}
+            onUpdateProduct={handleSaveProduct}
           />
         )}
 
@@ -1607,6 +1644,12 @@ export default function App() {
             userRole={activeRole}
             products={products}
             profile={profile}
+            investorsList={investors}
+            onInvestorsUpdated={(updated) => setInvestors(updated)}
+            onProductInvestorSynced={(updatedProds) => {
+              setProducts(updatedProds);
+              saveProducts(updatedProds);
+            }}
           />
         )}
 
@@ -1694,6 +1737,7 @@ export default function App() {
             profile={profile}
             currentUser={currentUser}
             categoryRecords={categoryRecords}
+            investors={investors}
             onRefreshProducts={handleRefreshAllData}
             onSaveProduct={handleSaveProduct}
             onUpdateStock={handleUpdateStock}

@@ -520,14 +520,15 @@ export async function apiDeleteCategoryRecord(
 
 export async function apiAddCity(
   name: string,
-  allowed = true
+  allowed = true,
+  deliveryCharge?: number | null
 ): Promise<{ ok: boolean; cities?: DeliveryCityConfig[]; error?: string }> {
   try {
     const res = await fetch('/api/cities', {
       method: 'POST',
       headers: getAuthHeaders(),
       cache: 'no-store',
-      body: JSON.stringify({ name, allowed }),
+      body: JSON.stringify({ name, allowed, deliveryCharge }),
     });
     const data = (await res.json()) as { ok?: boolean; cities?: DeliveryCityConfig[]; error?: string };
     if (!res.ok) return { ok: false, error: data.error || 'Failed to add city.' };
@@ -540,7 +541,7 @@ export async function apiAddCity(
 
 export async function apiUpdateCity(
   idOrName: string,
-  updates: { name?: string; allowed?: boolean }
+  updates: { name?: string; allowed?: boolean; deliveryCharge?: number | null }
 ): Promise<{ ok: boolean; cities?: DeliveryCityConfig[]; error?: string }> {
   try {
     const res = await fetch(`/api/cities/${encodeURIComponent(idOrName)}`, {
@@ -558,17 +559,37 @@ export async function apiUpdateCity(
   }
 }
 
+export async function apiToggleOtherCities(
+  allowOtherCities: boolean
+): Promise<{ ok: boolean; cities?: DeliveryCityConfig[]; error?: string }> {
+  try {
+    const res = await fetch('/api/cities/toggle-other-cities', {
+      method: 'PUT',
+      headers: getAuthHeaders(),
+      cache: 'no-store',
+      body: JSON.stringify({ allowOtherCities }),
+    });
+    const data = (await res.json()) as { ok?: boolean; cities?: DeliveryCityConfig[]; error?: string };
+    if (!res.ok) return { ok: false, error: data.error || 'Failed to toggle other cities.' };
+    await refreshSyncState();
+    return { ok: true, cities: data.cities };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
 export async function apiAddCityArea(
   cityIdOrName: string,
   name: string,
-  allowed = true
+  allowed = true,
+  deliveryCharge?: number | null
 ): Promise<{ ok: boolean; cities?: DeliveryCityConfig[]; error?: string }> {
   try {
     const res = await fetch(`/api/cities/${encodeURIComponent(cityIdOrName)}/areas`, {
       method: 'POST',
       headers: getAuthHeaders(),
       cache: 'no-store',
-      body: JSON.stringify({ name, allowed }),
+      body: JSON.stringify({ name, allowed, deliveryCharge }),
     });
     const data = (await res.json()) as { ok?: boolean; cities?: DeliveryCityConfig[]; error?: string };
     if (!res.ok) return { ok: false, error: data.error || 'Failed to add area.' };
@@ -581,7 +602,7 @@ export async function apiAddCityArea(
 
 export async function apiUpdateCityArea(
   areaId: string,
-  updates: { name?: string; allowed?: boolean }
+  updates: { name?: string; allowed?: boolean; deliveryCharge?: number | null }
 ): Promise<{ ok: boolean; cities?: DeliveryCityConfig[]; error?: string }> {
   try {
     const res = await fetch(`/api/areas/${encodeURIComponent(areaId)}`, {
@@ -672,6 +693,9 @@ export function getBusinessProfile(): BusinessProfile {
   }
   if (!prof.adminPin) {
     prof.adminPin = '580987';
+  }
+  if (prof.defaultCityCenterDeliveryCharge === undefined) {
+    prof.defaultCityCenterDeliveryCharge = 50;
   }
   if (!prof.deliveryCities || prof.deliveryCities.length === 0) {
     prof.deliveryCities = ensureCityAreasShape(defaultDeliveryCities);

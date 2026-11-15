@@ -1,10 +1,12 @@
 import {
   BusinessProfile,
   Customer,
+  Investor,
   LuckyDrawWinner,
   MonthlyCustomerStatement,
   PakistaniPaymentChannels,
   ProductBroadcast,
+  ProductItem,
   ReminderTemplate,
   Transaction,
 } from '../types';
@@ -331,4 +333,647 @@ export function buildMonthlyStatementWhatsAppMessage(
   msg += `*100DAGAR مدینہ مارکیٹ* کے ساتھ خریداری پر شکریہ!\nجزاک اللہ خیراً۔`;
 
   return msg;
+}
+
+export function extractCustomerLastName(fullName?: string): string {
+  const cleaned = (fullName || '')
+    .replace(/\([^)]*\)/g, ' ')
+    .replace(/[^\p{L}\p{N}\s'-]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (!cleaned) return '';
+
+  const lower = cleaned.toLowerCase();
+  const genericNames = new Set([
+    'guest',
+    'guest customer',
+    'customer',
+    'valued customer',
+    'online customer',
+    'walk-in customer',
+    'walk in customer',
+    'buyer',
+  ]);
+  if (genericNames.has(lower)) return '';
+
+  const parts = cleaned.split(' ').filter(Boolean);
+  if (parts.length === 0) return '';
+
+  const rawLast = parts[parts.length - 1];
+  if (!rawLast || genericNames.has(rawLast.toLowerCase())) return '';
+
+  return rawLast.charAt(0).toUpperCase() + rawLast.slice(1);
+}
+
+export function resolvePublicProductImageUrl(imageUrl?: string): string {
+  const trimmed = (imageUrl || '').trim();
+  if (!trimmed || /^data:/i.test(trimmed) || /^blob:/i.test(trimmed)) return '';
+
+  if (/^https?:\/\//i.test(trimmed)) {
+    return trimmed;
+  }
+
+  if (typeof window !== 'undefined' && trimmed.startsWith('/')) {
+    return `${window.location.origin}${trimmed}`;
+  }
+
+  return '';
+}
+
+export function buildProductPageUrl(productId: string): string {
+  if (typeof window === 'undefined') {
+    return `/?product=${encodeURIComponent(productId)}`;
+  }
+  try {
+    const url = new URL(window.location.href);
+    url.search = '';
+    url.hash = '';
+    url.searchParams.set('product', productId);
+    return url.toString();
+  } catch {
+    return `${window.location.origin}/?product=${encodeURIComponent(productId)}`;
+  }
+}
+
+export interface ResolvedProductInvestor {
+  whatsapp: string;
+  investorName?: string;
+  investorId?: string;
+  isInvestorAssigned: boolean;
+  coOwners: Array<{
+    investorId: string;
+    investorName: string;
+    whatsapp: string;
+  }>;
+}
+
+/**
+ * Resolves which Investor's WhatsApp should receive a Product Inquiry.
+ * Prioritizes active linked Investor records (so edits in Backend -> Investor Details take effect immediately),
+ * then falls back to manual product.investorWhatsApp, and finally business fallback phone.
+ */
+export function resolveProductInvestorContact(
+  product: ProductItem,
+  investors: Investor[] = [],
+  fallbackPhone: string = '03125256266'
+): ResolvedProductInvestor {
+  const matched = investors.filter((inv) => {
+    if (inv.status === 'inactive') return false;
+    const isDirectId = Boolean(product.investorId && inv.id === product.investorId);
+    const isAssigned = Array.isArray(inv.assignedProductIds) && inv.assignedProductIds.includes(product.id);
+    const isAllocated =
+      Array.isArray(inv.productAllocations) && inv.productAllocations.some((a) => a.productId === product.id);
+    return isDirectId || isAssigned || isAllocated;
+  });
+
+  const coOwners = matched
+    .map((inv) => ({
+      investorId: inv.id,
+      investorName: inv.name,
+      whatsapp: (inv.whatsapp || inv.phone || '').trim(),
+    }))
+    .filter((entry) => entry.whatsapp.length > 0);
+
+  const primaryCoOwner = coOwners[0];
+  const manualProdWhatsapp = (product.investorWhatsApp || '').trim();
+
+  if (primaryCoOwner) {
+    return {
+      whatsapp: primaryCoOwner.whatsapp,
+      investorName: primaryCoOwner.investorName,
+      investorId: primaryCoOwner.investorId,
+      isInvestorAssigned: true,
+      coOwners,
+    };
+  }
+
+  if (manualProdWhatsapp) {
+    const namedInv = product.investorId ? investors.find((i) => i.id === product.investorId) : undefined;
+    return {
+      whatsapp: manualProdWhatsapp,
+      investorName: namedInv?.name,
+      investorId: namedInv?.id || product.investorId,
+      isInvestorAssigned: true,
+      coOwners: [
+        {
+          investorId: namedInv?.id || product.investorId || 'manual',
+          investorName: namedInv?.name || 'Product Investor',
+          whatsapp: manualProdWhatsapp,
+        },
+      ],
+    };
+  }
+
+  return {
+    whatsapp: (fallbackPhone || '03125256266').trim(),
+    isInvestorAssigned: false,
+    coOwners: [],
+  };
+}
+
+export interface ProductMessageOptions {
+  customerName?: string;
+  investorName?: string;
+  selectedSize?: string;
+  quantity?: number;
+  activePrice?: number;
+  activeMarketPrice?: number;
+  productUrl?: string;
+  imageUrl?: string;
+}
+
+export function buildProfessionalCustomerProductShareMessage(
+  product: ProductItem,
+  profile: BusinessProfile,
+  options?: ProductMessageOptions
+): string {
+  const price = options?.activePrice ?? product.ourPrice;
+  const market = options?.activeMarketPrice ?? product.marketPrice;
+  const savings = Math.max(0, market - price);
+  const savingsPct = market > 0 ? Math.round((savings / market) * 100) : 0;
+  const qty = options?.quantity && options.quantity > 1 ? options.quantity : 1;
+  const productUrl = options?.productUrl || buildProductPageUrl(product.id);
+  const imageUrl = resolvePublicProductImageUrl(
+    options?.imageUrl || product.imageUrl || product.pictures?.[0]
+  );
+  const currency = profile.currencySymbol || 'Rs.';
+  const lastName = extractCustomerLastName(options?.customerName);
+  const greeting = lastName ? `Dear *Mr./Ms. ${lastName}*,` : 'Dear *Valued Customer*,';
+
+  const lines: string[] = [
+    greeting,
+    ``,
+    `Thank you for reaching out to me! How can I help you today?`,
+    ``,
+    `━━━━━━━━━━━━━━━━━━━━━━`,
+    `*${product.name}*`,
+  ];
+
+  if (product.urduName) {
+    lines.push(`_${product.urduName}_`);
+  }
+
+  lines.push(`*SKU:* ${product.sku || product.id}  |  *Category:* ${product.category}`);
+
+  if (options?.selectedSize) {
+    lines.push(`*Selected Option:* ${options.selectedSize}`);
+  }
+  if (qty > 1) {
+    lines.push(`*Quantity:* ${qty} units`);
+  }
+
+  lines.push(``);
+  lines.push(`*PRICE & VALUE SUMMARY*`);
+  lines.push(`• *Our Wholesale Price:* ${currency}${price.toLocaleString('en-PK')}`);
+  if (market > price) {
+    lines.push(`• *Market Retail Price:* ~${currency}${market.toLocaleString('en-PK')}~`);
+    lines.push(`• *Your Instant Savings:* ${currency}${savings.toLocaleString('en-PK')} (${savingsPct}% OFF)`);
+  }
+
+  if (product.isUpcoming || product.upcomingStatus === 'coming_soon') {
+    lines.push(
+      `• *Availability:* Upcoming / Coming Soon${product.expectedArrivalDate ? ` (Expected: ${product.expectedArrivalDate})` : ''}`
+    );
+  } else {
+    lines.push(`• *Availability:* ${product.stockQty > 0 ? `In Stock (${product.stockQty} units ready)` : 'Confirming latest stock'}`);
+  }
+
+  if (imageUrl) {
+    lines.push(``);
+    lines.push(`*Product Photo & Price Preview:*`);
+    lines.push(imageUrl);
+  }
+
+  lines.push(``);
+  lines.push(`*View Full Product Details:*`);
+  lines.push(productUrl);
+
+  if (product.videoUrl) {
+    lines.push(``);
+    lines.push(`*Product Video:* ${product.videoUrl}`);
+  }
+
+  lines.push(`━━━━━━━━━━━━━━━━━━━━━━`);
+  lines.push(`Please let me know your preferred quantity or delivery city so I can assist you right away.`);
+  lines.push(``);
+  lines.push(`Warm regards,`);
+  lines.push(`*${profile.name}*`);
+
+  return lines.join('\n');
+}
+
+export function buildDirectProductWhatsAppMessage(
+  product: ProductItem,
+  profile: BusinessProfile,
+  options?: ProductMessageOptions
+): string {
+  const price = options?.activePrice ?? product.ourPrice;
+  const market = options?.activeMarketPrice ?? product.marketPrice;
+  const savings = Math.max(0, market - price);
+  const savingsPct = market > 0 ? Math.round((savings / market) * 100) : 0;
+  const qty = options?.quantity && options.quantity > 0 ? options.quantity : 1;
+  const productUrl = options?.productUrl || buildProductPageUrl(product.id);
+  const imageUrl = resolvePublicProductImageUrl(
+    options?.imageUrl || product.imageUrl || product.pictures?.[0]
+  );
+  const currency = profile.currencySymbol || 'Rs.';
+  const lastName = extractCustomerLastName(options?.customerName);
+  const isUpcoming = product.isUpcoming || product.upcomingStatus === 'coming_soon';
+
+  const lines: string[] = [
+    `*${isUpcoming ? 'UPCOMING PRODUCT INQUIRY' : 'DIRECT ORDER INQUIRY'} — ${profile.name}*`,
+    `━━━━━━━━━━━━━━━━━━━━━━`,
+    ``,
+    lastName
+      ? `Hello *${profile.name}*, this is *${lastName}*.`
+      : `Assalam-o-Alaikum *${profile.name}*,`,
+    isUpcoming
+      ? `I would like arrival updates and pricing details for this upcoming item:`
+      : `I would like to order and confirm availability for the following product:`,
+    ``,
+    `*Product:* ${product.name}`,
+  ];
+
+  if (product.urduName) {
+    lines.push(`_${product.urduName}_`);
+  }
+  lines.push(`*SKU:* ${product.sku || product.id}`);
+  if (options?.selectedSize) {
+    lines.push(`*Selected Option:* ${options.selectedSize}`);
+  }
+  if (!isUpcoming) {
+    lines.push(`*Quantity:* ${qty} ${qty > 1 ? 'units' : 'unit'}`);
+  }
+
+  lines.push(``);
+  lines.push(`*PRICE DETAILS*`);
+  lines.push(`• *Our Price:* ${currency}${(price * qty).toLocaleString('en-PK')}${qty > 1 ? ` (${currency}${price.toLocaleString('en-PK')}/unit)` : ''}`);
+  if (market > price) {
+    lines.push(`• *Market Price:* ~${currency}${(market * qty).toLocaleString('en-PK')}~`);
+    lines.push(`• *Savings:* ${currency}${(savings * qty).toLocaleString('en-PK')} (${savingsPct}% OFF)`);
+  }
+
+  if (imageUrl) {
+    lines.push(``);
+    lines.push(`*Product Image:*`);
+    lines.push(imageUrl);
+  }
+
+  lines.push(``);
+  lines.push(`*Product Link:*`);
+  lines.push(productUrl);
+  lines.push(`━━━━━━━━━━━━━━━━━━━━━━`);
+  lines.push(`Thank you for reaching out — please share how you can help with dispatch & payment details.`);
+
+  return lines.join('\n');
+}
+
+export function buildInvestorProductInquiryMessage(
+  product: ProductItem,
+  profile: BusinessProfile,
+  options?: ProductMessageOptions
+): string {
+  const productUrl = options?.productUrl || buildProductPageUrl(product.id);
+  const storeTitle = (profile.name || '100DAGAR').split('·')[0].trim() || '100DAGAR';
+  const investorGreeting = options?.investorName
+    ? `Dear ${options.investorName},`
+    : 'Dear Investor Partner,';
+
+  const lines: string[] = [
+    `*PRODUCT INQUIRY — ${storeTitle}*`,
+    ``,
+    investorGreeting,
+    ``,
+    `I’m interested in the following product:`,
+    ``,
+    `*Product:* ${product.name}`,
+  ];
+
+  if (product.urduName?.trim()) {
+    lines.push(product.urduName.trim());
+  }
+
+  lines.push(`*SKU:* ${product.sku || product.id}`);
+
+  if (options?.selectedSize && options.selectedSize !== 'Standard') {
+    lines.push(`*Option:* ${options.selectedSize}`);
+  }
+
+  lines.push(``);
+  lines.push(`*Product Link:* ${productUrl}`);
+  lines.push(``);
+  lines.push(`I have a question before confirming my order.`);
+
+  return lines.join('\n');
+}
+
+function loadCorsImage(src: string): Promise<HTMLImageElement | null> {
+  return new Promise((resolve) => {
+    if (!src) {
+      resolve(null);
+      return;
+    }
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => resolve(img);
+    img.onerror = () => resolve(null);
+    img.src = src;
+  });
+}
+
+function wrapCanvasText(
+  ctx: CanvasRenderingContext2D,
+  text: string,
+  maxWidth: number,
+  maxLines: number
+): string[] {
+  const words = text.split(/\s+/).filter(Boolean);
+  const lines: string[] = [];
+  let current = '';
+
+  for (const word of words) {
+    const test = current ? `${current} ${word}` : word;
+    if (ctx.measureText(test).width > maxWidth && current) {
+      lines.push(current);
+      current = word;
+      if (lines.length >= maxLines) break;
+    } else {
+      current = test;
+    }
+  }
+  if (current && lines.length < maxLines) {
+    lines.push(current);
+  }
+  return lines;
+}
+
+/**
+ * Renders a crisp, high-resolution Product Image & Price Card PNG for sharing via WhatsApp / Web Share.
+ */
+export async function generateProductPriceCardFile(
+  product: ProductItem,
+  profile: BusinessProfile,
+  options?: ProductMessageOptions
+): Promise<File | null> {
+  if (typeof document === 'undefined') return null;
+
+  try {
+    const width = 1080;
+    const height = 1240;
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return null;
+
+    const price = options?.activePrice ?? product.ourPrice;
+    const market = options?.activeMarketPrice ?? product.marketPrice;
+    const savings = Math.max(0, market - price);
+    const savingsPct = market > 0 ? Math.round((savings / market) * 100) : 0;
+    const currency = profile.currencySymbol || 'Rs.';
+    const lastName = extractCustomerLastName(options?.customerName);
+
+    // Background
+    ctx.fillStyle = '#F8FAFC';
+    ctx.fillRect(0, 0, width, height);
+
+    // Top Header Band
+    ctx.fillStyle = '#0F172A';
+    ctx.fillRect(0, 0, width, 150);
+
+    // Gold Brand Accent Strip
+    ctx.fillStyle = '#FFD200';
+    ctx.fillRect(0, 150, width, 10);
+
+    // Brand Title
+    ctx.fillStyle = '#FFD200';
+    ctx.font = 'bold 34px system-ui, -apple-system, sans-serif';
+    ctx.fillText((profile.name || '100DAGAR').toUpperCase(), 54, 66);
+
+    ctx.fillStyle = '#CBD5E1';
+    ctx.font = '600 22px system-ui, -apple-system, sans-serif';
+    ctx.fillText(
+      lastName
+        ? `Prepared for Mr./Ms. ${lastName}  ·  Official Price Quote`
+        : 'Official Wholesale Price & Product Card',
+      54,
+      110
+    );
+
+    // Product Image Frame
+    const frameX = 54;
+    const frameY = 192;
+    const frameW = width - 108;
+    const frameH = 540;
+
+    ctx.fillStyle = '#FFFFFF';
+    ctx.strokeStyle = '#E2E8F0';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.roundRect(frameX, frameY, frameW, frameH, 24);
+    ctx.fill();
+    ctx.stroke();
+
+    const imgSrc = options?.imageUrl || product.imageUrl || product.pictures?.[0] || '';
+    const loadedImg = await loadCorsImage(imgSrc);
+    if (loadedImg && loadedImg.naturalWidth > 0) {
+      const pad = 20;
+      const availW = frameW - pad * 2;
+      const availH = frameH - pad * 2;
+      const scale = Math.min(availW / loadedImg.naturalWidth, availH / loadedImg.naturalHeight);
+      const drawW = loadedImg.naturalWidth * scale;
+      const drawH = loadedImg.naturalHeight * scale;
+      const drawX = frameX + (frameW - drawW) / 2;
+      const drawY = frameY + (frameH - drawH) / 2;
+      ctx.save();
+      ctx.beginPath();
+      ctx.roundRect(frameX + pad, frameY + pad, availW, availH, 16);
+      ctx.clip();
+      ctx.drawImage(loadedImg, drawX, drawY, drawW, drawH);
+      ctx.restore();
+    } else {
+      ctx.fillStyle = '#64748B';
+      ctx.font = 'bold 28px system-ui, -apple-system, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(product.name.slice(0, 32), width / 2, frameY + frameH / 2);
+      ctx.textAlign = 'left';
+    }
+
+    // Savings Pill Overlay on Image Top-Left
+    if (savingsPct > 0) {
+      ctx.fillStyle = '#059669';
+      ctx.beginPath();
+      ctx.roundRect(frameX + 24, frameY + 24, 220, 52, 12);
+      ctx.fill();
+      ctx.fillStyle = '#FFFFFF';
+      ctx.font = 'bold 24px system-ui, -apple-system, sans-serif';
+      ctx.fillText(`SAVE ${savingsPct}% OFF`, frameX + 44, frameY + 58);
+    }
+
+    // Product Title & SKU
+    let cursorY = 790;
+    ctx.fillStyle = '#64748B';
+    ctx.font = 'bold 20px system-ui, -apple-system, sans-serif';
+    const metaLabel = `${product.category || 'Catalog'}  ·  SKU: ${product.sku || product.id}${
+      options?.selectedSize ? `  ·  Option: ${options.selectedSize}` : ''
+    }`;
+    ctx.fillText(metaLabel.slice(0, 72), 54, cursorY);
+
+    cursorY += 46;
+    ctx.fillStyle = '#0F172A';
+    ctx.font = 'bold 38px system-ui, -apple-system, sans-serif';
+    const titleLines = wrapCanvasText(ctx, product.name, width - 108, 2);
+    for (const line of titleLines) {
+      ctx.fillText(line, 54, cursorY);
+      cursorY += 46;
+    }
+
+    // Price Highlight Box
+    const priceBoxY = Math.max(cursorY + 12, 910);
+    ctx.fillStyle = '#FFFFFF';
+    ctx.strokeStyle = '#FFD200';
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.roundRect(54, priceBoxY, width - 108, 155, 22);
+    ctx.fill();
+    ctx.stroke();
+
+    ctx.fillStyle = '#0F172A';
+    ctx.font = '900 58px system-ui, -apple-system, sans-serif';
+    ctx.fillText(`${currency} ${price.toLocaleString('en-PK')}`, 86, priceBoxY + 78);
+
+    if (market > price) {
+      ctx.fillStyle = '#94A3B8';
+      ctx.font = 'bold 30px system-ui, -apple-system, sans-serif';
+      const marketText = `${currency} ${market.toLocaleString('en-PK')}`;
+      ctx.fillText(marketText, 86, priceBoxY + 126);
+      const textWidth = ctx.measureText(marketText).width;
+      ctx.strokeStyle = '#94A3B8';
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(84, priceBoxY + 116);
+      ctx.lineTo(88 + textWidth, priceBoxY + 116);
+      ctx.stroke();
+
+      ctx.fillStyle = '#059669';
+      ctx.font = 'bold 28px system-ui, -apple-system, sans-serif';
+      ctx.fillText(
+        `Instant Savings: ${currency} ${savings.toLocaleString('en-PK')}`,
+        420,
+        priceBoxY + 126
+      );
+    }
+
+    // Bottom Greeting Footer
+    const footerY = 1105;
+    ctx.fillStyle = '#0F172A';
+    ctx.beginPath();
+    ctx.roundRect(54, footerY, width - 108, 96, 18);
+    ctx.fill();
+
+    ctx.fillStyle = '#FFD200';
+    ctx.font = 'bold 25px system-ui, -apple-system, sans-serif';
+    ctx.fillText(
+      lastName
+        ? `Dear ${lastName}, thanks for reaching out! How can I help you?`
+        : 'Thank you for reaching out! How can I help you today?',
+      84,
+      footerY + 42
+    );
+
+    ctx.fillStyle = '#CBD5E1';
+    ctx.font = '600 20px system-ui, -apple-system, sans-serif';
+    ctx.fillText(
+      `WhatsApp: ${profile.phone || '03125256266'}  ·  ${profile.name}`,
+      84,
+      footerY + 76
+    );
+
+    const blob = await new Promise<Blob | null>((resolve) =>
+      canvas.toBlob((b) => resolve(b), 'image/png', 0.95)
+    );
+    if (!blob) return null;
+
+    const safeSlug = (product.sku || product.id || 'product')
+      .replace(/[^a-zA-Z0-9_-]+/g, '-')
+      .toLowerCase();
+    return new File([blob], `${safeSlug}-price-card.png`, { type: 'image/png' });
+  } catch {
+    return null;
+  }
+}
+
+export interface ParsedVideoEmbed {
+  kind: 'youtube' | 'vimeo' | 'direct' | 'external';
+  src: string;
+  originalUrl: string;
+}
+
+export function parseProductVideoUrl(rawUrl?: string): ParsedVideoEmbed | null {
+  const trimmed = (rawUrl || '').trim();
+  if (!trimmed) return null;
+
+  try {
+    const normalized = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+    const u = new URL(normalized);
+    const host = u.hostname.replace(/^www\./, '').toLowerCase();
+
+    // YouTube watch / shorts / youtu.be / embed
+    if (host === 'youtu.be') {
+      const id = u.pathname.split('/').filter(Boolean)[0];
+      if (id) {
+        return {
+          kind: 'youtube',
+          src: `https://www.youtube.com/embed/${encodeURIComponent(id)}`,
+          originalUrl: normalized,
+        };
+      }
+    }
+    if (host === 'youtube.com' || host === 'm.youtube.com') {
+      if (u.pathname.startsWith('/embed/')) {
+        return { kind: 'youtube', src: normalized, originalUrl: normalized };
+      }
+      if (u.pathname.startsWith('/shorts/')) {
+        const id = u.pathname.replace('/shorts/', '').split('/')[0];
+        if (id) {
+          return {
+            kind: 'youtube',
+            src: `https://www.youtube.com/embed/${encodeURIComponent(id)}`,
+            originalUrl: normalized,
+          };
+        }
+      }
+      const v = u.searchParams.get('v');
+      if (v) {
+        return {
+          kind: 'youtube',
+          src: `https://www.youtube.com/embed/${encodeURIComponent(v)}`,
+          originalUrl: normalized,
+        };
+      }
+    }
+
+    // Vimeo
+    if (host === 'vimeo.com') {
+      const id = u.pathname.split('/').filter(Boolean)[0];
+      if (id && /^\d+$/.test(id)) {
+        return {
+          kind: 'vimeo',
+          src: `https://player.vimeo.com/video/${encodeURIComponent(id)}`,
+          originalUrl: normalized,
+        };
+      }
+    }
+
+    // Direct HTML5 video file
+    if (/\.(mp4|webm|ogg|mov)(\?.*)?$/i.test(u.pathname)) {
+      return { kind: 'direct', src: normalized, originalUrl: normalized };
+    }
+
+    // TikTok, Instagram, Facebook Reels, Google Drive, etc.
+    return { kind: 'external', src: normalized, originalUrl: normalized };
+  } catch {
+    return null;
+  }
 }

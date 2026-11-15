@@ -139,6 +139,7 @@ export interface ProductItem {
   details?: string; // Comprehensive description
   features?: string[]; // Bulleted feature highlights
   websiteUrl?: string; // Link to see more details on external/store website
+  videoUrl?: string; // Optional pasted video link (YouTube, TikTok, Instagram, Facebook, MP4)
   sourceUrl?: string; // Imported from link
   description?: string;
   rating?: number;
@@ -270,12 +271,14 @@ export interface DeliveryAreaConfig {
   id: string;
   name: string;
   allowed: boolean;
+  deliveryCharge?: number;
 }
 
 export interface DeliveryCityConfig {
   id?: string;
   name: string;
   allowed: boolean;
+  deliveryCharge?: number;
   areas?: DeliveryAreaConfig[];
 }
 
@@ -289,6 +292,7 @@ export interface BusinessProfile {
   paymentChannels: PakistaniPaymentChannels;
   shippingPartner: ShippingPartnerSettings;
   deliveryCities?: DeliveryCityConfig[];
+  defaultCityCenterDeliveryCharge?: number;
   currencySymbol: string; // 'Rs.'
   weeklyReminderDay: 'Monday' | 'Tuesday' | 'Wednesday' | 'Thursday' | 'Friday' | 'Saturday' | 'Sunday';
   monthlyReminderDay: number; // e.g. 1st, 5th

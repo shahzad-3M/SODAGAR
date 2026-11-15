@@ -18,7 +18,14 @@ import {
 } from 'lucide-react';
 import { AppUser, BusinessProfile, CartItem, Customer, DeliveryCityConfig, PaymentMode, SalePaymentType } from '../types';
 import { defaultDeliveryCities } from '../utils/defaultData';
-import { slugifyId } from '../utils/locationCategoryHelpers';
+import {
+  DEFAULT_CITY_CENTER_DELIVERY_CHARGE,
+  ensureCityAreasShape,
+  isMuzaffarabadCity,
+  resolveDeliveryCharge,
+  slugifyId,
+} from '../utils/locationCategoryHelpers';
+import { apiToggleOtherCities, apiUpdateCity } from '../utils/storage';
 import { AddressFieldsGroup } from './AddressFieldsGroup';
 
 export interface CheckoutSalePayload {
@@ -35,6 +42,7 @@ export interface CheckoutSalePayload {
   saleType: SalePaymentType;
   paidAmount: number;
   dueBalance: number;
+  deliveryFee: number;
   paymentMode: PaymentMode;
   paymentTermsDays: number;
   dueDate: string;
@@ -68,13 +76,14 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
   onSaveProfile,
   onCompleteSale,
 }) => {
-  const cityConfigs: DeliveryCityConfig[] =
+  const cityConfigs: DeliveryCityConfig[] = ensureCityAreasShape(
     profile.deliveryCities && profile.deliveryCities.length > 0
       ? profile.deliveryCities
-      : defaultDeliveryCities;
+      : defaultDeliveryCities
+  );
   const allowedCities = cityConfigs.filter((c) => c.allowed);
   const defaultActiveCity =
-    allowedCities.find((c) => c.name.toLowerCase() === 'muzaffarabad')?.name ||
+    allowedCities.find((c) => isMuzaffarabadCity(c.name))?.name ||
     allowedCities[0]?.name ||
     'Muzaffarabad';
 
@@ -87,6 +96,8 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
 
   const [showCityManager, setShowCityManager] = useState(false);
   const [newCityName, setNewCityName] = useState('');
+  const [newCityFee, setNewCityFee] = useState('');
+  const [includeDeliveryForPosFull, setIncludeDeliveryForPosFull] = useState(false);
   const isAuthenticatedCustomer =
     currentUser?.isAuthenticated === true && Boolean(currentUser.customerId);
 
@@ -117,7 +128,10 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
     () => matchedLoggedCustomer?.phone || (currentUser?.isAuthenticated ? currentUser.phone || '' : '') || ''
   );
   const [buyerCity, setBuyerCity] = useState<string>(defaultActiveCity);
-  const [buyerArea, setBuyerArea] = useState<string>(() => matchedLoggedCustomer?.area || '');
+  const [buyerArea, setBuyerArea] = useState<string>(() => {
+    if (matchedLoggedCustomer?.area) return matchedLoggedCustomer.area;
+    return isMuzaffarabadCity(defaultActiveCity) ? 'City Center' : '';
+  });
   const [buyerMohalla, setBuyerMohalla] = useState<string>(() => matchedLoggedCustomer?.mohalla || '');
   const [buyerLandmark, setBuyerLandmark] = useState<string>(() => matchedLoggedCustomer?.landmark || '');
   const [buyerAddress, setBuyerAddress] = useState<string>(
@@ -167,7 +181,12 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
           (c) => c.name.toLowerCase() === (matchedLoggedCustomer.city || '').toLowerCase()
         );
         setBuyerCity(custCityAllowed && matchedLoggedCustomer.city ? matchedLoggedCustomer.city : defaultActiveCity);
-        setBuyerArea(matchedLoggedCustomer.area || '');
+        setBuyerArea(
+          matchedLoggedCustomer.area ||
+            (isMuzaffarabadCity(custCityAllowed && matchedLoggedCustomer.city ? matchedLoggedCustomer.city : defaultActiveCity)
+              ? 'City Center'
+              : '')
+        );
         setBuyerMohalla(matchedLoggedCustomer.mohalla || '');
         setBuyerLandmark(matchedLoggedCustomer.landmark || '');
         setBuyerAddress(matchedLoggedCustomer.address || matchedLoggedCustomer.area || '');
@@ -176,6 +195,9 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
         setBuyerName(currentUser?.isAuthenticated ? currentUser.name : '');
         setBuyerPhone(currentUser?.isAuthenticated ? currentUser.phone || '' : '');
         setBuyerCity(defaultActiveCity);
+        if (!buyerArea && isMuzaffarabadCity(defaultActiveCity)) {
+          setBuyerArea('City Center');
+        }
       }
     } else if (selectedCustomerId && selectedCustomerId !== 'new_checkout_buyer') {
       const cust = customers.find((c) => c.id === selectedCustomerId);
@@ -185,26 +207,41 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
         const custCityAllowed = allowedCities.some(
           (c) => c.name.toLowerCase() === (cust.city || '').toLowerCase()
         );
-        setBuyerCity(custCityAllowed && cust.city ? cust.city : defaultActiveCity);
-        setBuyerArea(cust.area || '');
+        const resolvedCustCity = custCityAllowed && cust.city ? cust.city : defaultActiveCity;
+        setBuyerCity(resolvedCustCity);
+        setBuyerArea(cust.area || (isMuzaffarabadCity(resolvedCustCity) ? 'City Center' : ''));
         setBuyerMohalla(cust.mohalla || '');
         setBuyerLandmark(cust.landmark || '');
         setBuyerAddress(cust.address || cust.area || '');
       }
     } else {
       setBuyerCity(defaultActiveCity);
+      if (!buyerArea && isMuzaffarabadCity(defaultActiveCity)) {
+        setBuyerArea('City Center');
+      }
     }
   }, [isOpen, isCustomerView, isCreditAuthorizedSeller, selectedCustomerId, matchedLoggedCustomer, currentUser, customers]);
 
   if (!isOpen) return null;
 
-  // Cart totals
+  // Cart totals & dynamic city/area delivery fee
   const totalMarketPrice = cart.reduce((acc, it) => acc + it.marketPrice * it.quantity, 0);
   const totalOurPrice = cart.reduce((acc, it) => acc + it.unitPrice * it.quantity, 0);
   const totalSavings = totalMarketPrice - totalOurPrice;
   const savingsPercent = totalMarketPrice > 0 ? Math.round((totalSavings / totalMarketPrice) * 100) : 0;
 
-  const deliveryFee = saleType === 'cod' ? 250 : 0;
+  const activeBuyerCity = allowedCities.some((c) => c.name === buyerCity) ? buyerCity : defaultActiveCity;
+  const resolvedDelivery = resolveDeliveryCharge(
+    cityConfigs,
+    activeBuyerCity,
+    buyerArea,
+    profile.defaultCityCenterDeliveryCharge ?? DEFAULT_CITY_CENTER_DELIVERY_CHARGE
+  );
+  const shouldApplyDeliveryFee =
+    saleType === 'cod' ||
+    (isCustomerView && paymentMode !== 'cash') ||
+    (!isCustomerView && saleType === 'full' && includeDeliveryForPosFull);
+  const deliveryFee = shouldApplyDeliveryFee ? resolvedDelivery.charge : 0;
   const grandTotal = totalOurPrice + deliveryFee;
 
   const todayStr = new Date().toISOString().split('T')[0];
@@ -218,27 +255,62 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
   const softReminderPreviewDate = computeOffsetDate(creditDueDate, -3);
   const maxGracePreviewDate = computeOffsetDate(creditDueDate, 7);
 
+  const otherCities = cityConfigs.filter((c) => !isMuzaffarabadCity(c.name));
+  const otherCitiesOn = otherCities.some((c) => c.allowed);
+
   const handleToggleCityAllowed = (cityName: string) => {
     if (!onSaveProfile) return;
+    if (isMuzaffarabadCity(cityName)) return; // Muzaffarabad stays active
     const updatedCities = cityConfigs.map((c) =>
       c.name === cityName ? { ...c, allowed: !c.allowed } : c
     );
     onSaveProfile({ ...profile, deliveryCities: updatedCities });
     const nextAllowed = updatedCities.filter((c) => c.allowed);
     if (!nextAllowed.some((c) => c.name === buyerCity)) {
-      setBuyerCity(
-        nextAllowed.find((c) => c.name.toLowerCase() === 'muzaffarabad')?.name ||
-          nextAllowed[0]?.name ||
-          ''
-      );
+      const nextCity =
+        nextAllowed.find((c) => isMuzaffarabadCity(c.name))?.name || nextAllowed[0]?.name || '';
+      setBuyerCity(nextCity);
+      setBuyerArea(isMuzaffarabadCity(nextCity) ? 'City Center' : '');
+    }
+  };
+
+  const handleToggleOtherCitiesInCheckout = async (allowOther: boolean) => {
+    if (!onSaveProfile) return;
+    const updatedCities = cityConfigs.map((c) =>
+      isMuzaffarabadCity(c.name) ? { ...c, allowed: true } : { ...c, allowed: allowOther }
+    );
+    onSaveProfile({ ...profile, deliveryCities: updatedCities });
+    if (!allowOther && !isMuzaffarabadCity(buyerCity)) {
+      setBuyerCity('Muzaffarabad');
+      setBuyerArea('City Center');
+    }
+    await apiToggleOtherCities(allowOther);
+  };
+
+  const handleQuickCityChargeChange = (cityName: string, rawVal: string) => {
+    if (!onSaveProfile) return;
+    const trimmed = rawVal.trim();
+    const numeric = trimmed === '' ? undefined : Math.max(0, Math.round(Number(trimmed) || 0));
+    const updatedCities = cityConfigs.map((c) =>
+      c.name === cityName ? { ...c, deliveryCharge: numeric } : c
+    );
+    onSaveProfile({ ...profile, deliveryCities: updatedCities });
+    const target = cityConfigs.find((c) => c.name === cityName);
+    if (target?.id || target?.name) {
+      void apiUpdateCity(target.id || target.name, { deliveryCharge: numeric ?? null });
     }
   };
 
   const handleResetCities = () => {
     if (!onSaveProfile) return;
-    const freshCities = defaultDeliveryCities.map((c) => ({ ...c }));
-    onSaveProfile({ ...profile, deliveryCities: freshCities });
+    const freshCities = ensureCityAreasShape(defaultDeliveryCities);
+    onSaveProfile({
+      ...profile,
+      defaultCityCenterDeliveryCharge: DEFAULT_CITY_CENTER_DELIVERY_CHARGE,
+      deliveryCities: freshCities,
+    });
     setBuyerCity('Muzaffarabad');
+    setBuyerArea('City Center');
   };
 
   const handleAddDeliveryCity = () => {
@@ -248,14 +320,25 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
       setNewCityName('');
       return;
     }
+    const parsedFee =
+      newCityFee.trim() !== '' && Number.isFinite(Number(newCityFee)) && Number(newCityFee) >= 0
+        ? Math.round(Number(newCityFee))
+        : undefined;
     const updatedCities = [
       ...cityConfigs,
-      { id: `${slugifyId('city', trimmed)}_${Date.now().toString(36).slice(-4)}`, name: trimmed, allowed: true, areas: [] },
+      {
+        id: `${slugifyId('city', trimmed)}_${Date.now().toString(36).slice(-4)}`,
+        name: trimmed,
+        allowed: true,
+        ...(parsedFee !== undefined ? { deliveryCharge: parsedFee } : {}),
+        areas: [],
+      },
     ];
     onSaveProfile({ ...profile, deliveryCities: updatedCities });
     setBuyerCity(trimmed);
     setBuyerArea('');
     setNewCityName('');
+    setNewCityFee('');
   };
 
   const handleSelectExistingCustomer = (val: string) => {
@@ -324,8 +407,9 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
         address: buyerAddress.trim() || 'Counter Pickup / Direct Delivery',
       },
       saleType: effectiveSaleType,
-      paidAmount: effectiveSaleType === 'full' ? totalOurPrice : 0,
+      paidAmount: effectiveSaleType === 'full' ? grandTotal : 0,
       dueBalance: effectiveSaleType === 'time_credit' ? totalOurPrice : 0,
+      deliveryFee,
       paymentMode: effectiveSaleType === 'cod' ? 'cod' : effectiveSaleType === 'time_credit' ? 'other' : paymentMode,
       paymentTermsDays: effectiveSaleType === 'time_credit' ? creditTermsDays : 0,
       dueDate: effectiveSaleType === 'time_credit' ? creditDueDate : todayStr,
@@ -454,25 +538,54 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
               </div>
 
               {allowedCities.length > 0 ? (
-                <AddressFieldsGroup
-                  cities={cityConfigs}
-                  city={allowedCities.some((c) => c.name === buyerCity) ? buyerCity : defaultActiveCity}
-                  area={buyerArea}
-                  mohalla={buyerMohalla}
-                  landmark={buyerLandmark}
-                  address={buyerAddress}
-                  filterActiveCitiesOnly={true}
-                  showCompleteAddress={true}
-                  required={saleType === 'cod'}
-                  compact={true}
-                  onChange={(patch) => {
-                    if (patch.city !== undefined) setBuyerCity(patch.city);
-                    if (patch.area !== undefined) setBuyerArea(patch.area);
-                    if (patch.mohalla !== undefined) setBuyerMohalla(patch.mohalla);
-                    if (patch.landmark !== undefined) setBuyerLandmark(patch.landmark);
-                    if (patch.address !== undefined) setBuyerAddress(patch.address);
-                  }}
-                />
+                <div className="space-y-2.5">
+                  <AddressFieldsGroup
+                    cities={cityConfigs}
+                    city={activeBuyerCity}
+                    area={buyerArea}
+                    mohalla={buyerMohalla}
+                    landmark={buyerLandmark}
+                    address={buyerAddress}
+                    filterActiveCitiesOnly={true}
+                    showCompleteAddress={true}
+                    required={saleType === 'cod'}
+                    compact={true}
+                    onChange={(patch) => {
+                      if (patch.city !== undefined) setBuyerCity(patch.city);
+                      if (patch.area !== undefined) setBuyerArea(patch.area);
+                      if (patch.mohalla !== undefined) setBuyerMohalla(patch.mohalla);
+                      if (patch.landmark !== undefined) setBuyerLandmark(patch.landmark);
+                      if (patch.address !== undefined) setBuyerAddress(patch.address);
+                    }}
+                  />
+
+                  {/* Live Customer Visibility Banner for Delivery Charges */}
+                  <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-2 rounded-lg bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800/80 text-[11px]">
+                    <div className="flex items-center gap-1.5 text-amber-950 dark:text-amber-200 font-semibold">
+                      <MapPin className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+                      <span>
+                        Delivery Charges for <b>{resolvedDelivery.label}</b>:
+                      </span>
+                    </div>
+                    <span className="font-mono font-black text-xs text-slate-900 dark:text-white bg-white dark:bg-slate-900 px-2 py-0.5 rounded border border-amber-300 dark:border-amber-700">
+                      {profile.currencySymbol}{resolvedDelivery.charge.toLocaleString('en-PK')}
+                    </span>
+                  </div>
+
+                  {!isCustomerView && saleType === 'full' && (
+                    <label className="flex items-center gap-2 text-[11px] text-slate-700 dark:text-slate-300 cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        checked={includeDeliveryForPosFull}
+                        onChange={(e) => setIncludeDeliveryForPosFull(e.target.checked)}
+                        className="w-3.5 h-3.5 rounded text-amber-500 cursor-pointer"
+                      />
+                      <span>
+                        Add Home Delivery Charges ({profile.currencySymbol}{resolvedDelivery.charge}) to this POS invoice
+                      </span>
+                    </label>
+                  )}
+                </div>
               ) : (
                 <div className="px-3 py-2 rounded-lg border border-red-300 bg-red-50 text-red-700 text-[11px] font-semibold">
                   Delivery paused for all cities. Please enable at least one city in settings.
@@ -480,50 +593,82 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
               )}
             </div>
 
-            {/* Admin / Manager City Checkmark Allow/Disallow & Reset Panel */}
+            {/* Admin / Manager City Checkmark Allow/Disallow, Other Cities ON/OFF & City Fee Setup */}
             {canManageCities && showCityManager && (
               <div className="p-3 rounded-xl bg-white dark:bg-slate-900 border border-amber-300 dark:border-amber-800 space-y-2.5">
                 <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 dark:border-slate-800 pb-2">
                   <div>
                     <span className="font-bold text-slate-900 dark:text-white text-[11px] block">
-                      Allowed Delivery Cities (Checkmark to Allow / Uncheck to Disable)
+                      Delivery Cities &amp; Fees (Checkmark Allow / Enter Rs. Fee)
                     </span>
                     <span className="text-[10px] text-slate-500">
-                      Muzaffarabad is the default active delivery city.
+                      Muzaffarabad stays ON (Default Rs. {profile.defaultCityCenterDeliveryCharge ?? 50}). Toggle other cities ON/OFF anytime.
                     </span>
                   </div>
-                  <button
-                    type="button"
-                    onClick={handleResetCities}
-                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-amber-100 hover:bg-amber-200 dark:bg-amber-950/60 dark:hover:bg-amber-900 text-amber-900 dark:text-amber-200 font-bold text-[10px] cursor-pointer"
-                  >
-                    <RotateCcw className="w-3 h-3" />
-                    <span>Reset Cities</span>
-                  </button>
-                </div>
-
-                <div className="grid grid-cols-2 sm:grid-cols-3 gap-1.5 max-h-36 overflow-y-auto pr-1">
-                  {cityConfigs.map((c) => (
-                    <label
-                      key={c.name}
-                      className={`flex items-center gap-1.5 px-2 py-1.5 rounded-lg border text-[11px] cursor-pointer select-none ${
-                        c.allowed
-                          ? 'bg-emerald-50/70 dark:bg-emerald-950/30 border-emerald-200 dark:border-emerald-800 text-emerald-900 dark:text-emerald-200 font-semibold'
-                          : 'bg-slate-50 dark:bg-slate-800/60 border-slate-200 dark:border-slate-700 text-slate-400 line-through'
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => void handleToggleOtherCitiesInCheckout(!otherCitiesOn)}
+                      className={`px-2 py-1 rounded-lg font-bold text-[10px] cursor-pointer ${
+                        otherCitiesOn
+                          ? 'bg-emerald-600 text-white'
+                          : 'bg-rose-100 text-rose-800 dark:bg-rose-950/60 dark:text-rose-200'
                       }`}
                     >
-                      <input
-                        type="checkbox"
-                        checked={c.allowed}
-                        onChange={() => handleToggleCityAllowed(c.name)}
-                        className="w-3.5 h-3.5 rounded text-emerald-600 cursor-pointer"
-                      />
-                      <span className="truncate">{c.name}</span>
-                    </label>
-                  ))}
+                      Other Cities: {otherCitiesOn ? 'ON' : 'OFF'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleResetCities}
+                      className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-amber-100 hover:bg-amber-200 dark:bg-amber-950/60 dark:hover:bg-amber-900 text-amber-900 dark:text-amber-200 font-bold text-[10px] cursor-pointer"
+                    >
+                      <RotateCcw className="w-3 h-3" />
+                      <span>Reset</span>
+                    </button>
+                  </div>
                 </div>
 
-                <div className="flex items-center gap-2 pt-1">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 max-h-40 overflow-y-auto pr-1">
+                  {cityConfigs.map((c) => {
+                    const isMzd = isMuzaffarabadCity(c.name);
+                    return (
+                      <div
+                        key={c.name}
+                        className={`flex items-center justify-between gap-1.5 px-2 py-1.5 rounded-lg border text-[11px] ${
+                          isMzd || c.allowed
+                            ? 'bg-emerald-50/70 dark:bg-emerald-950/30 border-emerald-200 dark:border-emerald-800 text-emerald-900 dark:text-emerald-200 font-semibold'
+                            : 'bg-slate-50 dark:bg-slate-800/60 border-slate-200 dark:border-slate-700 text-slate-400'
+                        }`}
+                      >
+                        <label className="flex items-center gap-1.5 min-w-0 cursor-pointer select-none">
+                          <input
+                            type="checkbox"
+                            checked={isMzd ? true : c.allowed}
+                            disabled={isMzd}
+                            onChange={() => handleToggleCityAllowed(c.name)}
+                            className="w-3.5 h-3.5 rounded text-emerald-600 cursor-pointer shrink-0"
+                          />
+                          <span className={`truncate ${!isMzd && !c.allowed ? 'line-through' : ''}`}>
+                            {c.name}
+                          </span>
+                        </label>
+                        <div className="flex items-center gap-1 shrink-0">
+                          <span className="text-[10px] text-slate-500">Rs.</span>
+                          <input
+                            type="number"
+                            min={0}
+                            value={c.deliveryCharge ?? ''}
+                            placeholder={isMzd ? '50' : '250'}
+                            onChange={(e) => handleQuickCityChargeChange(c.name, e.target.value)}
+                            className="w-14 px-1 py-0.5 text-[10px] font-mono rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-900 dark:text-white"
+                          />
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 pt-1">
                   <input
                     type="text"
                     value={newCityName}
@@ -531,10 +676,18 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                     placeholder="Add new city name..."
                     className="flex-1 px-2.5 py-1.5 text-[11px] rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white"
                   />
+                  <input
+                    type="number"
+                    min={0}
+                    value={newCityFee}
+                    onChange={(e) => setNewCityFee(e.target.value)}
+                    placeholder="Fee Rs."
+                    className="w-full sm:w-24 px-2.5 py-1.5 text-[11px] font-mono rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white"
+                  />
                   <button
                     type="button"
                     onClick={handleAddDeliveryCity}
-                    className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-slate-900 dark:bg-amber-500 text-white dark:text-slate-950 font-bold text-[11px] cursor-pointer"
+                    className="inline-flex items-center justify-center gap-1 px-3 py-1.5 rounded-lg bg-slate-900 dark:bg-amber-500 text-white dark:text-slate-950 font-bold text-[11px] cursor-pointer"
                   >
                     <Plus className="w-3 h-3" />
                     <span>Add City</span>
@@ -592,10 +745,10 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
               ))}
             </div>
 
-            {saleType === 'cod' && (
-              <div className="flex items-center justify-between text-[11px] text-slate-600 dark:text-slate-300 pt-1">
-                <span>COD Standard Delivery Charges:</span>
-                <span className="font-mono font-bold">
+            {deliveryFee > 0 && (
+              <div className="flex items-center justify-between text-[11px] text-slate-700 dark:text-slate-200 pt-1">
+                <span>Delivery Charges ({resolvedDelivery.label}):</span>
+                <span className="font-mono font-bold text-amber-700 dark:text-amber-300">
                   +{profile.currencySymbol}{deliveryFee.toLocaleString('en-PK')}
                 </span>
               </div>

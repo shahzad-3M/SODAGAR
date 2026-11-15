@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   Building,
   CreditCard,
@@ -53,12 +53,18 @@ import {
   saveResellers,
   apiAddCity,
   apiUpdateCity,
+  apiToggleOtherCities,
   apiAddCityArea,
   apiUpdateCityArea,
   apiDeleteCityArea,
   apiCreateServerBackup,
 } from '../utils/storage';
-import { ensureCityAreasShape, normalizeTextKey } from '../utils/locationCategoryHelpers';
+import {
+  DEFAULT_CITY_CENTER_DELIVERY_CHARGE,
+  ensureCityAreasShape,
+  isMuzaffarabadCity,
+  normalizeTextKey,
+} from '../utils/locationCategoryHelpers';
 import {
   ToastBanner,
   ToastMessage,
@@ -109,8 +115,12 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [userListNotice, setUserListNotice] = useState<string | null>(null);
   const [revealedPins, setRevealedPins] = useState<Record<string, boolean>>({});
   const [newDeliveryCity, setNewDeliveryCity] = useState('');
+  const [newDeliveryCityCharge, setNewDeliveryCityCharge] = useState('');
   const [expandedCityId, setExpandedCityId] = useState<string | null>('city_muzaffarabad');
   const [newAreaInputs, setNewAreaInputs] = useState<Record<string, string>>({});
+  const [newAreaChargeInputs, setNewAreaChargeInputs] = useState<Record<string, string>>({});
+  const [cityChargeEdits, setCityChargeEdits] = useState<Record<string, string>>({});
+  const [areaChargeEdits, setAreaChargeEdits] = useState<Record<string, string>>({});
   const [editingCityId, setEditingCityId] = useState<string | null>(null);
   const [editingCityName, setEditingCityName] = useState('');
   const [editingAreaId, setEditingAreaId] = useState<string | null>(null);
@@ -118,6 +128,15 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
   const [confirmDialog, setConfirmDialog] = useState<ConfirmDialogState | null>(null);
   const [inputPrompt, setInputPrompt] = useState<InputPromptState | null>(null);
+
+  useEffect(() => {
+    setFormData((prev) => ({
+      ...prev,
+      deliveryCities: profile.deliveryCities,
+      defaultCityCenterDeliveryCharge:
+        profile.defaultCityCenterDeliveryCharge ?? prev.defaultCityCenterDeliveryCharge ?? DEFAULT_CITY_CENTER_DELIVERY_CHARGE,
+    }));
+  }, [profile.deliveryCities, profile.defaultCityCenterDeliveryCharge]);
 
   const pushToast = (text: string, type: ToastMessage['type'] = 'info') => {
     const id = `toast_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
@@ -133,7 +152,25 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       : defaultDeliveryCities
   );
 
+  const cityCenterDefaultFee =
+    formData.defaultCityCenterDeliveryCharge ?? DEFAULT_CITY_CENTER_DELIVERY_CHARGE;
+  const otherCities = deliveryCities.filter((c) => !isMuzaffarabadCity(c.name));
+  const activeOtherCitiesCount = otherCities.filter((c) => c.allowed).length;
+  const isOtherCitiesEnabled = activeOtherCitiesCount > 0;
+
+  const parseChargeField = (raw: string): number | null | 'invalid' => {
+    const clean = raw.trim();
+    if (!clean) return null;
+    const num = Number(clean);
+    if (!Number.isFinite(num) || num < 0) return 'invalid';
+    return Math.round(num);
+  };
+
   const handleToggleSettingsCity = async (city: DeliveryCityConfig) => {
+    if (isMuzaffarabadCity(city.name)) {
+      pushToast('Muzaffarabad is the default active city and always stays ON.', 'info');
+      return;
+    }
     const targetId = city.id || city.name;
     const updated = deliveryCities.map((c) =>
       c.name === city.name ? { ...c, allowed: !c.allowed } : c
@@ -141,16 +178,136 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     const nextProf = { ...formData, deliveryCities: updated };
     setFormData(nextProf);
     onSaveProfile(nextProf);
-    await apiUpdateCity(targetId, { allowed: !city.allowed });
+    const res = await apiUpdateCity(targetId, { allowed: !city.allowed });
+    if (res.ok && res.cities) {
+      const syncedProf = { ...formData, deliveryCities: res.cities };
+      setFormData(syncedProf);
+      onSaveProfile(syncedProf);
+    }
+  };
+
+  const handleToggleAllOtherCities = async (allowOther: boolean) => {
+    const updated = deliveryCities.map((c) =>
+      isMuzaffarabadCity(c.name) ? { ...c, allowed: true } : { ...c, allowed: allowOther }
+    );
+    const nextProf = { ...formData, deliveryCities: updated };
+    setFormData(nextProf);
+    onSaveProfile(nextProf);
+    const res = await apiToggleOtherCities(allowOther);
+    if (res.ok && res.cities) {
+      const syncedProf = { ...formData, deliveryCities: res.cities };
+      setFormData(syncedProf);
+      onSaveProfile(syncedProf);
+      pushToast(
+        allowOther
+          ? 'Other cities enabled (ON) for delivery alongside Muzaffarabad.'
+          : 'Other cities turned OFF. Only Muzaffarabad is active for delivery.',
+        'success'
+      );
+    } else {
+      pushToast(res.error || 'Could not update other cities status.', 'error');
+    }
+  };
+
+  const handleSaveDefaultCityCenterCharge = () => {
+    const clean = Number(formData.defaultCityCenterDeliveryCharge ?? DEFAULT_CITY_CENTER_DELIVERY_CHARGE);
+    const safeFee = Number.isFinite(clean) && clean >= 0 ? Math.round(clean) : DEFAULT_CITY_CENTER_DELIVERY_CHARGE;
+    const updated = deliveryCities.map((c) => {
+      if (!isMuzaffarabadCity(c.name)) return c;
+      return {
+        ...c,
+        allowed: true,
+        deliveryCharge: c.deliveryCharge ?? safeFee,
+        areas: (c.areas || []).map((a) =>
+          normalizeTextKey(a.name) === 'city center'
+            ? { ...a, deliveryCharge: safeFee }
+            : a
+        ),
+      };
+    });
+    const nextProf: BusinessProfile = {
+      ...formData,
+      defaultCityCenterDeliveryCharge: safeFee,
+      deliveryCities: updated,
+    };
+    setFormData(nextProf);
+    onSaveProfile(nextProf);
+    pushToast(`Default City Center delivery charge saved as Rs. ${safeFee}.`, 'success');
+  };
+
+  const handleSaveCityCharge = async (city: DeliveryCityConfig) => {
+    const cityKey = city.id || city.name;
+    const raw = cityChargeEdits[cityKey] ?? (city.deliveryCharge !== undefined ? String(city.deliveryCharge) : '');
+    const parsed = parseChargeField(raw);
+    if (parsed === 'invalid') {
+      pushToast('Please enter a valid non-negative delivery charge (Rs.).', 'error');
+      return;
+    }
+    const res = await apiUpdateCity(cityKey, { deliveryCharge: parsed });
+    if (res.ok && res.cities) {
+      const nextProf = { ...formData, deliveryCities: res.cities };
+      setFormData(nextProf);
+      onSaveProfile(nextProf);
+      setCityChargeEdits((prev) => {
+        const next = { ...prev };
+        delete next[cityKey];
+        return next;
+      });
+      pushToast(
+        parsed === null
+          ? `Cleared custom fee for ${city.name}.`
+          : `${city.name} delivery charge set to Rs. ${parsed}.`,
+        'success'
+      );
+    } else {
+      pushToast(res.error || 'Could not save city delivery charge.', 'error');
+    }
+  };
+
+  const handleSaveAreaCharge = async (city: DeliveryCityConfig, areaId: string, areaName: string) => {
+    const raw = areaChargeEdits[areaId] ?? '';
+    const parsed = parseChargeField(raw);
+    if (parsed === 'invalid') {
+      pushToast('Please enter a valid non-negative area delivery charge (Rs.).', 'error');
+      return;
+    }
+    const res = await apiUpdateCityArea(areaId, { deliveryCharge: parsed });
+    if (res.ok && res.cities) {
+      const nextProf = { ...formData, deliveryCities: res.cities };
+      setFormData(nextProf);
+      onSaveProfile(nextProf);
+      setAreaChargeEdits((prev) => {
+        const next = { ...prev };
+        delete next[areaId];
+        return next;
+      });
+      pushToast(
+        parsed === null
+          ? `${areaName} (${city.name}) now uses city fee.`
+          : `${areaName} (${city.name}) delivery charge set to Rs. ${parsed}.`,
+        'success'
+      );
+    } else {
+      pushToast(res.error || 'Could not update area delivery charge.', 'error');
+    }
   };
 
   const handleResetSettingsCities = () => {
     const fresh = ensureCityAreasShape(defaultDeliveryCities);
-    const nextProf = { ...formData, deliveryCities: fresh };
+    const nextProf: BusinessProfile = {
+      ...formData,
+      defaultCityCenterDeliveryCharge: DEFAULT_CITY_CENTER_DELIVERY_CHARGE,
+      deliveryCities: fresh,
+    };
     setFormData(nextProf);
     onSaveProfile(nextProf);
+    setCityChargeEdits({});
+    setAreaChargeEdits({});
     setSavedSuccess(true);
-    pushToast('Default delivery cities & areas restored cleanly.', 'success');
+    pushToast(
+      'Restored defaults: Muzaffarabad City Center Rs. 50 (ON), other cities OFF with customizable delivery charges.',
+      'success'
+    );
     setTimeout(() => setSavedSuccess(false), 2500);
   };
 
@@ -161,13 +318,22 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       pushToast(`City "${trimmed}" already exists.`, 'error');
       return;
     }
-    const res = await apiAddCity(trimmed, true);
+    const parsedCharge = parseChargeField(newDeliveryCityCharge);
+    if (parsedCharge === 'invalid') {
+      pushToast('Delivery charge must be a valid number (0 or higher).', 'error');
+      return;
+    }
+    const res = await apiAddCity(trimmed, true, parsedCharge);
     if (res.ok && res.cities) {
       const nextProf = { ...formData, deliveryCities: res.cities };
       setFormData(nextProf);
       onSaveProfile(nextProf);
       setNewDeliveryCity('');
-      pushToast(`City "${trimmed}" added and synced across devices.`, 'success');
+      setNewDeliveryCityCharge('');
+      pushToast(
+        `City "${trimmed}"${parsedCharge !== null ? ` (Rs. ${parsedCharge})` : ''} added and synced.`,
+        'success'
+      );
     } else {
       pushToast(res.error || 'Could not add city.', 'error');
     }
@@ -200,6 +366,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     const cityKey = city.id || city.name;
     const raw = (newAreaInputs[cityKey] || '').trim();
     if (!raw) return;
+    const parsedCharge = parseChargeField(newAreaChargeInputs[cityKey] || '');
+    if (parsedCharge === 'invalid') {
+      pushToast('Area delivery charge must be 0 or higher.', 'error');
+      return;
+    }
     const names = raw
       .split(',')
       .map((s) => s.trim())
@@ -213,7 +384,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         pushToast(`Duplicate area "${areaName}" skipped in ${city.name}.`, 'error');
         continue;
       }
-      const res = await apiAddCityArea(cityKey, areaName, true);
+      const res = await apiAddCityArea(cityKey, areaName, true, parsedCharge);
       if (res.ok && res.cities) {
         latestCities = res.cities;
         addedCount++;
@@ -227,7 +398,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       setFormData(nextProf);
       onSaveProfile(nextProf);
       setNewAreaInputs((prev) => ({ ...prev, [cityKey]: '' }));
-      pushToast(`Added ${addedCount} area(s) under ${city.name}.`, 'success');
+      setNewAreaChargeInputs((prev) => ({ ...prev, [cityKey]: '' }));
+      pushToast(
+        `Added ${addedCount} area(s) under ${city.name}${parsedCharge !== null ? ` @ Rs. ${parsedCharge}` : ''}.`,
+        'success'
+      );
     }
   };
 
@@ -1086,7 +1261,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             </div>
           </form>
 
-          {/* Delivery Cities & Nested Areas Availability Manager */}
+          {/* Delivery Cities, Area-Wise Delivery Charges & Other Cities ON/OFF */}
           <div className="mt-6 pt-6 border-t border-slate-200 dark:border-slate-800 space-y-4">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
               <div className="flex items-center gap-2.5">
@@ -1095,10 +1270,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 </span>
                 <div>
                   <h4 className="text-sm font-bold text-slate-900 dark:text-white">
-                    Cities &amp; Areas Management (شہر اور علاقے)
+                    Cities, Areas &amp; Delivery Charges (شہر، علاقے اور ڈلیوری چارجز)
                   </h4>
                   <p className="text-xs text-slate-500 dark:text-slate-400">
-                    Default city: <b>Muzaffarabad</b>. Click any city row to add, edit, or activate/deactivate its nested Areas.
+                    Default city: <b>Muzaffarabad</b> (City Center default: <b>Rs. {cityCenterDefaultFee}</b>). Enter city-wise or area-wise delivery charges to show live to customers.
                   </p>
                 </div>
               </div>
@@ -1112,8 +1287,83 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               </button>
             </div>
 
-            {/* Add City Row */}
-            <div className="flex items-center gap-2 max-w-md">
+            {/* Quick Policy Bar: Default City Center Rs. 50 + Other Cities ON/OFF Master Toggle */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+              <div className="p-3.5 rounded-xl bg-amber-50/70 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800/80 flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <span className="text-xs font-bold text-slate-900 dark:text-white block">
+                    City Center Default Delivery Charge (Muzaffarabad)
+                  </span>
+                  <span className="text-[11px] text-slate-600 dark:text-slate-400">
+                    Applied automatically when City Center or Muzaffarabad is selected (Default: Rs. 50)
+                  </span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <div className="flex items-center rounded-lg border border-amber-300 dark:border-amber-700 bg-white dark:bg-slate-900 overflow-hidden">
+                    <span className="px-2 py-1 text-[11px] font-bold text-slate-500 bg-slate-50 dark:bg-slate-800 border-r border-amber-200 dark:border-amber-800">
+                      Rs.
+                    </span>
+                    <input
+                      type="number"
+                      min={0}
+                      value={formData.defaultCityCenterDeliveryCharge ?? 50}
+                      onChange={(e) =>
+                        setFormData({
+                          ...formData,
+                          defaultCityCenterDeliveryCharge: Math.max(0, Number(e.target.value) || 0),
+                        })
+                      }
+                      className="w-20 px-2 py-1 text-xs font-mono font-bold text-slate-900 dark:text-white bg-transparent focus:outline-hidden"
+                    />
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleSaveDefaultCityCenterCharge}
+                    className="px-2.5 py-1.5 text-[11px] font-bold bg-slate-900 dark:bg-amber-500 text-white dark:text-slate-950 rounded-lg cursor-pointer"
+                  >
+                    Save
+                  </button>
+                </div>
+              </div>
+
+              <div className="p-3.5 rounded-xl bg-slate-50 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-700 flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <span className="text-xs font-bold text-slate-900 dark:text-white block">
+                    Other Cities Except Muzaffarabad ({activeOtherCitiesCount}/{otherCities.length} ON)
+                  </span>
+                  <span className="text-[11px] text-slate-500 dark:text-slate-400">
+                    Quickly enable or disable all outside cities while keeping Muzaffarabad ON
+                  </span>
+                </div>
+                <div className="inline-flex rounded-lg border border-slate-300 dark:border-slate-600 overflow-hidden bg-white dark:bg-slate-900">
+                  <button
+                    type="button"
+                    onClick={() => void handleToggleAllOtherCities(true)}
+                    className={`px-3 py-1.5 text-xs font-bold cursor-pointer transition-colors ${
+                      isOtherCitiesEnabled
+                        ? 'bg-emerald-600 text-white'
+                        : 'text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800'
+                    }`}
+                  >
+                    ON
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void handleToggleAllOtherCities(false)}
+                    className={`px-3 py-1.5 text-xs font-bold cursor-pointer transition-colors ${
+                      !isOtherCitiesEnabled
+                        ? 'bg-rose-600 text-white'
+                        : 'text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800'
+                    }`}
+                  >
+                    OFF
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            {/* Add City Row (with optional delivery fee) */}
+            <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 max-w-2xl">
               <input
                 type="text"
                 value={newDeliveryCity}
@@ -1127,23 +1377,38 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 placeholder="Add new city (e.g. Bagh, Kotli, Chakwal)..."
                 className="flex-1 px-3 py-1.5 text-xs rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white"
               />
+              <input
+                type="number"
+                min={0}
+                value={newDeliveryCityCharge}
+                onChange={(e) => setNewDeliveryCityCharge(e.target.value)}
+                placeholder="Delivery Rs. (opt)"
+                className="w-full sm:w-36 px-3 py-1.5 text-xs font-mono rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white"
+              />
               <button
                 type="button"
                 onClick={() => void handleAddSettingsCity()}
-                className="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-bold bg-slate-900 dark:bg-amber-500 text-white dark:text-slate-950 rounded-lg cursor-pointer"
+                className="inline-flex items-center justify-center gap-1 px-3 py-1.5 text-xs font-bold bg-slate-900 dark:bg-amber-500 text-white dark:text-slate-950 rounded-lg cursor-pointer shrink-0"
               >
                 <Plus className="w-3.5 h-3.5" />
                 <span>Add City</span>
               </button>
             </div>
 
-            {/* Cities Accordion with Nested Areas */}
+            {/* Cities Accordion with Nested Areas & Delivery Fees */}
             <div className="border border-slate-200 dark:border-slate-800 rounded-xl divide-y divide-slate-100 dark:divide-slate-800 overflow-hidden">
               {deliveryCities.map((c) => {
                 const cityKey = c.id || c.name;
                 const isExpanded = expandedCityId === cityKey;
                 const areas = c.areas || [];
                 const activeAreaCount = areas.filter((a) => a.allowed).length;
+                const isMzd = isMuzaffarabadCity(c.name);
+                const cityChargeInput =
+                  cityChargeEdits[cityKey] !== undefined
+                    ? cityChargeEdits[cityKey]
+                    : c.deliveryCharge !== undefined
+                    ? String(c.deliveryCharge)
+                    : '';
 
                 return (
                   <div key={cityKey} className="bg-white dark:bg-slate-900">
@@ -1151,10 +1416,19 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                       <div className="flex items-center gap-2.5 min-w-0">
                         <input
                           type="checkbox"
-                          checked={c.allowed}
+                          checked={isMzd ? true : c.allowed}
+                          disabled={isMzd}
                           onChange={() => void handleToggleSettingsCity(c)}
-                          className="w-4 h-4 rounded text-emerald-600 cursor-pointer shrink-0"
-                          title={c.allowed ? 'Active for checkout' : 'Disabled for checkout'}
+                          className={`w-4 h-4 rounded text-emerald-600 shrink-0 ${
+                            isMzd ? 'cursor-not-allowed opacity-80' : 'cursor-pointer'
+                          }`}
+                          title={
+                            isMzd
+                              ? 'Muzaffarabad is default city and always ON'
+                              : c.allowed
+                              ? 'Active for delivery (ON)'
+                              : 'Disabled for delivery (OFF)'
+                          }
                         />
 
                         <button
@@ -1170,7 +1444,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                           {editingCityId === cityKey ? null : (
                             <span
                               className={`text-xs font-bold ${
-                                c.allowed
+                                isMzd || c.allowed
                                   ? 'text-slate-900 dark:text-white'
                                   : 'text-slate-400 line-through'
                               }`}
@@ -1179,6 +1453,12 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                             </span>
                           )}
                         </button>
+
+                        {isMzd && (
+                          <span className="px-2 py-0.5 text-[10px] font-bold rounded bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300">
+                            Default ON
+                          </span>
+                        )}
 
                         {editingCityId === cityKey && (
                           <div className="flex items-center gap-1.5">
@@ -1206,7 +1486,39 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                         )}
                       </div>
 
-                      <div className="flex items-center gap-2">
+                      <div className="flex flex-wrap items-center gap-2">
+                        {/* City Delivery Charge Entry */}
+                        <div className="flex items-center gap-1 bg-slate-50 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700 rounded-lg px-2 py-0.5">
+                          <span className="text-[10px] font-bold text-slate-500">Fee Rs.</span>
+                          <input
+                            type="number"
+                            min={0}
+                            value={cityChargeInput}
+                            onChange={(e) =>
+                              setCityChargeEdits((prev) => ({
+                                ...prev,
+                                [cityKey]: e.target.value,
+                              }))
+                            }
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') {
+                                e.preventDefault();
+                                void handleSaveCityCharge(c);
+                              }
+                            }}
+                            placeholder={isMzd ? String(cityCenterDefaultFee) : '250'}
+                            className="w-16 px-1 py-0.5 text-[11px] font-mono font-bold text-slate-900 dark:text-white bg-transparent focus:outline-hidden"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => void handleSaveCityCharge(c)}
+                            className="px-1.5 py-0.5 text-[10px] font-bold bg-amber-500 hover:bg-amber-400 text-slate-950 rounded cursor-pointer"
+                            title="Save city delivery fee"
+                          >
+                            Save Fee
+                          </button>
+                        </div>
+
                         <span className="text-[11px] font-mono text-slate-500 dark:text-slate-400">
                           {activeAreaCount}/{areas.length} Areas
                         </span>
@@ -1246,8 +1558,18 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                                 void handleAddAreasToCity(c);
                               }
                             }}
-                            placeholder={`Add area(s) in ${c.name} (comma-separated allowed, e.g. Chattar, Plate, Gojra)`}
+                            placeholder={`Add area(s) in ${c.name} (comma-separated allowed, e.g. City Center, Chattar)`}
                             className="flex-1 px-3 py-1.5 text-xs rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white"
+                          />
+                          <input
+                            type="number"
+                            min={0}
+                            value={newAreaChargeInputs[cityKey] || ''}
+                            onChange={(e) =>
+                              setNewAreaChargeInputs((prev) => ({ ...prev, [cityKey]: e.target.value }))
+                            }
+                            placeholder="Area Rs. (opt)"
+                            className="w-full sm:w-32 px-3 py-1.5 text-xs font-mono rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white"
                           />
                           <button
                             type="button"
@@ -1261,80 +1583,131 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
                         {areas.length === 0 ? (
                           <p className="text-[11px] text-slate-400">
-                            No predefined areas yet for {c.name}. Add areas above so customers can pick from a dropdown.
+                            No predefined areas yet for {c.name}. Add areas above with optional area-wise delivery charges.
                           </p>
                         ) : (
-                          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
-                            {areas.map((area) => (
-                              <div
-                                key={area.id}
-                                className={`flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg border text-xs ${
-                                  area.allowed
-                                    ? 'bg-white dark:bg-slate-900 border-emerald-200 dark:border-emerald-800/60'
-                                    : 'bg-slate-100 dark:bg-slate-800/50 border-slate-200 dark:border-slate-700 opacity-70'
-                                }`}
-                              >
-                                <div className="flex items-center gap-2 min-w-0 flex-1">
-                                  <input
-                                    type="checkbox"
-                                    checked={area.allowed}
-                                    onChange={() =>
-                                      void handleToggleCityArea(c, area.id, area.allowed)
-                                    }
-                                    className="w-3.5 h-3.5 rounded text-emerald-600 cursor-pointer shrink-0"
-                                  />
-                                  {editingAreaId === area.id ? (
-                                    <div className="flex items-center gap-1 flex-1">
+                          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-2">
+                            {areas.map((area) => {
+                              const areaChargeVal =
+                                areaChargeEdits[area.id] !== undefined
+                                  ? areaChargeEdits[area.id]
+                                  : area.deliveryCharge !== undefined
+                                  ? String(area.deliveryCharge)
+                                  : '';
+                              return (
+                                <div
+                                  key={area.id}
+                                  className={`flex flex-col gap-1.5 px-2.5 py-2 rounded-lg border text-xs ${
+                                    area.allowed
+                                      ? 'bg-white dark:bg-slate-900 border-emerald-200 dark:border-emerald-800/60'
+                                      : 'bg-slate-100 dark:bg-slate-800/50 border-slate-200 dark:border-slate-700 opacity-70'
+                                  }`}
+                                >
+                                  <div className="flex items-center justify-between gap-2">
+                                    <div className="flex items-center gap-2 min-w-0 flex-1">
                                       <input
-                                        type="text"
-                                        value={editingAreaName}
-                                        onChange={(e) => setEditingAreaName(e.target.value)}
-                                        className="w-full px-1.5 py-0.5 text-xs border border-amber-400 rounded bg-white dark:bg-slate-800"
+                                        type="checkbox"
+                                        checked={area.allowed}
+                                        onChange={() =>
+                                          void handleToggleCityArea(c, area.id, area.allowed)
+                                        }
+                                        className="w-3.5 h-3.5 rounded text-emerald-600 cursor-pointer shrink-0"
+                                      />
+                                      {editingAreaId === area.id ? (
+                                        <div className="flex items-center gap-1 flex-1">
+                                          <input
+                                            type="text"
+                                            value={editingAreaName}
+                                            onChange={(e) => setEditingAreaName(e.target.value)}
+                                            className="w-full px-1.5 py-0.5 text-xs border border-amber-400 rounded bg-white dark:bg-slate-800"
+                                          />
+                                          <button
+                                            type="button"
+                                            onClick={() => void handleSaveAreaRename(area.id)}
+                                            className="px-1.5 py-0.5 text-[10px] font-bold bg-emerald-600 text-white rounded cursor-pointer"
+                                          >
+                                            OK
+                                          </button>
+                                        </div>
+                                      ) : (
+                                        <span
+                                          className={`truncate font-semibold ${
+                                            area.allowed
+                                              ? 'text-slate-800 dark:text-slate-200'
+                                              : 'text-slate-400 line-through'
+                                          }`}
+                                        >
+                                          {area.name}
+                                        </span>
+                                      )}
+                                    </div>
+
+                                    <div className="flex items-center gap-1 shrink-0">
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          setEditingAreaId(area.id);
+                                          setEditingAreaName(area.name);
+                                        }}
+                                        className="p-1 text-slate-400 hover:text-amber-600 cursor-pointer"
+                                        title="Edit area"
+                                      >
+                                        <Pencil className="w-3 h-3" />
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() => void handleRemoveArea(area.id)}
+                                        className="p-1 text-slate-400 hover:text-red-600 cursor-pointer"
+                                        title="Remove area"
+                                      >
+                                        <Trash2 className="w-3 h-3" />
+                                      </button>
+                                    </div>
+                                  </div>
+
+                                  {/* Area-wise Delivery Fee Input */}
+                                  <div className="flex items-center justify-between gap-1.5 pt-1 border-t border-slate-100 dark:border-slate-800">
+                                    <span className="text-[10px] text-slate-500">
+                                      Area Fee (Rs.):
+                                    </span>
+                                    <div className="flex items-center gap-1">
+                                      <input
+                                        type="number"
+                                        min={0}
+                                        value={areaChargeVal}
+                                        onChange={(e) =>
+                                          setAreaChargeEdits((prev) => ({
+                                            ...prev,
+                                            [area.id]: e.target.value,
+                                          }))
+                                        }
+                                        onKeyDown={(e) => {
+                                          if (e.key === 'Enter') {
+                                            e.preventDefault();
+                                            void handleSaveAreaCharge(c, area.id, area.name);
+                                          }
+                                        }}
+                                        placeholder={
+                                          c.deliveryCharge !== undefined
+                                            ? `City (${c.deliveryCharge})`
+                                            : isMzd
+                                            ? String(cityCenterDefaultFee)
+                                            : '250'
+                                        }
+                                        className="w-20 px-1.5 py-0.5 text-[11px] font-mono rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white"
                                       />
                                       <button
                                         type="button"
-                                        onClick={() => void handleSaveAreaRename(area.id)}
-                                        className="px-1.5 py-0.5 text-[10px] font-bold bg-emerald-600 text-white rounded cursor-pointer"
+                                        onClick={() => void handleSaveAreaCharge(c, area.id, area.name)}
+                                        className="px-2 py-0.5 text-[10px] font-bold bg-slate-900 dark:bg-amber-500 text-white dark:text-slate-950 rounded cursor-pointer"
                                       >
-                                        OK
+                                        Set
                                       </button>
                                     </div>
-                                  ) : (
-                                    <span
-                                      className={`truncate font-medium ${
-                                        area.allowed
-                                          ? 'text-slate-800 dark:text-slate-200'
-                                          : 'text-slate-400 line-through'
-                                      }`}
-                                    >
-                                      {area.name}
-                                    </span>
-                                  )}
+                                  </div>
                                 </div>
-
-                                <div className="flex items-center gap-1 shrink-0">
-                                  <button
-                                    type="button"
-                                    onClick={() => {
-                                      setEditingAreaId(area.id);
-                                      setEditingAreaName(area.name);
-                                    }}
-                                    className="p-1 text-slate-400 hover:text-amber-600 cursor-pointer"
-                                    title="Edit area"
-                                  >
-                                    <Pencil className="w-3 h-3" />
-                                  </button>
-                                  <button
-                                    type="button"
-                                    onClick={() => void handleRemoveArea(area.id)}
-                                    className="p-1 text-slate-400 hover:text-red-600 cursor-pointer"
-                                    title="Remove area"
-                                  >
-                                    <Trash2 className="w-3 h-3" />
-                                  </button>
-                                </div>
-                              </div>
-                            ))}
+                              );
+                            })}
                           </div>
                         )}
                       </div>

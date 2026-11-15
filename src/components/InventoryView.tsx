@@ -20,12 +20,16 @@ import {
   CheckCircle2,
   ShieldAlert,
   Layers,
+  Video,
+  Users,
+  Phone,
 } from 'lucide-react';
-import { AppUser, BusinessProfile, CategoryRecord, ProductItem, ProductVariation } from '../types';
+import { AppUser, BusinessProfile, CategoryRecord, Investor, ProductItem, ProductVariation } from '../types';
 import {
   getCategories,
   addCategory,
   getCategoryRecords,
+  getInvestors,
   apiSaveCategoryRecord,
   apiActivateProductArrival,
 } from '../utils/storage';
@@ -46,6 +50,7 @@ interface InventoryViewProps {
   profile: BusinessProfile;
   currentUser?: AppUser;
   categoryRecords?: CategoryRecord[];
+  investors?: Investor[];
   onRefreshProducts?: () => void;
   onSaveProduct: (product: ProductItem) => void;
   onUpdateStock: (productId: string, newStock: number) => void;
@@ -60,6 +65,7 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
   profile,
   currentUser,
   categoryRecords,
+  investors,
   onRefreshProducts,
   onSaveProduct,
   onUpdateStock,
@@ -93,6 +99,11 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
   const [formIsWinning, setFormIsWinning] = useState(false);
   const [formImageUrl, setFormImageUrl] = useState('');
   const [formWebsiteUrl, setFormWebsiteUrl] = useState('');
+  const [formVideoUrl, setFormVideoUrl] = useState('');
+  const [formInvestorId, setFormInvestorId] = useState('');
+  const [formInvestorWhatsApp, setFormInvestorWhatsApp] = useState('');
+
+  const effectiveInvestors = investors && investors.length > 0 ? investors : getInvestors();
 
   // Central category management (3-level records)
   const [centralCategories, setCentralCategories] = useState<string[]>(() => getCategories());
@@ -210,6 +221,16 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
       setFormIsWinning(prod.isWinningItem);
       setFormImageUrl(prod.imageUrl || '');
       setFormWebsiteUrl(prod.websiteUrl || '');
+      setFormVideoUrl(prod.videoUrl || '');
+      const matchedInv =
+        effectiveInvestors.find((i) => i.id === prod.investorId) ||
+        effectiveInvestors.find(
+          (i) =>
+            i.assignedProductIds?.includes(prod.id) ||
+            i.productAllocations?.some((a) => a.productId === prod.id)
+        );
+      setFormInvestorId(prod.investorId || matchedInv?.id || '');
+      setFormInvestorWhatsApp(prod.investorWhatsApp || matchedInv?.whatsapp || matchedInv?.phone || '');
     } else {
       setEditingProduct(null);
       setFormName('');
@@ -231,6 +252,9 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
       setFormIsWinning(false);
       setFormImageUrl('');
       setFormWebsiteUrl('');
+      setFormVideoUrl('');
+      setFormInvestorId('');
+      setFormInvestorWhatsApp('');
     }
     setIsCreatingNewCategory(false);
     setNewCategoryInput('');
@@ -346,6 +370,9 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
       details: formDetails.trim() || editingProduct?.details,
       imageUrl: formImageUrl.trim() || undefined,
       websiteUrl: formWebsiteUrl.trim() || undefined,
+      videoUrl: formVideoUrl.trim() || undefined,
+      investorId: formInvestorId || undefined,
+      investorWhatsApp: formInvestorWhatsApp.trim() || undefined,
       createdAt: editingProduct ? editingProduct.createdAt : new Date().toISOString().split('T')[0],
       updatedAt: new Date().toISOString(),
     };
@@ -678,8 +705,8 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
       {/* 4. ADD / EDIT PRODUCT MODAL */}
       {isAddModalOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/70 backdrop-blur-xs p-4 overflow-y-auto">
-          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl w-full max-w-xl overflow-hidden shadow-2xl my-8">
-            <div className="bg-[#FFD200] p-4 flex items-center justify-between text-slate-900">
+          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl w-full max-w-xl overflow-hidden shadow-2xl my-4 max-h-[92vh] flex flex-col">
+            <div className="bg-[#FFD200] p-4 flex items-center justify-between text-slate-900 shrink-0">
               <h2 className="text-base font-extrabold tracking-tight">
                 {editingProduct ? 'Edit Product Details' : 'Add New Inventory Item (نیا آئٹم)'}
               </h2>
@@ -688,7 +715,7 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
               </button>
             </div>
 
-            <form onSubmit={handleSaveSubmit} className="p-6 space-y-4 text-xs">
+            <form onSubmit={handleSaveSubmit} className="p-6 space-y-4 text-xs overflow-y-auto">
               <div className="space-y-1">
                 <label className="font-bold text-slate-800 dark:text-slate-200 block">
                   Product Name in English *
@@ -994,6 +1021,66 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
                   placeholder="https://100dagar.pk/products/5-in-1-hot-air-styler"
                   className="w-full px-3 py-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white font-mono focus:ring-2 focus:ring-blue-400 focus:outline-hidden"
                 />
+              </div>
+
+              {/* Paste Product Video Link Area */}
+              <div className="space-y-1">
+                <label className="font-bold text-slate-800 dark:text-slate-200 flex items-center justify-between">
+                  <span className="flex items-center gap-1">
+                    <Video className="w-3.5 h-3.5 text-amber-500" />
+                    <span>Product Video Link (Paste Video URL)</span>
+                  </span>
+                  <span className="text-[10px] text-slate-400 font-normal">YouTube, TikTok, Reels, MP4</span>
+                </label>
+                <input
+                  type="url"
+                  value={formVideoUrl}
+                  onChange={(e) => setFormVideoUrl(e.target.value)}
+                  placeholder="https://www.youtube.com/watch?v=... or TikTok/MP4 video link"
+                  className="w-full px-3 py-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white font-mono focus:ring-2 focus:ring-amber-400 focus:outline-hidden"
+                />
+              </div>
+
+              {/* Investor Assignment & WhatsApp for Product Inquiries */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 p-3 rounded-xl bg-teal-50/70 dark:bg-teal-950/25 border border-teal-200 dark:border-teal-900">
+                <div className="space-y-1">
+                  <label className="font-bold text-teal-900 dark:text-teal-200 flex items-center gap-1">
+                    <Users className="w-3.5 h-3.5 text-teal-600" />
+                    <span>Assigned Investor</span>
+                  </label>
+                  <select
+                    value={formInvestorId}
+                    onChange={(e) => {
+                      const invId = e.target.value;
+                      setFormInvestorId(invId);
+                      const inv = effectiveInvestors.find((i) => i.id === invId);
+                      if (inv) {
+                        setFormInvestorWhatsApp(inv.whatsapp || inv.phone || '');
+                      }
+                    }}
+                    className="w-full px-2.5 py-2 rounded-lg border border-teal-300 dark:border-teal-800 bg-white dark:bg-slate-800 text-slate-900 dark:text-white cursor-pointer"
+                  >
+                    <option value="">-- Select Investor (Optional) --</option>
+                    {effectiveInvestors.map((inv) => (
+                      <option key={inv.id} value={inv.id}>
+                        {inv.name} ({inv.whatsapp || inv.phone})
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="space-y-1">
+                  <label className="font-bold text-teal-900 dark:text-teal-200 flex items-center gap-1">
+                    <Phone className="w-3.5 h-3.5 text-teal-600" />
+                    <span>Investor Inquiry WhatsApp</span>
+                  </label>
+                  <input
+                    type="text"
+                    value={formInvestorWhatsApp}
+                    onChange={(e) => setFormInvestorWhatsApp(e.target.value)}
+                    placeholder="e.g. 03001234567"
+                    className="w-full px-3 py-2 font-mono rounded-lg border border-teal-300 dark:border-teal-800 bg-white dark:bg-slate-800 text-slate-900 dark:text-white"
+                  />
+                </div>
               </div>
 
               <div className="pt-3 flex items-center justify-end gap-3 border-t border-slate-200 dark:border-slate-800">

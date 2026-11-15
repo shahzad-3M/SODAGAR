@@ -270,6 +270,13 @@ export function doesProductMatchCategoryFilter(
   );
 }
 
+export const DEFAULT_CITY_CENTER_DELIVERY_CHARGE = 50;
+export const DEFAULT_OTHER_CITY_DELIVERY_CHARGE = 250;
+
+export function isMuzaffarabadCity(name?: string | null): boolean {
+  return normalizeTextKey(name) === 'muzaffarabad';
+}
+
 export function slugifyId(prefix: string, name: string): string {
   const slug = name
     .trim()
@@ -280,15 +287,119 @@ export function slugifyId(prefix: string, name: string): string {
   return `${prefix}_${slug || Date.now()}`;
 }
 
-export function ensureCityAreasShape(cities: DeliveryCityConfig[]): DeliveryCityConfig[] {
-  return (cities || []).map((c, idx) => ({
-    id: c.id || slugifyId('city', c.name || `city_${idx}`),
-    name: (c.name || '').trim(),
-    allowed: c.allowed !== false,
-    areas: (c.areas || []).map((a, aIdx): DeliveryAreaConfig => ({
-      id: a.id || slugifyId('area', `${c.name}_${a.name || aIdx}`),
-      name: (a.name || '').trim(),
-      allowed: a.allowed !== false,
-    })),
-  }));
+function parseValidDeliveryCharge(val: unknown): number | undefined {
+  if (val === undefined || val === null || val === '') return undefined;
+  const num = Number(val);
+  if (!Number.isFinite(num) || num < 0) return undefined;
+  return Math.round(num);
 }
+
+export function ensureCityAreasShape(cities: DeliveryCityConfig[]): DeliveryCityConfig[] {
+  return (cities || []).map((c, idx) => {
+    const cleanCityName = (c.name || '').trim();
+    const parsedCityCharge = parseValidDeliveryCharge(c.deliveryCharge);
+    const areas = (c.areas || []).map((a, aIdx): DeliveryAreaConfig => {
+      const parsedAreaCharge = parseValidDeliveryCharge(a.deliveryCharge);
+      const areaObj: DeliveryAreaConfig = {
+        id: a.id || slugifyId('area', `${cleanCityName}_${a.name || aIdx}`),
+        name: (a.name || '').trim(),
+        allowed: a.allowed !== false,
+      };
+      if (parsedAreaCharge !== undefined) {
+        areaObj.deliveryCharge = parsedAreaCharge;
+      }
+      return areaObj;
+    });
+
+    const cityObj: DeliveryCityConfig = {
+      id: c.id || slugifyId('city', cleanCityName || `city_${idx}`),
+      name: cleanCityName,
+      allowed: isMuzaffarabadCity(cleanCityName) ? true : c.allowed !== false,
+      areas,
+    };
+    if (parsedCityCharge !== undefined) {
+      cityObj.deliveryCharge = parsedCityCharge;
+    } else if (isMuzaffarabadCity(cleanCityName)) {
+      cityObj.deliveryCharge = DEFAULT_CITY_CENTER_DELIVERY_CHARGE;
+    }
+    return cityObj;
+  });
+}
+
+export interface ResolvedDeliveryCharge {
+  charge: number;
+  source: 'area' | 'city' | 'city_center_default' | 'standard_default';
+  label: string;
+}
+
+export function resolveDeliveryCharge(
+  cities: DeliveryCityConfig[],
+  cityName?: string,
+  areaName?: string,
+  cityCenterDefault = DEFAULT_CITY_CENTER_DELIVERY_CHARGE
+): ResolvedDeliveryCharge {
+  const safeDefault =
+    Number.isFinite(cityCenterDefault) && cityCenterDefault >= 0
+      ? Math.round(cityCenterDefault)
+      : DEFAULT_CITY_CENTER_DELIVERY_CHARGE;
+
+  const normalizedCity = normalizeTextKey(cityName);
+  const normalizedArea = normalizeTextKey(areaName);
+  const cityObj = (cities || []).find((c) => normalizeTextKey(c.name) === normalizedCity);
+  const areaObj =
+    cityObj && normalizedArea
+      ? (cityObj.areas || []).find((a) => normalizeTextKey(a.name) === normalizedArea)
+      : undefined;
+
+  if (
+    areaObj &&
+    typeof areaObj.deliveryCharge === 'number' &&
+    Number.isFinite(areaObj.deliveryCharge) &&
+    areaObj.deliveryCharge >= 0
+  ) {
+    return {
+      charge: Math.round(areaObj.deliveryCharge),
+      source: 'area',
+      label: `${cityObj?.name || cityName} · ${areaObj.name}`,
+    };
+  }
+
+  if (
+    isMuzaffarabadCity(cityName) &&
+    (normalizedArea === 'city center' || normalizedArea === 'madina market')
+  ) {
+    return {
+      charge: safeDefault,
+      source: 'city_center_default',
+      label: `${cityObj?.name || 'Muzaffarabad'} · ${areaObj?.name || areaName || 'City Center'}`,
+    };
+  }
+
+  if (
+    cityObj &&
+    typeof cityObj.deliveryCharge === 'number' &&
+    Number.isFinite(cityObj.deliveryCharge) &&
+    cityObj.deliveryCharge >= 0
+  ) {
+    return {
+      charge: Math.round(cityObj.deliveryCharge),
+      source: 'city',
+      label: `${cityObj.name}${areaName ? ` · ${areaName}` : ''}`,
+    };
+  }
+
+  if (isMuzaffarabadCity(cityName)) {
+    return {
+      charge: safeDefault,
+      source: 'city_center_default',
+      label: `${cityObj?.name || 'Muzaffarabad'}${areaName ? ` · ${areaName}` : ' · City Center'}`,
+    };
+  }
+
+  return {
+    charge: DEFAULT_OTHER_CITY_DELIVERY_CHARGE,
+    source: 'standard_default',
+    label: `${cityObj?.name || cityName || 'Standard Delivery'}${areaName ? ` · ${areaName}` : ''}`,
+  };
+}
+

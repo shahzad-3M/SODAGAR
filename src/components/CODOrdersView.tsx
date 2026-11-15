@@ -36,7 +36,11 @@ import {
 import { openWhatsAppDirect } from '../utils/whatsapp';
 import { getWasalSettlements, saveWasalSettlements } from '../utils/storage';
 import { defaultDeliveryCities } from '../utils/defaultData';
-import { isProductPurchaseBlocked } from '../utils/locationCategoryHelpers';
+import {
+  DEFAULT_CITY_CENTER_DELIVERY_CHARGE,
+  isProductPurchaseBlocked,
+  resolveDeliveryCharge,
+} from '../utils/locationCategoryHelpers';
 import { AddressFieldsGroup } from './AddressFieldsGroup';
 import {
   ToastBanner,
@@ -117,16 +121,30 @@ export const CODOrdersView: React.FC<CODOrdersViewProps> = ({
   );
 
   // New Order Form State
+  const deliveryCitiesList =
+    profile.deliveryCities && profile.deliveryCities.length > 0
+      ? profile.deliveryCities
+      : defaultDeliveryCities;
+  const initialDefaultArea =
+    defaultCityName.toLowerCase() === 'muzaffarabad' ? 'City Center' : '';
+
   const [newCustName, setNewCustName] = useState('');
   const [newPhone, setNewPhone] = useState('');
   const [newCity, setNewCity] = useState(defaultCityName);
-  const [newArea, setNewArea] = useState('');
+  const [newArea, setNewArea] = useState(initialDefaultArea);
   const [newMohalla, setNewMohalla] = useState('');
   const [newLandmark, setNewLandmark] = useState('');
   const [newAddress, setNewAddress] = useState('');
   const [newProductId, setNewProductId] = useState(() => purchasableProducts[0]?.id || products[0]?.id || '');
   const [newQty, setNewQty] = useState(1);
-  const [newDeliveryFee, setNewDeliveryFee] = useState(250);
+  const [newDeliveryFee, setNewDeliveryFee] = useState(() =>
+    resolveDeliveryCharge(
+      deliveryCitiesList,
+      defaultCityName,
+      initialDefaultArea,
+      profile.defaultCityCenterDeliveryCharge ?? DEFAULT_CITY_CENTER_DELIVERY_CHARGE
+    ).charge
+  );
   const [newCourier, setNewCourier] = useState<'WASAL delivery' | 'TCS' | 'Leopards' | 'Trax' | 'PostEx' | 'Rider' | 'Self'>('WASAL delivery');
   const [newTracking, setNewTracking] = useState('');
   const [newResellerCode, setNewResellerCode] = useState('RES-100D-01');
@@ -1133,11 +1151,7 @@ export const CODOrdersView: React.FC<CODOrdersViewProps> = ({
 
               <div className="p-3 rounded-xl bg-slate-50 dark:bg-slate-800/40 border border-slate-200 dark:border-slate-800">
                 <AddressFieldsGroup
-                  cities={
-                    profile.deliveryCities && profile.deliveryCities.length > 0
-                      ? profile.deliveryCities
-                      : defaultDeliveryCities
-                  }
+                  cities={deliveryCitiesList}
                   city={newCity}
                   area={newArea}
                   mohalla={newMohalla}
@@ -1148,8 +1162,19 @@ export const CODOrdersView: React.FC<CODOrdersViewProps> = ({
                   required={true}
                   compact={true}
                   onChange={(patch) => {
+                    const nextCity = patch.city !== undefined ? patch.city : newCity;
+                    const nextArea = patch.area !== undefined ? patch.area : newArea;
                     if (patch.city !== undefined) setNewCity(patch.city);
                     if (patch.area !== undefined) setNewArea(patch.area);
+                    if (patch.city !== undefined || patch.area !== undefined) {
+                      const feeInfo = resolveDeliveryCharge(
+                        deliveryCitiesList,
+                        nextCity,
+                        nextArea,
+                        profile.defaultCityCenterDeliveryCharge ?? DEFAULT_CITY_CENTER_DELIVERY_CHARGE
+                      );
+                      setNewDeliveryFee(feeInfo.charge);
+                    }
                     if (patch.mohalla !== undefined) setNewMohalla(patch.mohalla);
                     if (patch.landmark !== undefined) setNewLandmark(patch.landmark);
                     if (patch.address !== undefined) setNewAddress(patch.address);

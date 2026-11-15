@@ -275,6 +275,7 @@ function runMigrations(db: DatabaseSync, hadExistingDb: boolean) {
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL COLLATE NOCASE UNIQUE,
         allowed INTEGER NOT NULL DEFAULT 1,
+        delivery_charge REAL,
         display_order INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
@@ -285,6 +286,7 @@ function runMigrations(db: DatabaseSync, hadExistingDb: boolean) {
         city_id TEXT NOT NULL,
         name TEXT NOT NULL,
         allowed INTEGER NOT NULL DEFAULT 1,
+        delivery_charge REAL,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         FOREIGN KEY (city_id) REFERENCES cities(id) ON DELETE CASCADE
@@ -394,19 +396,35 @@ function runMigrations(db: DatabaseSync, hadExistingDb: boolean) {
     const cityCount = Number((db.prepare('SELECT COUNT(*) as cnt FROM cities').get() as { cnt: number }).cnt || 0);
     if (cityCount === 0) {
       const insertCity = db.prepare(`
-        INSERT OR IGNORE INTO cities (id, name, allowed, display_order, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT OR IGNORE INTO cities (id, name, allowed, delivery_charge, display_order, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
       `);
       const insertArea = db.prepare(`
-        INSERT OR IGNORE INTO city_areas (id, city_id, name, allowed, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT OR IGNORE INTO city_areas (id, city_id, name, allowed, delivery_charge, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
       `);
       defaultDeliveryCities.forEach((city, idx) => {
         const cityId = city.id || slugifyId('city', city.name);
-        insertCity.run(cityId, city.name, city.allowed ? 1 : 0, idx + 1, now, now);
+        insertCity.run(
+          cityId,
+          city.name,
+          city.allowed ? 1 : 0,
+          city.deliveryCharge ?? null,
+          idx + 1,
+          now,
+          now
+        );
         (city.areas || []).forEach((area) => {
           const areaId = area.id || slugifyId('area', `${city.name}_${area.name}`);
-          insertArea.run(areaId, cityId, area.name, area.allowed ? 1 : 0, now, now);
+          insertArea.run(
+            areaId,
+            cityId,
+            area.name,
+            area.allowed ? 1 : 0,
+            area.deliveryCharge ?? null,
+            now,
+            now
+          );
         });
       });
     }
@@ -528,6 +546,60 @@ function runMigrations(db: DatabaseSync, hadExistingDb: boolean) {
 
     recordMigration('003_upgrade_upcoming_categories_locations', 'Normalized Upcoming category label, seeded multi-level sample subcategories, and synced city areas');
   }
+
+  if (!hasMigration('004_delivery_charges_city_areas')) {
+    const now = new Date().toISOString();
+
+    const cityCols = db.prepare('PRAGMA table_info(cities)').all() as Array<{ name: string }>;
+    if (!cityCols.some((c) => c.name === 'delivery_charge')) {
+      db.exec('ALTER TABLE cities ADD COLUMN delivery_charge REAL;');
+    }
+
+    const areaCols = db.prepare('PRAGMA table_info(city_areas)').all() as Array<{ name: string }>;
+    if (!areaCols.some((c) => c.name === 'delivery_charge')) {
+      db.exec('ALTER TABLE city_areas ADD COLUMN delivery_charge REAL;');
+    }
+
+    // Ensure Muzaffarabad stays active and defaults to Rs. 50 for City Center
+    const mzdRow = db
+      .prepare("SELECT id, delivery_charge FROM cities WHERE LOWER(TRIM(name)) = 'muzaffarabad'")
+      .get() as { id: string; delivery_charge: number | null } | undefined;
+
+    if (mzdRow) {
+      db.prepare(
+        'UPDATE cities SET allowed = 1, delivery_charge = COALESCE(delivery_charge, 50), updated_at = ? WHERE id = ?'
+      ).run(now, mzdRow.id);
+
+      const cityCenterArea = db
+        .prepare("SELECT id FROM city_areas WHERE city_id = ? AND LOWER(TRIM(name)) = 'city center'")
+        .get(mzdRow.id) as { id: string } | undefined;
+
+      if (!cityCenterArea) {
+        db.prepare(
+          'INSERT OR IGNORE INTO city_areas (id, city_id, name, allowed, delivery_charge, created_at, updated_at) VALUES (?, ?, ?, 1, 50, ?, ?)'
+        ).run('area_mzd_city_center', mzdRow.id, 'City Center', now, now);
+      } else {
+        db.prepare(
+          'UPDATE city_areas SET allowed = 1, delivery_charge = COALESCE(delivery_charge, 50), updated_at = ? WHERE id = ?'
+        ).run(now, cityCenterArea.id);
+      }
+
+      db.prepare(
+        "UPDATE city_areas SET delivery_charge = COALESCE(delivery_charge, 50), updated_at = ? WHERE city_id = ? AND LOWER(TRIM(name)) = 'madina market'"
+      ).run(now, mzdRow.id);
+    }
+
+    const currentProfile = getCollectionValue<BusinessProfile>(db, 'business_profile', defaultBusinessProfile);
+    if (currentProfile.defaultCityCenterDeliveryCharge === undefined) {
+      saveCollectionValue(db, 'business_profile', {
+        ...currentProfile,
+        defaultCityCenterDeliveryCharge: 50,
+      });
+    }
+    syncDeliveryCitiesIntoBusinessProfile(db);
+
+    recordMigration('004_delivery_charges_city_areas', 'Added per-city and per-area delivery_charge columns with City Center Rs. 50 default');
+  }
 }
 
 // ==========================================
@@ -597,27 +669,37 @@ export function getAllCitiesFromDb(db = getDb()): DeliveryCityConfig[] {
     .prepare('SELECT * FROM cities ORDER BY display_order ASC, name ASC')
     .all() as Array<Record<string, unknown>>;
   const areaRows = db
-    .prepare('SELECT * FROM city_areas ORDER BY name ASC')
+    .prepare("SELECT * FROM city_areas ORDER BY CASE WHEN LOWER(TRIM(name)) = 'city center' THEN 0 ELSE 1 END, name ASC")
     .all() as Array<Record<string, unknown>>;
 
   const areasByCity = new Map<string, DeliveryAreaConfig[]>();
   for (const ar of areaRows) {
     const cid = String(ar.city_id);
     const list = areasByCity.get(cid) || [];
-    list.push({
+    const areaObj: DeliveryAreaConfig = {
       id: String(ar.id),
       name: String(ar.name),
       allowed: Boolean(ar.allowed),
-    });
+    };
+    if (ar.delivery_charge !== null && ar.delivery_charge !== undefined) {
+      areaObj.deliveryCharge = Number(ar.delivery_charge);
+    }
+    list.push(areaObj);
     areasByCity.set(cid, list);
   }
 
-  return cityRows.map((cr) => ({
-    id: String(cr.id),
-    name: String(cr.name),
-    allowed: Boolean(cr.allowed),
-    areas: areasByCity.get(String(cr.id)) || [],
-  }));
+  return cityRows.map((cr) => {
+    const cityObj: DeliveryCityConfig = {
+      id: String(cr.id),
+      name: String(cr.name),
+      allowed: Boolean(cr.allowed),
+      areas: areasByCity.get(String(cr.id)) || [],
+    };
+    if (cr.delivery_charge !== null && cr.delivery_charge !== undefined) {
+      cityObj.deliveryCharge = Number(cr.delivery_charge);
+    }
+    return cityObj;
+  });
 }
 
 export function syncDeliveryCitiesIntoBusinessProfile(db = getDb()): BusinessProfile {
@@ -625,6 +707,10 @@ export function syncDeliveryCitiesIntoBusinessProfile(db = getDb()): BusinessPro
   const profile = getCollectionValue<BusinessProfile>(db, 'business_profile', defaultBusinessProfile);
   const updatedProfile: BusinessProfile = {
     ...profile,
+    defaultCityCenterDeliveryCharge:
+      profile.defaultCityCenterDeliveryCharge !== undefined
+        ? profile.defaultCityCenterDeliveryCharge
+        : 50,
     deliveryCities: ensureCityAreasShape(cities),
   };
   saveCollectionValue(db, 'business_profile', updatedProfile);
@@ -642,15 +728,20 @@ export function replaceCitiesAndAreasFromList(db: DatabaseSync, incomingCities: 
     const c = shaped[i];
     const matchByName = existingByName.get(normalizeTextKey(c.name));
     const cityId = matchByName?.id || c.id || slugifyId('city', c.name);
+    const cityCharge =
+      typeof c.deliveryCharge === 'number' && Number.isFinite(c.deliveryCharge) && c.deliveryCharge >= 0
+        ? Math.round(c.deliveryCharge)
+        : null;
     db.prepare(`
-      INSERT INTO cities (id, name, allowed, display_order, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?)
+      INSERT INTO cities (id, name, allowed, delivery_charge, display_order, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         name = excluded.name,
         allowed = excluded.allowed,
+        delivery_charge = excluded.delivery_charge,
         display_order = excluded.display_order,
         updated_at = excluded.updated_at
-    `).run(cityId, c.name, c.allowed ? 1 : 0, i + 1, now, now);
+    `).run(cityId, c.name, c.allowed ? 1 : 0, cityCharge, i + 1, now, now);
 
     if (c.areas && c.areas.length > 0) {
       for (const a of c.areas) {
@@ -658,14 +749,19 @@ export function replaceCitiesAndAreasFromList(db: DatabaseSync, incomingCities: 
           .prepare('SELECT id FROM city_areas WHERE city_id = ? AND LOWER(name) = LOWER(?)')
           .get(cityId, a.name) as { id: string } | undefined;
         const areaId = existingArea?.id || a.id || slugifyId('area', `${c.name}_${a.name}`);
+        const areaCharge =
+          typeof a.deliveryCharge === 'number' && Number.isFinite(a.deliveryCharge) && a.deliveryCharge >= 0
+            ? Math.round(a.deliveryCharge)
+            : null;
         db.prepare(`
-          INSERT INTO city_areas (id, city_id, name, allowed, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?)
+          INSERT INTO city_areas (id, city_id, name, allowed, delivery_charge, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT(id) DO UPDATE SET
             name = excluded.name,
             allowed = excluded.allowed,
+            delivery_charge = excluded.delivery_charge,
             updated_at = excluded.updated_at
-        `).run(areaId, cityId, a.name, a.allowed ? 1 : 0, now, now);
+        `).run(areaId, cityId, a.name, a.allowed ? 1 : 0, areaCharge, now, now);
       }
     }
   }

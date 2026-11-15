@@ -22,6 +22,7 @@ import {
   Sliders,
   DollarSign,
   Package,
+  Video,
 } from 'lucide-react';
 import { ProductItem, ProductVariation, ProductImportLog, CategoryRecord } from '../types';
 import {
@@ -749,6 +750,7 @@ export const ProductImporterModal: React.FC<ProductImporterModalProps> = ({
       upcomingStatus: isUpcomingItem ? 'coming_soon' : 'available',
       expectedArrivalDate: isUpcomingItem ? (upcomingArrivalDate.trim() || extractedProduct.expectedArrivalDate) : undefined,
       stockQty: isUpcomingItem ? 0 : extractedProduct.stockQty,
+      videoUrl: extractedProduct.videoUrl?.trim() || undefined,
       status: publishImmediately ? 'published' : (isDraft ? 'draft' : 'published'),
       updatedAt: new Date().toISOString(),
     };
@@ -1394,6 +1396,26 @@ export const ProductImporterModal: React.FC<ProductImporterModalProps> = ({
                           </div>
                         </div>
                       ))}
+                    </div>
+
+                    {/* Product Video Link Paste Area */}
+                    <div className="pt-3 border-t border-slate-200 dark:border-slate-800 space-y-1.5">
+                      <label className="text-xs font-bold text-slate-800 dark:text-slate-200 flex items-center gap-1.5">
+                        <Video className="w-3.5 h-3.5 text-teal-600 dark:text-teal-400" />
+                        Product Video Link (Paste Video URL — YouTube, TikTok, Reels, MP4)
+                      </label>
+                      <input
+                        type="url"
+                        value={extractedProduct.videoUrl || ''}
+                        onChange={(e) =>
+                          setExtractedProduct({
+                            ...extractedProduct,
+                            videoUrl: e.target.value,
+                          })
+                        }
+                        placeholder="https://www.youtube.com/watch?v=... or TikTok / Reels / MP4 URL"
+                        className="w-full px-3 py-2 text-xs bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-lg text-slate-900 dark:text-white focus:ring-2 focus:ring-teal-500 focus:outline-hidden font-mono"
+                      />
                     </div>
                   </div>
 

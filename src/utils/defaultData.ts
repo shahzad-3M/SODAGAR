@@ -37,8 +37,10 @@ export const defaultDeliveryCities: DeliveryCityConfig[] = [
     id: 'city_muzaffarabad',
     name: 'Muzaffarabad',
     allowed: true,
+    deliveryCharge: 50,
     areas: [
-      { id: 'area_mzd_madina', name: 'Madina Market', allowed: true },
+      { id: 'area_mzd_city_center', name: 'City Center', allowed: true, deliveryCharge: 50 },
+      { id: 'area_mzd_madina', name: 'Madina Market', allowed: true, deliveryCharge: 50 },
       { id: 'area_mzd_chattar', name: 'Chattar', allowed: true },
       { id: 'area_mzd_chehla', name: 'Chehla Bandi', allowed: true },
       { id: 'area_mzd_upper_adda', name: 'Upper Adda', allowed: true },
@@ -50,7 +52,8 @@ export const defaultDeliveryCities: DeliveryCityConfig[] = [
   {
     id: 'city_mirpur',
     name: 'Mirpur (AJK)',
-    allowed: true,
+    allowed: false,
+    deliveryCharge: 250,
     areas: [
       { id: 'area_mrp_f1', name: 'Sector F-1', allowed: true },
       { id: 'area_mrp_allama', name: 'Allama Iqbal Road', allowed: true },
@@ -60,7 +63,8 @@ export const defaultDeliveryCities: DeliveryCityConfig[] = [
   {
     id: 'city_rawalpindi',
     name: 'Rawalpindi',
-    allowed: true,
+    allowed: false,
+    deliveryCharge: 250,
     areas: [
       { id: 'area_rwp_raja', name: 'Raja Bazaar', allowed: true },
       { id: 'area_rwp_saddar', name: 'Saddar', allowed: true },
@@ -71,7 +75,8 @@ export const defaultDeliveryCities: DeliveryCityConfig[] = [
   {
     id: 'city_islamabad',
     name: 'Islamabad',
-    allowed: true,
+    allowed: false,
+    deliveryCharge: 250,
     areas: [
       { id: 'area_isb_f10', name: 'Sector F-10 Markaz', allowed: true },
       { id: 'area_isb_g11', name: 'Sector G-11', allowed: true },
@@ -81,7 +86,8 @@ export const defaultDeliveryCities: DeliveryCityConfig[] = [
   {
     id: 'city_lahore',
     name: 'Lahore',
-    allowed: true,
+    allowed: false,
+    deliveryCharge: 250,
     areas: [
       { id: 'area_lhr_shahalam', name: 'Shah Alam Market', allowed: true },
       { id: 'area_lhr_anarkali', name: 'Anarkali Bazaar', allowed: true },
@@ -93,22 +99,23 @@ export const defaultDeliveryCities: DeliveryCityConfig[] = [
   {
     id: 'city_karachi',
     name: 'Karachi',
-    allowed: true,
+    allowed: false,
+    deliveryCharge: 250,
     areas: [
       { id: 'area_khi_bolton', name: 'Bolton Market', allowed: true },
       { id: 'area_khi_saddar', name: 'Saddar', allowed: true },
       { id: 'area_khi_gulshan', name: 'Gulshan-e-Iqbal', allowed: true },
     ],
   },
-  { id: 'city_faisalabad', name: 'Faisalabad', allowed: true, areas: [{ id: 'area_fsd_katchery', name: 'Katchery Bazaar', allowed: true }] },
-  { id: 'city_multan', name: 'Multan', allowed: true, areas: [{ id: 'area_mux_hussain', name: 'Hussain Agahi', allowed: true }] },
-  { id: 'city_gujranwala', name: 'Gujranwala', allowed: true, areas: [{ id: 'area_guj_rail', name: 'Rail Bazaar', allowed: true }] },
-  { id: 'city_sialkot', name: 'Sialkot', allowed: true, areas: [{ id: 'area_skt_paris', name: 'Paris Road', allowed: true }] },
-  { id: 'city_peshawar', name: 'Peshawar', allowed: true, areas: [{ id: 'area_pew_qissa', name: 'Qissa Khwani', allowed: true }] },
-  { id: 'city_abbottabad', name: 'Abbottabad', allowed: true, areas: [{ id: 'area_abt_mandian', name: 'Mandian', allowed: true }] },
-  { id: 'city_quetta', name: 'Quetta', allowed: true, areas: [{ id: 'area_uet_jinnah', name: 'Jinnah Road', allowed: true }] },
-  { id: 'city_bahawalpur', name: 'Bahawalpur', allowed: true, areas: [{ id: 'area_bhv_farid', name: 'Farid Gate', allowed: true }] },
-  { id: 'city_sargodha', name: 'Sargodha', allowed: true, areas: [{ id: 'area_sgd_urdu', name: 'Urdu Bazaar', allowed: true }] },
+  { id: 'city_faisalabad', name: 'Faisalabad', allowed: false, deliveryCharge: 250, areas: [{ id: 'area_fsd_katchery', name: 'Katchery Bazaar', allowed: true }] },
+  { id: 'city_multan', name: 'Multan', allowed: false, deliveryCharge: 250, areas: [{ id: 'area_mux_hussain', name: 'Hussain Agahi', allowed: true }] },
+  { id: 'city_gujranwala', name: 'Gujranwala', allowed: false, deliveryCharge: 250, areas: [{ id: 'area_guj_rail', name: 'Rail Bazaar', allowed: true }] },
+  { id: 'city_sialkot', name: 'Sialkot', allowed: false, deliveryCharge: 250, areas: [{ id: 'area_skt_paris', name: 'Paris Road', allowed: true }] },
+  { id: 'city_peshawar', name: 'Peshawar', allowed: false, deliveryCharge: 250, areas: [{ id: 'area_pew_qissa', name: 'Qissa Khwani', allowed: true }] },
+  { id: 'city_abbottabad', name: 'Abbottabad', allowed: false, deliveryCharge: 250, areas: [{ id: 'area_abt_mandian', name: 'Mandian', allowed: true }] },
+  { id: 'city_quetta', name: 'Quetta', allowed: false, deliveryCharge: 250, areas: [{ id: 'area_uet_jinnah', name: 'Jinnah Road', allowed: true }] },
+  { id: 'city_bahawalpur', name: 'Bahawalpur', allowed: false, deliveryCharge: 250, areas: [{ id: 'area_bhv_farid', name: 'Farid Gate', allowed: true }] },
+  { id: 'city_sargodha', name: 'Sargodha', allowed: false, deliveryCharge: 250, areas: [{ id: 'area_sgd_urdu', name: 'Urdu Bazaar', allowed: true }] },
 ];
 
 export const defaultLoginFormConfig: LoginFormConfig = {
@@ -176,6 +183,7 @@ export const defaultBusinessProfile: BusinessProfile = {
     autoSync: true,
   },
   deliveryCities: defaultDeliveryCities,
+  defaultCityCenterDeliveryCharge: 50,
   adminPin: '580987', // USER DIRECTIVE: Owner default pin is 580987 and resettable in backend
 };
 
