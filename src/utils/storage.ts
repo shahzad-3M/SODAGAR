@@ -189,6 +189,7 @@ export function setSessionToken(token: string | null): void {
 function getAuthHeaders(): Record<string, string> {
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
+    Accept: 'application/json',
     'x-client-id': CLIENT_ID,
   };
   const token = getSessionToken();
@@ -202,6 +203,50 @@ function getAuthHeaders(): Record<string, string> {
     headers['x-actor-name'] = user.name;
   }
   return headers;
+}
+
+async function safeParseJsonResponse<T = Record<string, unknown>>(
+  res: Response
+): Promise<{ ok: boolean; status: number; data: T | null; error?: string }> {
+  const contentType = (res.headers.get('content-type') || '').toLowerCase();
+  const rawText = await res.text();
+  const trimmed = rawText.trim();
+
+  if (!trimmed) {
+    return {
+      ok: res.ok,
+      status: res.status,
+      data: null,
+      error: res.ok ? undefined : `Server returned an empty response (HTTP ${res.status}).`,
+    };
+  }
+
+  const looksLikeHtml =
+    trimmed.startsWith('<!') ||
+    trimmed.startsWith('<html') ||
+    trimmed.startsWith('<') ||
+    contentType.includes('text/html');
+
+  if (looksLikeHtml) {
+    return {
+      ok: false,
+      status: res.status,
+      data: null,
+      error: `Server returned an unexpected HTML page (HTTP ${res.status}). Please refresh or try again; if importing an external site, use the "Paste HTML Source" option below.`,
+    };
+  }
+
+  try {
+    const parsed = JSON.parse(trimmed) as T;
+    return { ok: res.ok, status: res.status, data: parsed };
+  } catch {
+    return {
+      ok: false,
+      status: res.status,
+      data: null,
+      error: `Invalid response format from server (HTTP ${res.status}).`,
+    };
+  }
 }
 
 function notifyListeners() {
@@ -243,8 +288,8 @@ function queueServerCollectionWrite(collectionKey: string, value: unknown) {
         body: JSON.stringify({ data: value }),
       });
       if (res.ok) {
-        const json = (await res.json()) as { syncVersion?: string };
-        if (json.syncVersion) currentSyncVersion = json.syncVersion;
+        const parsed = await safeParseJsonResponse<{ syncVersion?: string }>(res);
+        if (parsed.data?.syncVersion) currentSyncVersion = parsed.data.syncVersion;
       }
     })
     .catch((err) => {
@@ -304,9 +349,9 @@ export async function refreshSyncState(): Promise<boolean> {
       headers: getAuthHeaders(),
       cache: 'no-store',
     });
-    if (!res.ok) return false;
-    const data = (await res.json()) as Record<string, unknown>;
-    applyServerStateSnapshot(data);
+    const parsed = await safeParseJsonResponse<Record<string, unknown>>(res);
+    if (!parsed.ok || !parsed.data) return false;
+    applyServerStateSnapshot(parsed.data);
     notifyListeners();
     return true;
   } catch {
@@ -430,8 +475,13 @@ export async function apiAuthenticateLogin(
       cache: 'no-store',
       body: JSON.stringify({ identifier, pin }),
     });
-    if (!res.ok) return { ok: false };
-    const data = (await res.json()) as { ok: boolean; user?: Partial<AppUser>; sessionToken?: string };
+    const parsed = await safeParseJsonResponse<{
+      ok: boolean;
+      user?: Partial<AppUser>;
+      sessionToken?: string;
+    }>(res);
+    if (!parsed.ok || !parsed.data) return { ok: false };
+    const data = parsed.data;
     if (data.ok && data.sessionToken) {
       setSessionToken(data.sessionToken);
       await refreshSyncState();
@@ -464,12 +514,12 @@ export async function apiActivateProductArrival(
       cache: 'no-store',
       body: JSON.stringify(payload),
     });
-    const data = (await res.json()) as { ok?: boolean; product?: ProductItem; error?: string };
-    if (!res.ok) {
-      return { ok: false, error: data.error || 'Failed to confirm arrival.' };
+    const parsed = await safeParseJsonResponse<{ ok?: boolean; product?: ProductItem; error?: string }>(res);
+    if (!parsed.ok || !parsed.data) {
+      return { ok: false, error: parsed.data?.error || parsed.error || 'Failed to confirm arrival.' };
     }
     await refreshSyncState();
-    return { ok: true, product: data.product };
+    return { ok: true, product: parsed.data.product };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
   }
@@ -500,7 +550,7 @@ export async function apiScrapeProductUrl(
       cache: 'no-store',
       body: JSON.stringify({ url, htmlOverride }),
     });
-    const data = (await res.json()) as {
+    const parsed = await safeParseJsonResponse<{
       ok?: boolean;
       product?: ProductItem;
       diagnostics?: {
@@ -514,9 +564,13 @@ export async function apiScrapeProductUrl(
         videoFound: boolean;
       };
       error?: string;
-    };
-    if (!res.ok || !data.ok || !data.product) {
-      return { ok: false, error: data.error || 'Could not scrape product details from URL.' };
+    }>(res);
+    const data = parsed.data;
+    if (!parsed.ok || !data?.ok || !data.product) {
+      return {
+        ok: false,
+        error: data?.error || parsed.error || 'Could not scrape product details from URL.',
+      };
     }
     return { ok: true, product: data.product, diagnostics: data.diagnostics };
   } catch (err) {
@@ -538,15 +592,15 @@ export async function apiSaveCategoryRecord(
       cache: 'no-store',
       body: JSON.stringify(payload),
     });
-    const data = (await res.json()) as {
+    const parsed = await safeParseJsonResponse<{
       ok?: boolean;
       category?: CategoryRecord;
       categories?: CategoryRecord[];
       error?: string;
-    };
-    if (!res.ok) return { ok: false, error: data.error || 'Category operation failed.' };
+    }>(res);
+    if (!parsed.ok || !parsed.data) return { ok: false, error: parsed.data?.error || parsed.error || 'Category operation failed.' };
     await refreshSyncState();
-    return { ok: true, category: data.category, categories: data.categories };
+    return { ok: true, category: parsed.data.category, categories: parsed.data.categories };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
   }
@@ -561,8 +615,8 @@ export async function apiDeleteCategoryRecord(
       headers: getAuthHeaders(),
       cache: 'no-store',
     });
-    const data = (await res.json()) as { ok?: boolean; error?: string };
-    if (!res.ok) return { ok: false, error: data.error || 'Cannot delete category.' };
+    const parsed = await safeParseJsonResponse<{ ok?: boolean; error?: string }>(res);
+    if (!parsed.ok) return { ok: false, error: parsed.data?.error || parsed.error || 'Cannot delete category.' };
     await refreshSyncState();
     return { ok: true };
   } catch (err) {
@@ -582,10 +636,10 @@ export async function apiAddCity(
       cache: 'no-store',
       body: JSON.stringify({ name, allowed, deliveryCharge }),
     });
-    const data = (await res.json()) as { ok?: boolean; cities?: DeliveryCityConfig[]; error?: string };
-    if (!res.ok) return { ok: false, error: data.error || 'Failed to add city.' };
+    const parsed = await safeParseJsonResponse<{ ok?: boolean; cities?: DeliveryCityConfig[]; error?: string }>(res);
+    if (!parsed.ok) return { ok: false, error: parsed.data?.error || parsed.error || 'Failed to add city.' };
     await refreshSyncState();
-    return { ok: true, cities: data.cities };
+    return { ok: true, cities: parsed.data?.cities };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
   }
@@ -602,10 +656,10 @@ export async function apiUpdateCity(
       cache: 'no-store',
       body: JSON.stringify(updates),
     });
-    const data = (await res.json()) as { ok?: boolean; cities?: DeliveryCityConfig[]; error?: string };
-    if (!res.ok) return { ok: false, error: data.error || 'Failed to update city.' };
+    const parsed = await safeParseJsonResponse<{ ok?: boolean; cities?: DeliveryCityConfig[]; error?: string }>(res);
+    if (!parsed.ok) return { ok: false, error: parsed.data?.error || parsed.error || 'Failed to update city.' };
     await refreshSyncState();
-    return { ok: true, cities: data.cities };
+    return { ok: true, cities: parsed.data?.cities };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
   }
@@ -621,10 +675,10 @@ export async function apiToggleOtherCities(
       cache: 'no-store',
       body: JSON.stringify({ allowOtherCities }),
     });
-    const data = (await res.json()) as { ok?: boolean; cities?: DeliveryCityConfig[]; error?: string };
-    if (!res.ok) return { ok: false, error: data.error || 'Failed to toggle other cities.' };
+    const parsed = await safeParseJsonResponse<{ ok?: boolean; cities?: DeliveryCityConfig[]; error?: string }>(res);
+    if (!parsed.ok) return { ok: false, error: parsed.data?.error || parsed.error || 'Failed to toggle other cities.' };
     await refreshSyncState();
-    return { ok: true, cities: data.cities };
+    return { ok: true, cities: parsed.data?.cities };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
   }
@@ -643,10 +697,10 @@ export async function apiAddCityArea(
       cache: 'no-store',
       body: JSON.stringify({ name, allowed, deliveryCharge }),
     });
-    const data = (await res.json()) as { ok?: boolean; cities?: DeliveryCityConfig[]; error?: string };
-    if (!res.ok) return { ok: false, error: data.error || 'Failed to add area.' };
+    const parsed = await safeParseJsonResponse<{ ok?: boolean; cities?: DeliveryCityConfig[]; error?: string }>(res);
+    if (!parsed.ok) return { ok: false, error: parsed.data?.error || parsed.error || 'Failed to add area.' };
     await refreshSyncState();
-    return { ok: true, cities: data.cities };
+    return { ok: true, cities: parsed.data?.cities };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
   }
@@ -663,10 +717,10 @@ export async function apiUpdateCityArea(
       cache: 'no-store',
       body: JSON.stringify(updates),
     });
-    const data = (await res.json()) as { ok?: boolean; cities?: DeliveryCityConfig[]; error?: string };
-    if (!res.ok) return { ok: false, error: data.error || 'Failed to update area.' };
+    const parsed = await safeParseJsonResponse<{ ok?: boolean; cities?: DeliveryCityConfig[]; error?: string }>(res);
+    if (!parsed.ok) return { ok: false, error: parsed.data?.error || parsed.error || 'Failed to update area.' };
     await refreshSyncState();
-    return { ok: true, cities: data.cities };
+    return { ok: true, cities: parsed.data?.cities };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
   }
@@ -681,10 +735,10 @@ export async function apiDeleteCityArea(
       headers: getAuthHeaders(),
       cache: 'no-store',
     });
-    const data = (await res.json()) as { ok?: boolean; cities?: DeliveryCityConfig[]; error?: string };
-    if (!res.ok) return { ok: false, error: data.error || 'Failed to remove area.' };
+    const parsed = await safeParseJsonResponse<{ ok?: boolean; cities?: DeliveryCityConfig[]; error?: string }>(res);
+    if (!parsed.ok) return { ok: false, error: parsed.data?.error || parsed.error || 'Failed to remove area.' };
     await refreshSyncState();
-    return { ok: true, cities: data.cities };
+    return { ok: true, cities: parsed.data?.cities };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
   }
@@ -704,8 +758,8 @@ export async function apiSubmitCheckoutOrder(payload: {
       cache: 'no-store',
       body: JSON.stringify(payload),
     });
-    const data = (await res.json()) as { ok?: boolean; error?: string };
-    if (!res.ok) return { ok: false, error: data.error || 'Checkout blocked by server validation.' };
+    const parsed = await safeParseJsonResponse<{ ok?: boolean; error?: string }>(res);
+    if (!parsed.ok) return { ok: false, error: parsed.data?.error || parsed.error || 'Checkout blocked by server validation.' };
     await refreshSyncState();
     return { ok: true };
   } catch (err) {
@@ -721,8 +775,8 @@ export async function apiCreateServerBackup(reason = 'manual'): Promise<{ ok: bo
       cache: 'no-store',
       body: JSON.stringify({ reason }),
     });
-    const data = (await res.json()) as { ok?: boolean; error?: string };
-    if (!res.ok) return { ok: false, error: data.error || 'Backup failed.' };
+    const parsed = await safeParseJsonResponse<{ ok?: boolean; error?: string }>(res);
+    if (!parsed.ok) return { ok: false, error: parsed.data?.error || parsed.error || 'Backup failed.' };
     return { ok: true };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : 'Network error' };

@@ -144,18 +144,38 @@ export const ProductImporterModal: React.FC<ProductImporterModalProps> = ({
   const categories = getCategories();
 
   // LIVE SERVER-SIDE EXTRACTION ENGINE (Shopify JSON, JSON-LD, OpenGraph, DOM, Video, Variations)
+  const normalizeInputUrl = (raw: string): string => {
+    const trimmed = raw.trim();
+    if (!trimmed) return '';
+    if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(trimmed)) {
+      return `https://${trimmed.replace(/^\/+/, '')}`;
+    }
+    return trimmed;
+  };
+
   const handleStartImport = async (urlToFetch: string, overrideHtml?: string) => {
-    const rawUrl = urlToFetch.trim();
-    if (!rawUrl) {
+    const normalizedUrl = overrideHtml
+      ? normalizeInputUrl(urlToFetch) || 'https://supplier.example.com/product'
+      : normalizeInputUrl(urlToFetch);
+
+    if (!normalizedUrl) {
       setImportError('Please enter a valid website product URL.');
       return;
     }
 
     try {
-      new URL(rawUrl);
+      const parsedCheck = new URL(normalizedUrl);
+      if (parsedCheck.protocol !== 'http:' && parsedCheck.protocol !== 'https:') {
+        setImportError('Only http:// and https:// website links are supported.');
+        return;
+      }
     } catch {
-      setImportError('Invalid URL format. Please include http:// or https://');
+      setImportError('Invalid URL format. Example: https://store.com/products/item-name');
       return;
+    }
+
+    if (!overrideHtml && normalizedUrl !== importUrl) {
+      setImportUrl(normalizedUrl);
     }
 
     setIsLoading(true);
@@ -171,7 +191,8 @@ export const ProductImporterModal: React.FC<ProductImporterModalProps> = ({
         : 'Fetching live product page & extracting JSON-LD, OpenGraph, images, specs, variants & video...'
     );
 
-    const res = await apiScrapeProductUrl(rawUrl, overrideHtml);
+    const res = await apiScrapeProductUrl(normalizedUrl, overrideHtml);
+    const rawUrl = normalizedUrl;
     if (!res.ok || !res.product) {
       setIsLoading(false);
       setProgressPercent(0);
@@ -597,9 +618,16 @@ export const ProductImporterModal: React.FC<ProductImporterModalProps> = ({
                   <div className="relative flex-1">
                     <Globe className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
                     <input
-                      type="url"
+                      type="text"
+                      inputMode="url"
                       value={importUrl}
                       onChange={(e) => setImportUrl(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' && !isLoading) {
+                          e.preventDefault();
+                          handleStartImport(importUrl);
+                        }
+                      }}
                       placeholder="Paste e-commerce link (e.g. Shopify, WooCommerce, Amazon, Daraz, Brand store)..."
                       className="w-full pl-9 pr-3 py-2.5 text-xs bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-amber-400 font-mono"
                     />
@@ -690,18 +718,29 @@ export const ProductImporterModal: React.FC<ProductImporterModalProps> = ({
 
               {/* ERROR ALERT */}
               {importError && (
-                <div className="bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-800 rounded-xl p-4 flex items-center justify-between gap-3 text-red-800 dark:text-red-200 text-xs">
-                  <div className="flex items-center gap-2">
-                    <AlertCircle className="w-4 h-4 shrink-0 text-red-500" />
+                <div className="bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-800 rounded-xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-red-800 dark:text-red-200 text-xs">
+                  <div className="flex items-start gap-2">
+                    <AlertCircle className="w-4 h-4 shrink-0 text-red-500 mt-0.5" />
                     <span>{importError}</span>
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => handleStartImport(importUrl)}
-                    className="px-3 py-1 bg-red-600 text-white font-bold rounded hover:bg-red-500 cursor-pointer text-[11px]"
-                  >
-                    Retry
-                  </button>
+                  <div className="flex items-center gap-2 shrink-0">
+                    {!showHtmlFallback && (
+                      <button
+                        type="button"
+                        onClick={() => setShowHtmlFallback(true)}
+                        className="px-3 py-1 bg-white dark:bg-slate-800 border border-red-300 dark:border-red-700 text-red-700 dark:text-red-200 font-bold rounded hover:bg-red-100 cursor-pointer text-[11px]"
+                      >
+                        Paste HTML Source
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => handleStartImport(importUrl)}
+                      className="px-3 py-1 bg-red-600 text-white font-bold rounded hover:bg-red-500 cursor-pointer text-[11px]"
+                    >
+                      Retry
+                    </button>
+                  </div>
                 </div>
               )}
 

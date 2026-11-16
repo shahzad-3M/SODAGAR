@@ -221,33 +221,176 @@ function matchCategoryRecord(
   return undefined;
 }
 
-async function fetchHtmlWithHeaders(targetUrl: string): Promise<{ html: string; finalUrl: string }> {
+function normalizeScrapeUrl(rawUrl: string): URL {
+  let trimmed = (rawUrl || '').trim();
+  if (!trimmed) {
+    throw new Error('Please enter a product website URL.');
+  }
+  if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(trimmed)) {
+    trimmed = `https://${trimmed.replace(/^\/+/, '')}`;
+  }
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(trimmed);
+  } catch {
+    throw new Error('Invalid website link. Please paste a valid product URL (e.g. https://store.com/products/item).');
+  }
+  if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
+    throw new Error('Only http:// and https:// website links are supported.');
+  }
+  return parsedUrl;
+}
+
+function detectBotChallengePage(html: string): string | null {
+  if (!html) return null;
+  const sample = html.slice(0, 12000).toLowerCase();
+  const titleMatch = sample.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  const title = (titleMatch?.[1] || '').trim();
+
+  if (
+    title === 'just a moment...' ||
+    title.includes('attention required! | cloudflare') ||
+    sample.includes('/cdn-cgi/challenge-platform/') ||
+    sample.includes('cf-browser-verification') ||
+    sample.includes('enable javascript and cookies to continue')
+  ) {
+    return 'Cloudflare / anti-bot security challenge';
+  }
+  if (
+    sample.includes('type the characters you see in this image') ||
+    sample.includes('api-services-support@amazon.com') ||
+    sample.includes('sorry, we just need to make sure you\'re not a robot')
+  ) {
+    return 'CAPTCHA / anti-bot verification';
+  }
+  if (
+    (title === 'access denied' || title === '403 forbidden') &&
+    sample.length < 4000
+  ) {
+    return 'Access Denied protection';
+  }
+  return null;
+}
+
+async function fetchUrlText(
+  targetUrl: string,
+  headers: Record<string, string>,
+  timeoutMs = 10000
+): Promise<{ status: number; statusText: string; contentType: string; finalUrl: string; text: string }> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 14000);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const res = await fetch(targetUrl, {
       method: 'GET',
       redirect: 'follow',
       signal: controller.signal,
-      headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-      },
+      headers,
     });
-    if (!res.ok) {
-      throw new Error(`Website responded with HTTP ${res.status} (${res.statusText || 'Blocked or Unavailable'}).`);
-    }
     const contentType = res.headers.get('content-type') || '';
-    if (contentType && !contentType.includes('text/') && !contentType.includes('json') && !contentType.includes('xml')) {
-      throw new Error(`Unsupported content type (${contentType}). Please paste a product web page link.`);
-    }
-    const html = await res.text();
-    return { html, finalUrl: res.url || targetUrl };
+    const text = await res.text();
+    return {
+      status: res.status,
+      statusText: res.statusText || '',
+      contentType,
+      finalUrl: res.url || targetUrl,
+      text,
+    };
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function fetchHtmlWithHeaders(parsedUrl: URL): Promise<{ html: string; finalUrl: string }> {
+  const domain = parsedUrl.hostname.replace(/^www\./, '');
+  const primaryHeaders: Record<string, string> = {
+    'User-Agent':
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+    Accept:
+      'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Cache-Control': 'no-cache',
+    'Upgrade-Insecure-Requests': '1',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'none',
+    'Sec-Fetch-User': '?1',
+    Referer: `${parsedUrl.origin}/`,
+  };
+
+  let attempt: { status: number; statusText: string; contentType: string; finalUrl: string; text: string };
+  try {
+    attempt = await fetchUrlText(parsedUrl.href, primaryHeaders, 9500);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : '';
+    const isAbort = err instanceof Error && err.name === 'AbortError';
+    if (isAbort) {
+      throw new Error(
+        `Connection to ${domain} timed out. Use "Paste HTML Source" below as an instant fallback.`
+      );
+    }
+    throw new Error(
+      `Could not connect to ${domain}${msg ? ` (${msg})` : ''}. Check the link or use "Paste HTML Source" below.`
+    );
+  }
+
+  // Fallback retry with clean bot/minimal headers if WAF returned 403/406/429/503 or JS challenge
+  const challengePrimary = attempt.status >= 200 && attempt.status < 400 ? detectBotChallengePage(attempt.text) : null;
+  if ([403, 406, 429, 503].includes(attempt.status) || challengePrimary) {
+    try {
+      const retryAttempt = await fetchUrlText(
+        parsedUrl.href,
+        {
+          'User-Agent':
+            'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36',
+          Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.9',
+        },
+        6000
+      );
+      const retryChallenge = detectBotChallengePage(retryAttempt.text);
+      if (retryAttempt.status >= 200 && retryAttempt.status < 400 && !retryChallenge) {
+        attempt = retryAttempt;
+      }
+    } catch {
+      // keep original attempt result for diagnostic error
+    }
+  }
+
+  if (attempt.status < 200 || attempt.status >= 400) {
+    if (attempt.status === 404) {
+      throw new Error(`Product page not found on ${domain} (HTTP 404). Please check the URL.`);
+    }
+    if ([401, 403, 406, 429, 503].includes(attempt.status)) {
+      throw new Error(
+        `${domain} blocked automated fetching (HTTP ${attempt.status}). Open the product page in your browser, copy Page Source (Ctrl+U → Ctrl+A → Ctrl+C), and paste it into "Paste HTML Source" below.`
+      );
+    }
+    throw new Error(
+      `${domain} returned HTTP ${attempt.status} (${attempt.statusText || 'Unavailable'}). Try again or use "Paste HTML Source" below.`
+    );
+  }
+
+  const contentType = attempt.contentType.toLowerCase();
+  if (
+    contentType &&
+    !contentType.includes('text/') &&
+    !contentType.includes('json') &&
+    !contentType.includes('xml') &&
+    !contentType.includes('xhtml')
+  ) {
+    throw new Error(
+      `This link points to a non-webpage file (${attempt.contentType}). Please paste a product web page URL.`
+    );
+  }
+
+  const challenge = detectBotChallengePage(attempt.text);
+  if (challenge) {
+    throw new Error(
+      `${domain} showed a ${challenge} to automated requests. Open the page in your browser, copy Page Source (Ctrl+U → Ctrl+A → Ctrl+C), and use "Paste HTML Source" below.`
+    );
+  }
+
+  return { html: attempt.text, finalUrl: attempt.finalUrl };
 }
 
 interface ShopifyVariantJson {
@@ -277,9 +420,11 @@ interface ShopifyProductJson {
 
 async function tryFetchShopifyProductJson(
   parsedUrl: URL,
-  html: string
+  html = '',
+  forceAttempt = false
 ): Promise<ShopifyProductJson | null> {
   const isShopify =
+    forceAttempt ||
     /shopify\.com|cdn\.shopify\.com|Shopify\.shop|shopify-section/i.test(html) ||
     parsedUrl.pathname.includes('/products/');
   if (!isShopify) return null;
@@ -289,24 +434,90 @@ async function tryFetchShopifyProductJson(
 
   const jsonUrl = `${parsedUrl.origin}${prodMatch[1].replace(/\.json$/i, '')}.json`;
   try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 7000);
-    const res = await fetch(jsonUrl, {
-      signal: controller.signal,
-      headers: {
+    const attempt = await fetchUrlText(
+      jsonUrl,
+      {
         'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-        Accept: 'application/json',
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+        Accept: 'application/json, text/javascript, */*; q=0.01',
       },
-    });
-    clearTimeout(timer);
-    if (!res.ok) return null;
-    const data = (await res.json()) as { product?: ShopifyProductJson };
+      6000
+    );
+    if (attempt.status < 200 || attempt.status >= 400) return null;
+    const trimmed = attempt.text.trim();
+    if (!trimmed || trimmed.startsWith('<')) return null;
+    const data = JSON.parse(trimmed) as { product?: ShopifyProductJson };
     if (data?.product?.title) return data.product;
   } catch {
     return null;
   }
   return null;
+}
+
+function tryExtractShopifyJsonFromHtml(html: string): ShopifyProductJson | null {
+  const patterns = [
+    /<script[^>]*type=["']application\/json["'][^>]*data-product-json[^>]*>([\s\S]*?)<\/script>/i,
+    /<script[^>]*id=["']ProductJson[^"']*["'][^>]*>([\s\S]*?)<\/script>/i,
+  ];
+  for (const pat of patterns) {
+    const m = html.match(pat);
+    if (m?.[1]) {
+      try {
+        const parsed = JSON.parse(m[1].trim()) as ShopifyProductJson & { product?: ShopifyProductJson };
+        const prod = parsed.product || parsed;
+        if (prod?.title) return prod;
+      } catch {
+        // ignore invalid inline JSON
+      }
+    }
+  }
+  return null;
+}
+
+function extractWooVariationsFromHtml(html: string, finalUrl: string): ProductVariation[] {
+  const match = html.match(/data-product_variations=["']([\s\S]*?)["']/i);
+  if (!match?.[1]) return [];
+  try {
+    const raw = decodeHtmlEntities(match[1]);
+    const list = JSON.parse(raw) as Array<{
+      variation_id?: number | string;
+      sku?: string;
+      display_price?: number;
+      display_regular_price?: number;
+      is_in_stock?: boolean;
+      max_qty?: number;
+      attributes?: Record<string, string>;
+      image?: { url?: string; full_src?: string };
+    }>;
+    if (!Array.isArray(list)) return [];
+    return list.slice(0, 25).map((v, idx) => {
+      const attrs: Record<string, string> = {};
+      if (v.attributes) {
+        Object.entries(v.attributes).forEach(([k, val]) => {
+          if (val) {
+            const cleanKey = k.replace(/^attribute_(pa_)?/i, '').replace(/[-_]/g, ' ');
+            attrs[cleanKey || `Option ${idx + 1}`] = String(val);
+          }
+        });
+      }
+      const salePrice = typeof v.display_price === 'number' ? Math.round(v.display_price) : 0;
+      const regularPrice =
+        typeof v.display_regular_price === 'number' ? Math.round(v.display_regular_price) : salePrice;
+      return {
+        id: `var_woo_${Date.now()}_${idx + 1}`,
+        sku: v.sku || `WOO-V${idx + 1}`,
+        attributes: Object.keys(attrs).length > 0 ? attrs : { Variant: `Option ${idx + 1}` },
+        size: attrs.size || attrs.Size || Object.values(attrs)[0] || undefined,
+        color: attrs.color || attrs.Color || attrs.colour || undefined,
+        originalPrice: regularPrice,
+        salePrice,
+        stockQty: v.is_in_stock === false ? 0 : typeof v.max_qty === 'number' && v.max_qty > 0 ? v.max_qty : 25,
+        image: resolveAbsoluteUrl(v.image?.full_src || v.image?.url, finalUrl) || undefined,
+      };
+    });
+  } catch {
+    return [];
+  }
 }
 
 function collectJsonLdProducts(html: string): Array<Record<string, unknown>> {
@@ -347,30 +558,39 @@ export async function scrapeProductFromUrl(
   categories: CategoryRecord[],
   htmlOverride?: string
 ): Promise<ScrapeProductResult> {
-  let parsedUrl: URL;
-  try {
-    parsedUrl = new URL(rawUrl.trim());
-  } catch {
-    throw new Error('Invalid URL format. Please include http:// or https://');
-  }
-  if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
-    throw new Error('Only http:// and https:// URLs are supported.');
-  }
+  const parsedUrl = normalizeScrapeUrl(rawUrl);
 
   let html = '';
   let finalUrl = parsedUrl.href;
+  let directShopifyProd: ShopifyProductJson | null = null;
   const strategiesUsed: string[] = [];
 
   if (htmlOverride && htmlOverride.trim().length > 40) {
     html = htmlOverride;
+    const challenge = detectBotChallengePage(html);
+    if (challenge) {
+      throw new Error(
+        `The pasted HTML appears to be a ${challenge} page instead of the product page. Make sure the product page finished loading in your browser before copying Page Source.`
+      );
+    }
     strategiesUsed.push('Manual HTML Source');
   } else {
     if (isBlockedHostOrIp(parsedUrl.hostname)) {
       throw new Error('Private/local network URLs are restricted for security reasons.');
     }
-    const fetched = await fetchHtmlWithHeaders(parsedUrl.href);
-    html = fetched.html;
-    finalUrl = fetched.finalUrl;
+    try {
+      const fetched = await fetchHtmlWithHeaders(parsedUrl);
+      html = fetched.html;
+      finalUrl = fetched.finalUrl;
+    } catch (fetchErr) {
+      // Before failing, if URL looks like a Shopify /products/ URL, try direct .json endpoint
+      if (parsedUrl.pathname.toLowerCase().includes('/products/')) {
+        directShopifyProd = await tryFetchShopifyProductJson(parsedUrl, '', true);
+      }
+      if (!directShopifyProd) {
+        throw fetchErr;
+      }
+    }
   }
 
   const domain = new URL(finalUrl).hostname.replace(/^www\./, '');
@@ -415,8 +635,11 @@ export async function scrapeProductFromUrl(
   }
   if (metaMap.size > 0) strategiesUsed.push('OpenGraph & Meta');
 
-  // 2. Try Shopify Direct Product JSON API if not htmlOverride
-  const shopifyProd = !htmlOverride ? await tryFetchShopifyProductJson(new URL(finalUrl), html) : null;
+  // 2. Try Shopify Direct Product JSON API or Embedded Shopify JSON in HTML
+  const shopifyProd =
+    directShopifyProd ||
+    (!htmlOverride ? await tryFetchShopifyProductJson(new URL(finalUrl), html) : null) ||
+    tryExtractShopifyJsonFromHtml(html);
   if (shopifyProd) {
     strategiesUsed.push('Shopify Product JSON');
     if (shopifyProd.title) name = decodeHtmlEntities(shopifyProd.title).trim();
@@ -708,6 +931,15 @@ export async function scrapeProductFromUrl(
     ) {
       featureSeen.add(text.toLowerCase());
       features.push(text);
+    }
+  }
+
+  // 5. WooCommerce Embedded Variations Fallback
+  if (variations.length === 0 && html) {
+    const wooVars = extractWooVariationsFromHtml(html, finalUrl);
+    if (wooVars.length > 0) {
+      variations.push(...wooVars);
+      strategiesUsed.push('WooCommerce Variations JSON');
     }
   }
 

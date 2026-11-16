@@ -2,7 +2,7 @@ import 'dotenv/config';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import express, { Request, Response } from 'express';
+import express, { NextFunction, Request, Response } from 'express';
 import { createServer as createViteServer } from 'vite';
 import {
   BusinessProfile,
@@ -151,8 +151,8 @@ function resolveActor(req: Request): {
         account,
       };
     }
-    if (actorRole === 'super_admin' && actorId === 'usr_superadmin') {
-      return { id: actorId, role: 'super_admin', name: actorName || 'Shahzad Malik' };
+    if ((actorRole === 'super_admin' || actorRole === 'admin') && actorId === 'usr_superadmin') {
+      return { id: actorId, role: actorRole, name: actorName || 'Shahzad Malik' };
     }
   }
   return { role: undefined };
@@ -507,28 +507,28 @@ async function startServer() {
 
   // 5B. REAL URL PRODUCT SCRAPER ENDPOINT
   app.post('/api/products/scrape-url', async (req, res) => {
-    const actor = resolveActor(req);
-    if (
-      actor.role !== 'super_admin' &&
-      actor.role !== 'admin' &&
-      actor.role !== 'manager'
-    ) {
-      res.status(403).json({
-        error: 'Only administrators or store managers can scrape external product links.',
-      });
-      return;
-    }
-
-    const { url, htmlOverride } = (req.body || {}) as {
-      url?: string;
-      htmlOverride?: string;
-    };
-    if (!url || typeof url !== 'string' || !url.trim()) {
-      res.status(400).json({ error: 'Product URL is required.' });
-      return;
-    }
-
     try {
+      const actor = resolveActor(req);
+      if (
+        actor.role !== 'super_admin' &&
+        actor.role !== 'admin' &&
+        actor.role !== 'manager'
+      ) {
+        res.status(403).json({
+          error: 'Only administrators or store managers can scrape external product links.',
+        });
+        return;
+      }
+
+      const { url, htmlOverride } = (req.body || {}) as {
+        url?: string;
+        htmlOverride?: string;
+      };
+      if (!url || typeof url !== 'string' || !url.trim()) {
+        res.status(400).json({ error: 'Product URL is required.' });
+        return;
+      }
+
       const db = getDb();
       const categories = getAllCategoriesFromDb(db);
       const result = await scrapeProductFromUrl(url.trim(), categories, htmlOverride);
@@ -1286,6 +1286,32 @@ async function startServer() {
 
     broadcastSyncEvent(key, req.header('x-client-id'));
     res.json({ ok: true, syncVersion: getSyncVersion() });
+  });
+
+  // Ensure unmatched /api/* routes return JSON 404 (never fall through to Vite/SPA index.html)
+  app.use('/api', (_req, res) => {
+    res.status(404).json({ error: 'API endpoint not found.' });
+  });
+
+  // /api JSON error handler BEFORE Vite/static middleware so malformed JSON or payload errors always return JSON
+  app.use('/api', (err: unknown, _req: Request, res: Response, next: NextFunction) => {
+    if (res.headersSent) {
+      next(err);
+      return;
+    }
+    const errObj = err as { status?: number; statusCode?: number; type?: string; message?: string };
+    const status =
+      errObj?.statusCode ||
+      errObj?.status ||
+      (errObj?.type === 'entity.too.large' ? 413 : 500);
+    res.status(status).json({
+      error:
+        status === 413
+          ? 'Submitted payload is too large. Please paste only the product HTML body.'
+          : status === 400
+          ? 'Malformed JSON request body.'
+          : errObj?.message || 'Unexpected server error.',
+    });
   });
 
   // Frontend middleware / static dist serving
