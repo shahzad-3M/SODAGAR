@@ -16,6 +16,7 @@ import {
   LoginAuditRecord,
   LoginFormConfig,
   LuckyDrawEvent,
+  MonthlyExpense,
   ProductBroadcast,
   ProductImportLog,
   ProductItem,
@@ -108,6 +109,7 @@ const STORAGE_KEYS = {
   COMMISSIONS: '100dagar_commissions_v5',
   IMPORT_LOGS: '100dagar_import_logs_v5',
   WASAL_SETTLEMENTS: '100dagar_wasal_settlements_v5',
+  MONTHLY_EXPENSES: '100dagar_monthly_expenses_v5',
 };
 
 const MIGRATION_FLAG_KEY = '100dagar_server_migrated_v1';
@@ -146,6 +148,7 @@ const STORAGE_TO_COLLECTION: Record<string, string> = {
   [STORAGE_KEYS.COMMISSIONS]: 'commission_records',
   [STORAGE_KEYS.IMPORT_LOGS]: 'import_logs',
   [STORAGE_KEYS.WASAL_SETTLEMENTS]: 'wasal_settlements',
+  [STORAGE_KEYS.MONTHLY_EXPENSES]: 'monthly_expenses',
 };
 
 const COLLECTION_TO_STORAGE: Record<string, string> = Object.fromEntries(
@@ -469,6 +472,55 @@ export async function apiActivateProductArrival(
     return { ok: true, product: data.product };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
+export async function apiScrapeProductUrl(
+  url: string,
+  htmlOverride?: string
+): Promise<{
+  ok: boolean;
+  product?: ProductItem;
+  diagnostics?: {
+    strategiesUsed: string[];
+    currencyDetected: string;
+    originalPriceText?: string;
+    imagesFound: number;
+    specsFound: number;
+    featuresFound: number;
+    variantsFound: number;
+    videoFound: boolean;
+  };
+  error?: string;
+}> {
+  try {
+    const res = await fetch('/api/products/scrape-url', {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      cache: 'no-store',
+      body: JSON.stringify({ url, htmlOverride }),
+    });
+    const data = (await res.json()) as {
+      ok?: boolean;
+      product?: ProductItem;
+      diagnostics?: {
+        strategiesUsed: string[];
+        currencyDetected: string;
+        originalPriceText?: string;
+        imagesFound: number;
+        specsFound: number;
+        featuresFound: number;
+        variantsFound: number;
+        videoFound: boolean;
+      };
+      error?: string;
+    };
+    if (!res.ok || !data.ok || !data.product) {
+      return { ok: false, error: data.error || 'Could not scrape product details from URL.' };
+    }
+    return { ok: true, product: data.product, diagnostics: data.diagnostics };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Network error during URL scrape' };
   }
 }
 
@@ -991,6 +1043,15 @@ export function saveWasalSettlements(settlements: WasalSettlement[]): void {
   saveToStorage(STORAGE_KEYS.WASAL_SETTLEMENTS, settlements);
 }
 
+// Monthly Overhead & Manual Expenses
+export function getMonthlyExpenses(): MonthlyExpense[] {
+  return loadFromStorage<MonthlyExpense[]>(STORAGE_KEYS.MONTHLY_EXPENSES, []);
+}
+
+export function saveMonthlyExpenses(expenses: MonthlyExpense[]): void {
+  saveToStorage(STORAGE_KEYS.MONTHLY_EXPENSES, expenses);
+}
+
 // HR Employees
 export function getEmployees(): Employee[] {
   return loadFromStorage<Employee[]>(STORAGE_KEYS.EMPLOYEES, defaultEmployees);
@@ -1467,6 +1528,7 @@ export function exportAllDataJSON(): string {
     commissionRecords: getCommissionRecords(),
     importLogs: getProductImportLogs(),
     wasalSettlements: getWasalSettlements(),
+    monthlyExpenses: getMonthlyExpenses(),
   };
   return JSON.stringify(data, null, 2);
 }
@@ -1503,6 +1565,7 @@ export function importAllDataJSON(jsonStr: string): boolean {
     if (parsed.commissionRecords) saveCommissionRecords(parsed.commissionRecords);
     if (parsed.importLogs) saveProductImportLogs(parsed.importLogs);
     if (parsed.wasalSettlements) saveWasalSettlements(parsed.wasalSettlements);
+    if (parsed.monthlyExpenses) saveMonthlyExpenses(parsed.monthlyExpenses);
     return true;
   } catch (e) {
     console.error('Failed to import JSON data', e);

@@ -822,4 +822,32 @@ export interface ProductImportLog {
   notes?: string;
 }
 
+// MONTHLY OVERHEAD & MANUAL EXPENSES
+export type ExpenseCategory =
+  | 'rent'
+  | 'utilities'
+  | 'salaries'
+  | 'marketing'
+  | 'packaging'
+  | 'courier'
+  | 'maintenance'
+  | 'software'
+  | 'tax_fees'
+  | 'other';
 
+export interface MonthlyExpense {
+  id: string;
+  title: string;
+  urduTitle?: string;
+  category: ExpenseCategory;
+  amount: number;
+  month: string; // YYYY-MM
+  date: string; // YYYY-MM-DD
+  paymentStatus: 'paid' | 'pending';
+  paymentMode: PaymentMode;
+  isRecurringMonthly?: boolean;
+  notes?: string;
+  recordedBy?: string;
+  createdAt: string;
+  updatedAt?: string;
+}

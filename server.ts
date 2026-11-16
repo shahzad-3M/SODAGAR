@@ -10,6 +10,7 @@ import {
   CODOrder,
   Customer,
   DeliveryCityConfig,
+  MonthlyExpense,
   ProductItem,
   Reseller,
   Transaction,
@@ -54,6 +55,7 @@ import {
   upsertCustomerRow,
   upsertProductRow,
 } from './src/server/db';
+import { scrapeProductFromUrl } from './src/server/productScraper';
 
 const PORT = Number(process.env.PORT || 3000);
 const SESSION_SECRET = process.env.SESSION_SECRET || crypto.createHash('sha256').update(`100dagar_${process.cwd()}`).digest('hex');
@@ -501,6 +503,105 @@ async function startServer() {
 
     broadcastSyncEvent('products', req.header('x-client-id'));
     res.json({ ok: true, product: saved, syncVersion: getSyncVersion() });
+  });
+
+  // 5B. REAL URL PRODUCT SCRAPER ENDPOINT
+  app.post('/api/products/scrape-url', async (req, res) => {
+    const actor = resolveActor(req);
+    if (
+      actor.role !== 'super_admin' &&
+      actor.role !== 'admin' &&
+      actor.role !== 'manager'
+    ) {
+      res.status(403).json({
+        error: 'Only administrators or store managers can scrape external product links.',
+      });
+      return;
+    }
+
+    const { url, htmlOverride } = (req.body || {}) as {
+      url?: string;
+      htmlOverride?: string;
+    };
+    if (!url || typeof url !== 'string' || !url.trim()) {
+      res.status(400).json({ error: 'Product URL is required.' });
+      return;
+    }
+
+    try {
+      const db = getDb();
+      const categories = getAllCategoriesFromDb(db);
+      const result = await scrapeProductFromUrl(url.trim(), categories, htmlOverride);
+      res.json({
+        ok: true,
+        product: result.product,
+        diagnostics: result.diagnostics,
+      });
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : 'Unable to fetch or parse product page.';
+      res.status(422).json({ error: message });
+    }
+  });
+
+  // 5C. MONTHLY EXPENSES ENDPOINTS (PRESERVES ALL EXISTING DATA)
+  app.get('/api/expenses', (_req, res) => {
+    const db = getDb();
+    res.json({
+      expenses: getCollectionValue<MonthlyExpense[]>(db, 'monthly_expenses', []),
+    });
+  });
+
+  app.post('/api/expenses', (req, res) => {
+    const actor = resolveActor(req);
+    if (actor.role !== 'super_admin' && actor.role !== 'admin' && actor.role !== 'manager') {
+      res.status(403).json({ error: 'Unauthorized to record expenses.' });
+      return;
+    }
+    const incoming = req.body as Partial<MonthlyExpense>;
+    if (!incoming?.title?.trim() || !Number.isFinite(Number(incoming.amount))) {
+      res.status(400).json({ error: 'Expense title and valid amount are required.' });
+      return;
+    }
+    const db = getDb();
+    const list = getCollectionValue<MonthlyExpense[]>(db, 'monthly_expenses', []);
+    const now = new Date().toISOString();
+    const dateStr = incoming.date || now.split('T')[0];
+    const expense: MonthlyExpense = {
+      id: incoming.id || `exp_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      title: incoming.title.trim(),
+      urduTitle: incoming.urduTitle?.trim() || undefined,
+      category: incoming.category || 'other',
+      amount: Math.max(0, Math.round(Number(incoming.amount))),
+      month: incoming.month || dateStr.slice(0, 7),
+      date: dateStr,
+      paymentStatus: incoming.paymentStatus || 'paid',
+      paymentMode: incoming.paymentMode || 'cash',
+      isRecurringMonthly: Boolean(incoming.isRecurringMonthly),
+      notes: incoming.notes?.trim() || undefined,
+      recordedBy: incoming.recordedBy || actor.name || 'Admin',
+      createdAt: incoming.createdAt || now,
+      updatedAt: now,
+    };
+    const exists = list.some((e) => e.id === expense.id);
+    const nextList = exists ? list.map((e) => (e.id === expense.id ? expense : e)) : [expense, ...list];
+    saveCollectionValue(db, 'monthly_expenses', nextList);
+    broadcastSyncEvent('monthly_expenses', req.header('x-client-id'));
+    res.json({ ok: true, expense, expenses: nextList, syncVersion: getSyncVersion() });
+  });
+
+  app.delete('/api/expenses/:id', (req, res) => {
+    const actor = resolveActor(req);
+    if (actor.role !== 'super_admin' && actor.role !== 'admin') {
+      res.status(403).json({ error: 'Only admins can delete monthly expenses.' });
+      return;
+    }
+    const db = getDb();
+    const list = getCollectionValue<MonthlyExpense[]>(db, 'monthly_expenses', []);
+    const nextList = list.filter((e) => e.id !== req.params.id);
+    saveCollectionValue(db, 'monthly_expenses', nextList);
+    broadcastSyncEvent('monthly_expenses', req.header('x-client-id'));
+    res.json({ ok: true, expenses: nextList, syncVersion: getSyncVersion() });
   });
 
   // 6. MULTI-LEVEL CATEGORIES (3 LEVELS)

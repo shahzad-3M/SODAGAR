@@ -37,6 +37,7 @@ interface ReportsViewProps {
   onOpenInvoiceModal: (tx: Transaction, customer: Customer) => void;
   userRole?: string;
   currentUser?: { customerId?: string; role?: string; name?: string; phone?: string };
+  onOpenFinancialMaster?: () => void;
 }
 
 export const ReportsView: React.FC<ReportsViewProps> = ({
@@ -48,6 +49,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
   onOpenInvoiceModal,
   userRole = 'admin',
   currentUser,
+  onOpenFinancialMaster,
 }) => {
   const [dateRange, setDateRange] = useState<'all' | 'this_month' | 'last_month' | 'this_week'>('this_month');
   const [reportType, setReportType] = useState<'daily_closing' | 'wasal_daybook' | 'summary' | 'daybook'>('daily_closing');
@@ -538,6 +540,17 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                 All Time
               </button>
             </div>
+
+            {onOpenFinancialMaster && (
+              <button
+                type="button"
+                onClick={onOpenFinancialMaster}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold text-slate-950 bg-amber-400 hover:bg-amber-300 rounded-lg cursor-pointer shadow-xs"
+              >
+                <Wallet className="w-3.5 h-3.5" />
+                Profit Master &amp; Monthly Expenses
+              </button>
+            )}
 
             <button
               onClick={handleExportCSV}

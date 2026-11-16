@@ -16,21 +16,28 @@ import {
   Save,
   Share2,
   Copy,
-  Image as ImageIcon,
 } from 'lucide-react';
 import { AppUser, BusinessProfile, Customer, Investor, ProductItem } from '../types';
 import {
   buildDirectProductWhatsAppMessage,
   buildInvestorProductInquiryMessage,
+  buildProductPageUrl,
   buildProfessionalCustomerProductShareMessage,
-  extractCustomerLastName,
   generateProductPriceCardFile,
   openWhatsAppDirect,
   parseProductVideoUrl,
   resolveProductInvestorContact,
 } from '../utils/whatsapp';
+import { defaultDeliveryCities } from '../utils/defaultData';
 import { getInvestors } from '../utils/storage';
-import { isProductPurchaseBlocked } from '../utils/locationCategoryHelpers';
+import {
+  DEFAULT_CITY_CENTER_DELIVERY_CHARGE,
+  ensureCityAreasShape,
+  isMuzaffarabadCity,
+  isProductPurchaseBlocked,
+  normalizeTextKey,
+  resolveDeliveryCharge,
+} from '../utils/locationCategoryHelpers';
 
 interface ProductDetailsModalProps {
   product: ProductItem | null;
@@ -59,7 +66,6 @@ export const ProductDetailsModal: React.FC<ProductDetailsModalProps> = ({
   profile,
   investors,
   currentUser,
-  customers = [],
   isCustomerView = false,
   canEditProduct = false,
   onUpdateProduct,
@@ -71,10 +77,21 @@ export const ProductDetailsModal: React.FC<ProductDetailsModalProps> = ({
   const [addedAnimation, setAddedAnimation] = useState(false);
   const [videoLinkInput, setVideoLinkInput] = useState('');
   const [videoSavedToast, setVideoSavedToast] = useState(false);
-  const [quoteCustomerName, setQuoteCustomerName] = useState('');
-  const [quoteCustomerPhone, setQuoteCustomerPhone] = useState('');
+  const [estimateCity, setEstimateCity] = useState('Muzaffarabad');
+  const [estimateArea, setEstimateArea] = useState('City Center');
   const [isSharingCard, setIsSharingCard] = useState(false);
   const [shareFeedback, setShareFeedback] = useState<string | null>(null);
+
+  const cityConfigs = ensureCityAreasShape(
+    profile.deliveryCities && profile.deliveryCities.length > 0
+      ? profile.deliveryCities
+      : defaultDeliveryCities
+  );
+  const activeDeliveryCities = cityConfigs.filter((c) => c.allowed);
+  const defaultEstimateCity =
+    activeDeliveryCities.find((c) => isMuzaffarabadCity(c.name))?.name ||
+    activeDeliveryCities[0]?.name ||
+    'Muzaffarabad';
 
   useEffect(() => {
     if (!isOpen || !product) return;
@@ -84,15 +101,13 @@ export const ProductDetailsModal: React.FC<ProductDetailsModalProps> = ({
     setVideoLinkInput(product.videoUrl || '');
     setVideoSavedToast(false);
     setShareFeedback(null);
-    const defaultCustName =
-      currentUser?.isAuthenticated && currentUser.name
-        ? currentUser.name
-        : '';
-    setQuoteCustomerName(defaultCustName);
-    setQuoteCustomerPhone(
-      currentUser?.isAuthenticated && currentUser.role === 'customer' && currentUser.phone
-        ? currentUser.phone
-        : ''
+    setEstimateCity(defaultEstimateCity);
+    const cityObj = activeDeliveryCities.find(
+      (c) => normalizeTextKey(c.name) === normalizeTextKey(defaultEstimateCity)
+    );
+    const activeAreas = (cityObj?.areas || []).filter((a) => a.allowed);
+    setEstimateArea(
+      activeAreas[0]?.name || (isMuzaffarabadCity(defaultEstimateCity) ? 'City Center' : '')
     );
     if (product.variations && product.variations.length > 0) {
       setSelectedVariationIndex(0);
@@ -103,7 +118,7 @@ export const ProductDetailsModal: React.FC<ProductDetailsModalProps> = ({
         product.selectedSize || (product.sizes && product.sizes.length > 0 ? product.sizes[0] : 'Standard')
       );
     }
-  }, [isOpen, product?.id, product?.videoUrl, currentUser?.isAuthenticated, currentUser?.name, currentUser?.phone, currentUser?.role]);
+  }, [isOpen, product?.id, product?.videoUrl, defaultEstimateCity]);
 
   if (!isOpen || !product) return null;
 
@@ -152,9 +167,20 @@ export const ProductDetailsModal: React.FC<ProductDetailsModalProps> = ({
   };
 
   const resolvedCustomerName =
-    quoteCustomerName.trim() ||
-    (currentUser?.isAuthenticated ? currentUser.name : undefined);
-  const resolvedCustomerLastName = extractCustomerLastName(resolvedCustomerName);
+    currentUser?.isAuthenticated && currentUser.name ? currentUser.name : undefined;
+
+  const selectedEstimateCityObj =
+    activeDeliveryCities.find(
+      (c) => normalizeTextKey(c.name) === normalizeTextKey(estimateCity)
+    ) || activeDeliveryCities[0];
+  const estimateCityAreas = (selectedEstimateCityObj?.areas || []).filter((a) => a.allowed);
+  const resolvedEstimateDelivery = resolveDeliveryCharge(
+    cityConfigs,
+    selectedEstimateCityObj?.name || estimateCity,
+    estimateArea,
+    profile.defaultCityCenterDeliveryCharge ?? DEFAULT_CITY_CENTER_DELIVERY_CHARGE
+  );
+  const estimatedOrderTotal = activePrice * quantity + resolvedEstimateDelivery.charge;
 
   const handleDirectWhatsAppOrder = () => {
     const text = buildDirectProductWhatsAppMessage(product, profile, {
@@ -217,7 +243,7 @@ export const ProductDetailsModal: React.FC<ProductDetailsModalProps> = ({
           text: shareText,
           files: [cardFile],
         });
-        setShareFeedback('Product price image & greeting shared.');
+        setShareFeedback('Product price card shared.');
         return;
       }
 
@@ -235,16 +261,16 @@ export const ProductDetailsModal: React.FC<ProductDetailsModalProps> = ({
       if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
         await navigator.clipboard.writeText(shareText);
       }
-      setShareFeedback('Price image card downloaded & professional message copied — ready to send in WhatsApp.');
+      setShareFeedback('Product price card downloaded & link copied.');
     } catch (err) {
       if ((err as { name?: string })?.name !== 'AbortError') {
         try {
           if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
             await navigator.clipboard.writeText(shareText);
           }
-          setShareFeedback('Professional message copied to clipboard.');
+          setShareFeedback('Product details copied to clipboard.');
         } catch {
-          setShareFeedback('Ready to send via WhatsApp.');
+          setShareFeedback('Unable to share right now.');
         }
       }
     } finally {
@@ -252,20 +278,15 @@ export const ProductDetailsModal: React.FC<ProductDetailsModalProps> = ({
     }
   };
 
-  const handleSendProfessionalQuote = () => {
-    const targetPhone = quoteCustomerPhone.trim() || profile.phone || '03125256266';
-    openWhatsAppDirect(targetPhone, getProfessionalShareMessage());
-  };
-
-  const handleCopyProfessionalMessage = async () => {
-    const shareText = getProfessionalShareMessage();
+  const handleCopyProductLink = async () => {
+    const url = buildProductPageUrl(product.id);
     try {
       if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(shareText);
+        await navigator.clipboard.writeText(url);
       }
-      setShareFeedback('Professional greeting & price message copied.');
+      setShareFeedback('Direct product link copied.');
     } catch {
-      setShareFeedback('Unable to access clipboard — use Send on WhatsApp.');
+      setShareFeedback('Unable to copy link automatically.');
     }
   };
 
@@ -700,83 +721,117 @@ export const ProductDetailsModal: React.FC<ProductDetailsModalProps> = ({
                 )}
               </div>
 
-              {/* SHARE PRODUCT IMAGE & PRICE WITH CUSTOMER LAST-NAME GREETING */}
-              <div className="p-3 rounded-xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-800 space-y-2.5">
+              {/* PRODUCT DELIVERY ESTIMATOR & 1-CLICK SHARE (CUSTOMER-FRIENDLY PRODUCT INFO) */}
+              <div className="p-3.5 rounded-xl bg-slate-50/80 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-700/80 space-y-3">
                 <div className="flex items-center justify-between gap-2">
                   <span className="text-xs font-bold text-slate-900 dark:text-white flex items-center gap-1.5">
-                    <ImageIcon className="w-3.5 h-3.5 text-amber-500" />
-                    <span>Share Product Image &amp; Price Quote</span>
+                    <Truck className="w-3.5 h-3.5 text-amber-500" />
+                    <span>Delivery &amp; Dispatch Estimate</span>
                   </span>
-                  <span className="text-[10px] font-semibold text-teal-700 dark:text-teal-300">
-                    {resolvedCustomerLastName
-                      ? `Greeting: Dear Mr./Ms. ${resolvedCustomerLastName}`
-                      : 'Professional Quote Format'}
+                  <span className="text-[11px] font-medium text-slate-500 dark:text-slate-400">
+                    {profile.shippingPartner?.name || 'WASAL Delivery'} · Cash on Delivery
                   </span>
                 </div>
 
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                  <div>
-                    <label className="block text-[10px] font-semibold text-slate-500 dark:text-slate-400 mb-0.5">
-                      Customer Full Name (uses Last Name)
-                    </label>
-                    <input
-                      type="text"
-                      value={quoteCustomerName}
-                      onChange={(e) => setQuoteCustomerName(e.target.value)}
-                      placeholder="e.g. Tariq Mahmood"
-                      list="product-quote-customers"
-                      className="w-full px-2.5 py-1.5 text-xs rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-amber-400"
-                    />
-                    {customers.length > 0 && !isCustomerView && (
-                      <datalist id="product-quote-customers">
-                        {customers.slice(0, 40).map((c) => (
-                          <option key={c.id} value={c.name} />
+                {activeDeliveryCities.length > 0 && (
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                    <div>
+                      <label className="block text-[10px] font-semibold text-slate-500 dark:text-slate-400 mb-1">
+                        Delivery City
+                      </label>
+                      <select
+                        value={selectedEstimateCityObj?.name || estimateCity}
+                        onChange={(e) => {
+                          const nextCity = e.target.value;
+                          setEstimateCity(nextCity);
+                          const cObj = activeDeliveryCities.find(
+                            (c) => normalizeTextKey(c.name) === normalizeTextKey(nextCity)
+                          );
+                          const nextAreas = (cObj?.areas || []).filter((a) => a.allowed);
+                          setEstimateArea(
+                            nextAreas[0]?.name || (isMuzaffarabadCity(nextCity) ? 'City Center' : '')
+                          );
+                        }}
+                        className="w-full px-2.5 py-1.5 text-xs rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-amber-400"
+                      >
+                        {activeDeliveryCities.map((c) => (
+                          <option key={c.id || c.name} value={c.name}>
+                            {c.name}
+                          </option>
                         ))}
-                      </datalist>
-                    )}
+                      </select>
+                    </div>
+
+                    <div>
+                      <label className="block text-[10px] font-semibold text-slate-500 dark:text-slate-400 mb-1">
+                        Area / Sector
+                      </label>
+                      {estimateCityAreas.length > 0 ? (
+                        <select
+                          value={estimateArea}
+                          onChange={(e) => setEstimateArea(e.target.value)}
+                          className="w-full px-2.5 py-1.5 text-xs rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-amber-400"
+                        >
+                          {estimateCityAreas.map((a) => (
+                            <option key={a.id} value={a.name}>
+                              {a.name}
+                              {typeof a.deliveryCharge === 'number' ? ` (Rs. ${a.deliveryCharge})` : ''}
+                            </option>
+                          ))}
+                        </select>
+                      ) : (
+                        <div className="px-2.5 py-1.5 text-xs rounded-lg border border-slate-200 dark:border-slate-700 bg-white/70 dark:bg-slate-900/60 text-slate-500 dark:text-slate-400">
+                          Standard City Coverage
+                        </div>
+                      )}
+                    </div>
                   </div>
-                  <div>
-                    <label className="block text-[10px] font-semibold text-slate-500 dark:text-slate-400 mb-0.5">
-                      Customer WhatsApp (Optional)
-                    </label>
-                    <input
-                      type="text"
-                      value={quoteCustomerPhone}
-                      onChange={(e) => {
-                        setQuoteCustomerPhone(e.target.value);
-                      }}
-                      placeholder={profile.phone || '03125256266'}
-                      className="w-full px-2.5 py-1.5 text-xs font-mono rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-amber-400"
-                    />
+                )}
+
+                <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-slate-200/80 dark:border-slate-700/80 text-xs">
+                  <div className="text-slate-600 dark:text-slate-300">
+                    <span>Shipping ({resolvedEstimateDelivery.label}): </span>
+                    <span className="font-mono tabular-nums font-bold text-slate-900 dark:text-white">
+                      {profile.currencySymbol}{resolvedEstimateDelivery.charge.toLocaleString('en-PK')}
+                    </span>
                   </div>
+                  {!isProductPurchaseBlocked(product) && (
+                    <div className="text-slate-700 dark:text-slate-200 font-semibold">
+                      <span>Est. Total ({quantity}x + Delivery): </span>
+                      <span className="font-mono tabular-nums font-black text-slate-900 dark:text-white">
+                        {profile.currencySymbol}{estimatedOrderTotal.toLocaleString('en-PK')}
+                      </span>
+                    </div>
+                  )}
                 </div>
 
-                <div className="flex flex-wrap items-center gap-1.5">
+                <div className="text-[11px] text-slate-500 dark:text-slate-400 flex flex-wrap items-center gap-x-2 gap-y-1">
+                  <span>
+                    {isProductPurchaseBlocked(product)
+                      ? 'Pre-arrival informational item · Delivery charges apply once stocked'
+                      : product.stockQty > 0
+                      ? `${product.stockQty} units ready to dispatch · Same-day dispatch inside Muzaffarabad`
+                      : 'Temporarily out of stock · Confirm restock via WhatsApp'}
+                  </span>
+                </div>
+
+                <div className="pt-2 border-t border-slate-200/80 dark:border-slate-700/80 flex flex-wrap items-center gap-2">
                   <button
                     type="button"
                     disabled={isSharingCard}
                     onClick={handleSharePriceImageCard}
-                    className="flex-1 min-w-[140px] py-1.5 px-3 bg-slate-900 hover:bg-slate-800 dark:bg-amber-500 dark:hover:bg-amber-400 text-white dark:text-slate-950 font-bold text-[11px] rounded-lg transition-colors flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-60"
+                    className="flex-1 min-w-[140px] py-1.5 px-3 bg-white dark:bg-slate-900 hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-800 dark:text-slate-100 border border-slate-300 dark:border-slate-700 font-semibold text-[11px] rounded-lg transition-colors flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-60"
                   >
-                    <Share2 className="w-3.5 h-3.5" />
-                    <span>{isSharingCard ? 'Preparing Image...' : 'Share Image & Price'}</span>
+                    <Share2 className="w-3.5 h-3.5 text-amber-600 dark:text-amber-400" />
+                    <span>{isSharingCard ? 'Preparing Card...' : 'Share Product Card'}</span>
                   </button>
                   <button
                     type="button"
-                    onClick={handleSendProfessionalQuote}
-                    className="flex-1 min-w-[140px] py-1.5 px-3 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-[11px] rounded-lg transition-colors flex items-center justify-center gap-1.5 cursor-pointer"
-                  >
-                    <MessageSquare className="w-3.5 h-3.5" />
-                    <span>Send Quote on WhatsApp</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={handleCopyProfessionalMessage}
-                    className="py-1.5 px-2.5 bg-white dark:bg-slate-900 hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 border border-slate-300 dark:border-slate-700 font-bold text-[11px] rounded-lg transition-colors flex items-center gap-1 cursor-pointer"
-                    title="Copy professional message"
+                    onClick={handleCopyProductLink}
+                    className="py-1.5 px-3 bg-white dark:bg-slate-900 hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-200 border border-slate-300 dark:border-slate-700 font-semibold text-[11px] rounded-lg transition-colors flex items-center justify-center gap-1.5 cursor-pointer"
                   >
                     <Copy className="w-3.5 h-3.5" />
-                    <span>Copy</span>
+                    <span>Copy Link</span>
                   </button>
                 </div>
 

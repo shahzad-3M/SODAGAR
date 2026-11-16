@@ -27,6 +27,9 @@ import {
   Receipt,
   LogIn,
   LogOut,
+  Calculator,
+  CreditCard,
+  Tag,
 } from 'lucide-react';
 import { AppUser, BusinessProfile, CategoryRecord, UserRole } from '../types';
 import { openWhatsAppDirect } from '../utils/whatsapp';
@@ -109,7 +112,9 @@ export const Navbar: React.FC<NavbarProps> = ({
   const guestNavItems: NavItem[] = [
     { id: 'store', label: 'Shop & Catalog', urdu: 'مارکیٹ کیٹلاگ', icon: ShoppingBag },
   ];
-  const guestDropdownItems: NavItem[] = [];
+  const guestDropdownItems: NavItem[] = [
+    { id: 'lucky_draw', label: 'Lucky Draw & Rewards', urdu: 'لکی ڈرا اور انعامات', icon: Trophy },
+  ];
 
   // 2. Authenticated Customer Navigation (Only shown when customer logs in)
   const customerNavItems: NavItem[] = [
@@ -164,6 +169,8 @@ export const Navbar: React.FC<NavbarProps> = ({
     { id: 'reports', label: 'Daybook & Reports', urdu: 'رپورٹس', icon: BarChart3 },
   ];
   const managerDropdownItems: NavItem[] = [
+    { id: 'financial_master', label: 'Profit Master & Expenses', urdu: 'منافع، اخراجات و بریک ایون', icon: Calculator },
+    { id: 'hr_payroll', label: 'HR Staff, Attendance & Salaries', urdu: 'ملازمین، حاضری و تنخواہیں', icon: Users },
     { id: 'customers', label: 'Customers Khata', urdu: 'کسٹمرز کھاتہ', icon: Users },
     { id: 'cod_orders', label: 'COD Orders', urdu: 'ڈلیوری آرڈرز', icon: Truck, badge: codPendingCount > 0 ? codPendingCount : undefined },
     { id: 'payment_terms', label: 'Payment Terms Alerts', urdu: '۳ روزہ یاددہانی', icon: CalendarClock, badge: pendingAlertsCount > 0 ? pendingAlertsCount : undefined },
@@ -184,18 +191,19 @@ export const Navbar: React.FC<NavbarProps> = ({
     { id: 'reports', label: 'Daybook & Reports', urdu: 'روزنامچہ و آڈٹ', icon: BarChart3 },
   ];
   const adminDropdownItems: NavItem[] = [
-    { id: 'categories_manage', label: 'Category Cleanup', urdu: 'کیٹگریز مینجمنٹ', icon: FolderTree },
+    { id: 'financial_master', label: 'Profit Master & Expenses', urdu: 'منافع، اخراجات و بریک ایون', icon: Calculator },
+    { id: 'settings', label: 'Payment Accounts & Settings', urdu: 'اکاؤنٹس، واصل و سیٹنگز', icon: CreditCard },
+    { id: 'hr_payroll', label: 'HR Hiring, Attendance & Salaries', urdu: 'ملازمین، حاضری و تنخواہیں', icon: Users },
+    { id: 'lucky_draw', label: 'Lucky Draw & Spin Winners', urdu: 'لکی ڈرا اسپن لائیو', icon: Trophy },
+    { id: 'categories_manage', label: 'Categories & Subcategories', urdu: 'کیٹگریز مینجمنٹ', icon: FolderTree },
     { id: 'payment_terms', label: 'Payment Terms Alerts', urdu: '۳ روزہ یاددہانی شیڈول', icon: CalendarClock, badge: pendingAlertsCount > 0 ? pendingAlertsCount : undefined },
     { id: 'resellers', label: 'Reseller Accounts', urdu: 'ری سیلرز کمیشن', icon: Briefcase },
-    { id: 'hr_payroll', label: 'HR Hiring & Payroll', urdu: 'ملازمین و تنخواہیں', icon: Users },
     { id: 'history', label: 'Transaction History & Audit', urdu: 'مکمل تاریخ وار کھاتہ', icon: Clock },
     { id: 'monthly_statement', label: 'Monthly Statements', urdu: 'ماہانہ اسٹیٹمنٹ', icon: FileText },
-    { id: 'lucky_draw', label: 'Lucky Draw & Winners', urdu: 'لکی ڈرا لائیو', icon: Trophy },
     { id: 'dashboard', label: 'Ledger Overview', urdu: 'کھاتہ خلاصہ', icon: FileText },
     { id: 'customers', label: 'Customers Khata', urdu: 'کسٹمرز کھاتہ', icon: Users },
     { id: 'recurring', label: 'Recurring Billing', urdu: 'مقررہ بلنگ', icon: CalendarClock },
     { id: 'whatsapp', label: 'WhatsApp Queue', urdu: 'واٹس ایپ کیو', icon: Phone },
-    { id: 'settings', label: 'Settings', urdu: 'سیٹنگز' },
   ];
 
   const isSuperAdminOrAdmin = userRole === 'super_admin' || userRole === 'admin';
@@ -476,10 +484,10 @@ export const Navbar: React.FC<NavbarProps> = ({
         </div>
       </div>
 
-      {/* 2. PRIMARY APP TABS ROW */}
+      {/* 2. PRIMARY APP TABS ROW (Overflow-visible wrapper around More Services so dropdown never clips!) */}
       <div className="w-full bg-slate-50 dark:bg-slate-950 border-t border-slate-200 dark:border-slate-800">
-        <div className="max-w-7xl mx-auto px-3 sm:px-4 md:px-6 lg:px-8 py-1.5 flex items-center justify-between gap-4 overflow-x-auto no-scrollbar">
-          <nav className="flex items-center gap-1 shrink-0">
+        <div className="max-w-7xl mx-auto px-3 sm:px-4 md:px-6 lg:px-8 py-1.5 flex items-center justify-between gap-2 relative">
+          <nav className="flex items-center gap-1 overflow-x-auto no-scrollbar min-w-0 flex-1">
             {primaryNavItems.map((item) => {
               const isActive = currentTab === item.id;
               const Icon = item.icon;
@@ -504,76 +512,161 @@ export const Navbar: React.FC<NavbarProps> = ({
                 </button>
               );
             })}
-
-            {/* USER DIRECTIVE: lucky draw and statement change place and dropdown best place not in quick front */}
-            <div className="relative shrink-0" ref={moreRef}>
-              <button
-                type="button"
-                onClick={() => setIsMoreOpen(!isMoreOpen)}
-                className={`px-2.5 sm:px-3 py-1 text-xs font-semibold rounded-md transition-all whitespace-nowrap flex items-center gap-1.5 cursor-pointer ${
-                  dropdownNavItems.some((it) => it.id === currentTab)
-                    ? 'bg-white dark:bg-slate-800 text-slate-900 dark:text-white shadow-2xs font-bold ring-1 ring-amber-400 dark:ring-amber-500'
-                    : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100 hover:bg-white/60 dark:hover:bg-slate-900/60'
-                }`}
-              >
-                <Sparkles className="w-3.5 h-3.5 text-amber-500" />
-                <span>
-                  {dropdownNavItems.find((it) => it.id === currentTab)?.label || 'More Services (مزید)'}
-                </span>
-                <ChevronDown className={`w-3.5 h-3.5 transition-transform duration-200 ${isMoreOpen ? 'rotate-180' : ''}`} />
-              </button>
-
-              {isMoreOpen && (
-                <div className="absolute left-0 mt-1.5 w-60 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl shadow-xl py-1.5 z-50 text-xs">
-                  {dropdownNavItems.map((item) => {
-                    const Icon = item.icon;
-                    const isItemActive = currentTab === item.id;
-                    return (
-                      <button
-                        key={item.id}
-                        type="button"
-                        onClick={() => {
-                          onTabChange(item.id);
-                          setIsMoreOpen(false);
-                        }}
-                        className={`w-full px-3 py-2 text-left flex items-center gap-2.5 transition-colors cursor-pointer ${
-                          isItemActive
-                            ? 'bg-amber-50 dark:bg-amber-950/50 text-amber-950 dark:text-amber-200 font-bold'
-                            : 'text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800/80'
-                        }`}
-                      >
-                        {Icon && <Icon className={`w-4 h-4 shrink-0 ${isItemActive ? 'text-amber-600 dark:text-amber-400' : 'text-slate-400'}`} />}
-                        <div className="flex-1 min-w-0">
-                          <div className="truncate font-semibold">{item.label}</div>
-                          {item.urdu && <div className="text-[10px] text-slate-400 font-urdu">{item.urdu}</div>}
-                        </div>
-                      </button>
-                    );
-                  })}
-
-                  {userRole === 'customer' && (
-                    <div className="border-t border-slate-100 dark:border-slate-800 mt-1 pt-1">
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setIsMoreOpen(false);
-                          const text = 'السلام علیکم! میں مدینہ مارکیٹ پر اپنی نئی پراڈکٹ شامل / سپلائی کروانا چاہتا ہوں۔ براہ کرم تفصیلات اور طریقہ کار رہنمائی فرمائیں۔ جزاک اللہ!';
-                          openWhatsAppDirect('03125256266', text);
-                        }}
-                        className="w-full px-3 py-2 text-left flex items-center gap-2.5 text-emerald-700 dark:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-950/40 transition-colors cursor-pointer font-bold"
-                      >
-                        <Phone className="w-4 h-4 shrink-0 text-emerald-600" />
-                        <div className="flex-1 min-w-0">
-                          <div className="truncate">Add My Product</div>
-                          <div className="text-[10px] text-emerald-600/80 font-urdu">واٹس ایپ پر اپنی پراڈکٹ شامل کروائیں</div>
-                        </div>
-                      </button>
-                    </div>
-                  )}
-                </div>
-              )}
-            </div>
           </nav>
+
+          {/* More Services Dropdown placed outside scrollable nav so vertical menu is never clipped */}
+          <div className="relative shrink-0" ref={moreRef}>
+            <button
+              type="button"
+              onClick={() => setIsMoreOpen((prev) => !prev)}
+              aria-expanded={isMoreOpen}
+              className={`px-2.5 sm:px-3 py-1 text-xs font-semibold rounded-md transition-all whitespace-nowrap flex items-center gap-1.5 cursor-pointer ${
+                dropdownNavItems.some((it) => it.id === currentTab)
+                  ? 'bg-white dark:bg-slate-800 text-slate-900 dark:text-white shadow-2xs font-bold ring-1 ring-amber-400 dark:ring-amber-500'
+                  : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100 hover:bg-white/60 dark:hover:bg-slate-900/60 border border-slate-200 dark:border-slate-800 bg-white/80 dark:bg-slate-900/80'
+              }`}
+            >
+              <Sparkles className="w-3.5 h-3.5 text-amber-500" />
+              <span>
+                {dropdownNavItems.find((it) => it.id === currentTab)?.label || 'More Services (مزید)'}
+              </span>
+              <ChevronDown className={`w-3.5 h-3.5 transition-transform duration-200 ${isMoreOpen ? 'rotate-180' : ''}`} />
+            </button>
+
+            {isMoreOpen && (
+              <div className="absolute right-0 mt-1.5 w-72 max-h-[75vh] overflow-y-auto bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl shadow-2xl py-1.5 z-50 text-xs">
+                {dropdownNavItems.length > 0 && (
+                  <div className="pb-1">
+                    <div className="px-3 py-1 text-[10px] font-black uppercase tracking-wider text-slate-400">
+                      Services &amp; Modules
+                    </div>
+                    {dropdownNavItems.map((item) => {
+                      const Icon = item.icon;
+                      const isItemActive = currentTab === item.id;
+                      return (
+                        <button
+                          key={item.id}
+                          type="button"
+                          onClick={() => {
+                            onTabChange(item.id);
+                            setIsMoreOpen(false);
+                          }}
+                          className={`w-full px-3 py-2 text-left flex items-center gap-2.5 transition-colors cursor-pointer ${
+                            isItemActive
+                              ? 'bg-amber-50 dark:bg-amber-950/50 text-amber-950 dark:text-amber-200 font-bold'
+                              : 'text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800/80'
+                          }`}
+                        >
+                          {Icon && <Icon className={`w-4 h-4 shrink-0 ${isItemActive ? 'text-amber-600 dark:text-amber-400' : 'text-slate-400'}`} />}
+                          <div className="flex-1 min-w-0">
+                            <div className="truncate font-semibold flex items-center justify-between gap-2">
+                              <span>{item.label}</span>
+                              {item.badge !== undefined && (
+                                <span className="px-1.5 py-0.5 text-[10px] font-mono font-bold bg-amber-500 text-white rounded-full">
+                                  {item.badge}
+                                </span>
+                              )}
+                            </div>
+                            {item.urdu && <div className="text-[10px] text-slate-400 font-urdu">{item.urdu}</div>}
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+
+                {/* Visible Store Categories & Subcategories inside More Services for ALL users */}
+                {displayCategories.length > 0 && (
+                  <div className="border-t border-slate-100 dark:border-slate-800 mt-1 pt-1.5 pb-1">
+                    <div className="px-3 py-1 text-[10px] font-black uppercase tracking-wider text-amber-600 dark:text-amber-400 flex items-center justify-between">
+                      <span>Store Categories (کیٹگریز)</span>
+                      <span className="font-mono text-[10px] text-slate-400">{displayCategories.length}</span>
+                    </div>
+                    <div className="space-y-0.5">
+                      {displayCategories.map((cat) => {
+                        const isSelected = selectedCategory === cat;
+                        const matchingTopRecord = categoryRecords.find(
+                          (r) =>
+                            r.isActive !== false &&
+                            !r.parentCategoryId &&
+                            r.name.trim().toLowerCase() === cat.trim().toLowerCase()
+                        );
+                        const childSubcats = matchingTopRecord
+                          ? categoryRecords.filter(
+                              (sub) => sub.isActive !== false && sub.parentCategoryId === matchingTopRecord.id
+                            )
+                          : [];
+
+                        return (
+                          <div key={cat}>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                onCategoryChange?.(cat);
+                                if (currentTab !== 'store') {
+                                  onTabChange('store');
+                                }
+                                setIsMoreOpen(false);
+                              }}
+                              className={`w-full px-3 py-1.5 text-left flex items-center gap-2 transition-colors cursor-pointer ${
+                                isSelected
+                                  ? 'bg-amber-50 dark:bg-amber-950/50 text-amber-900 dark:text-amber-200 font-bold'
+                                  : 'text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800/80'
+                              }`}
+                            >
+                              <Tag className={`w-3.5 h-3.5 shrink-0 ${isSelected ? 'text-amber-600' : 'text-slate-400'}`} />
+                              <span className="truncate flex-1">{cat}</span>
+                            </button>
+
+                            {childSubcats.length > 0 && (
+                              <div className="pl-7 pr-3 pb-1 flex flex-wrap gap-1">
+                                {childSubcats.map((sub) => (
+                                  <button
+                                    key={sub.id}
+                                    type="button"
+                                    onClick={() => {
+                                      onCategoryChange?.(sub.name);
+                                      if (currentTab !== 'store') {
+                                        onTabChange('store');
+                                      }
+                                      setIsMoreOpen(false);
+                                    }}
+                                    className="px-2 py-0.5 text-[10px] rounded bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:bg-amber-100 dark:hover:bg-amber-950 cursor-pointer"
+                                  >
+                                    {sub.name}
+                                  </button>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+
+                {(!isAuthenticated || userRole === 'customer') && (
+                  <div className="border-t border-slate-100 dark:border-slate-800 mt-1 pt-1">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setIsMoreOpen(false);
+                        const text = 'السلام علیکم! میں مدینہ مارکیٹ پر اپنی نئی پراڈکٹ شامل / سپلائی کروانا چاہتا ہوں۔ براہ کرم تفصیلات اور طریقہ کار رہنمائی فرمائیں۔ جزاک اللہ!';
+                        openWhatsAppDirect('03125256266', text);
+                      }}
+                      className="w-full px-3 py-2 text-left flex items-center gap-2.5 text-emerald-700 dark:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-950/40 transition-colors cursor-pointer font-bold"
+                    >
+                      <Phone className="w-4 h-4 shrink-0 text-emerald-600" />
+                      <div className="flex-1 min-w-0">
+                        <div className="truncate">Add My Product</div>
+                        <div className="text-[10px] text-emerald-600/80 font-urdu">واٹس ایپ پر اپنی پراڈکٹ شامل کروائیں</div>
+                      </div>
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
         </div>
       </div>
 

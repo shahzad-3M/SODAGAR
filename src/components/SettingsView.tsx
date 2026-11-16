@@ -679,6 +679,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         {/* Navigation Tabs */}
         <div className="flex flex-wrap gap-2 mt-4 pt-1">
           <button
+            type="button"
             onClick={() => setActiveTab('profile')}
             className={`inline-flex items-center gap-2 px-3.5 py-2 text-xs font-semibold rounded-lg transition-colors cursor-pointer ${
               activeTab === 'profile'
@@ -686,8 +687,22 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800'
             }`}
           >
+            <Building className="w-4 h-4" />
+            <span>Business Profile &amp; Payments (کاروبار و پے منٹس)</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              setActiveTab('profile');
+              setTimeout(() => {
+                document.getElementById('manual-payment-accounts')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+              }, 60);
+            }}
+            className="inline-flex items-center gap-2 px-3.5 py-2 text-xs font-bold rounded-lg bg-emerald-50 dark:bg-emerald-950/50 text-emerald-800 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800 hover:bg-emerald-100 transition-colors cursor-pointer"
+          >
             <CreditCard className="w-4 h-4" />
-            <span>Profile &amp; Payments (کاروبار و پے منٹس)</span>
+            <span>Manual Payment Accounts (EasyPaisa / JazzCash / Bank)</span>
           </button>
 
           <button
@@ -803,13 +818,18 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               </div>
             </div>
 
-            {/* Pakistani Mobile Wallets */}
-            <div className="pt-6 border-t border-slate-100 dark:border-slate-800">
-              <div className="flex items-center gap-2 mb-3">
-                <CreditCard className="w-4 h-4 text-emerald-600" />
-                <h3 className="text-xs font-bold text-slate-500 uppercase tracking-wider">
-                  Pakistani Mobile Wallets / موبائل والٹ اکاؤنٹ
-                </h3>
+            {/* Pakistani Mobile Wallets & Manual Payment Accounts */}
+            <div id="manual-payment-accounts" className="pt-6 border-t border-slate-100 dark:border-slate-800 scroll-mt-24">
+              <div className="flex items-center justify-between gap-2 mb-3">
+                <div className="flex items-center gap-2">
+                  <CreditCard className="w-4 h-4 text-emerald-600" />
+                  <h3 className="text-xs font-bold text-slate-700 dark:text-slate-200 uppercase tracking-wider">
+                    Manual Payment Accounts &amp; Wallets / دستی ادائیگی اکاؤنٹس
+                  </h3>
+                </div>
+                <span className="text-[10px] font-semibold text-emerald-700 dark:text-emerald-300">
+                  Shown in Checkout &amp; WhatsApp Invoices
+                </span>
               </div>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                 {/* EasyPaisa */}

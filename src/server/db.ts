@@ -10,6 +10,7 @@ import {
   Customer,
   DeliveryAreaConfig,
   DeliveryCityConfig,
+  MonthlyExpense,
   ProductItem,
   Transaction,
   UserAccount,
@@ -98,6 +99,7 @@ const DEFAULT_COLLECTION_MAP: Record<string, unknown> = {
   review_rewards: defaultReviewRewards,
   login_audits: defaultLoginAuditLogs,
   import_logs: defaultImportLogs,
+  monthly_expenses: [] as MonthlyExpense[],
   business_profile: defaultBusinessProfile,
 };
 
@@ -1291,6 +1293,7 @@ export function getDatabaseHealthSummary() {
     customers: Number((db.prepare('SELECT COUNT(*) as c FROM customers').get() as { c: number }).c),
     transactions: getCollectionValue<Transaction[]>(db, 'transactions', []).length,
     codOrders: getCollectionValue<CODOrder[]>(db, 'cod_orders', []).length,
+    monthlyExpenses: getCollectionValue<MonthlyExpense[]>(db, 'monthly_expenses', []).length,
     auditLogs: Number((db.prepare('SELECT COUNT(*) as c FROM admin_audit_logs').get() as { c: number }).c),
   };
   return {

@@ -31,6 +31,7 @@ import {
   getCategoryRecords,
   getProductImportLogs,
   logProductImport,
+  apiScrapeProductUrl,
 } from '../utils/storage';
 import {
   UPCOMING_CATEGORY_ID,
@@ -101,6 +102,9 @@ export const ProductImporterModal: React.FC<ProductImporterModalProps> = ({
   const [progressStep, setProgressStep] = useState<string>('');
   const [progressPercent, setProgressPercent] = useState<number>(0);
   const [importError, setImportError] = useState<string | null>(null);
+  const [showHtmlFallback, setShowHtmlFallback] = useState(false);
+  const [htmlFallbackSource, setHtmlFallbackSource] = useState('');
+  const [scrapeStatsSummary, setScrapeStatsSummary] = useState<string | null>(null);
 
   // Review & Editable Extracted Product State
   const [extractedProduct, setExtractedProduct] = useState<ProductItem | null>(null);
@@ -139,8 +143,8 @@ export const ProductImporterModal: React.FC<ProductImporterModalProps> = ({
 
   const categories = getCategories();
 
-  // HEURISTIC / RICH EXTRACTION ENGINE
-  const handleStartImport = async (urlToFetch: string) => {
+  // LIVE SERVER-SIDE EXTRACTION ENGINE (Shopify JSON, JSON-LD, OpenGraph, DOM, Video, Variations)
+  const handleStartImport = async (urlToFetch: string, overrideHtml?: string) => {
     const rawUrl = urlToFetch.trim();
     if (!rawUrl) {
       setImportError('Please enter a valid website product URL.');
@@ -156,370 +160,83 @@ export const ProductImporterModal: React.FC<ProductImporterModalProps> = ({
 
     setIsLoading(true);
     setImportError(null);
+    setScrapeStatsSummary(null);
     setExtractedProduct(null);
     setDuplicateMatch(null);
     setOverwriteConfirmed(false);
-    setProgressPercent(15);
-    setProgressStep('Connecting to website host...');
+    setProgressPercent(25);
+    setProgressStep(
+      overrideHtml
+        ? 'Parsing pasted HTML source (JSON-LD, OpenGraph, images, variants, video)...'
+        : 'Fetching live product page & extracting JSON-LD, OpenGraph, images, specs, variants & video...'
+    );
 
-    // Attempt simulated network extraction steps
-    setTimeout(() => {
-      setProgressPercent(35);
-      setProgressStep('Extracting OpenGraph, JSON-LD Schema & HTML Metadata...');
-
-      setTimeout(() => {
-        setProgressPercent(60);
-        setProgressStep('Parsing gallery images, specifications & features...');
-
-        setTimeout(() => {
-          setProgressPercent(85);
-          setProgressStep('Detecting multi-dimensional variations (sizes, colors, pricing)...');
-
-          setTimeout(() => {
-            try {
-              const parsed = parseProductFromUrl(rawUrl);
-              setProgressPercent(100);
-              setProgressStep('Extraction complete! Ready for review.');
-
-              // Check for duplicate product by SKU or title
-              const existingMatch = existingProducts.find(
-                (p) =>
-                  (p.sku && p.sku.toLowerCase() === parsed.sku.toLowerCase()) ||
-                  p.name.toLowerCase() === parsed.name.toLowerCase() ||
-                  (p.websiteUrl && p.websiteUrl.toLowerCase() === rawUrl.toLowerCase())
-              );
-
-              if (existingMatch) {
-                setDuplicateMatch(existingMatch);
-              }
-
-              const freshCatRecords = getCategoryRecords();
-              setCategoryRecords(freshCatRecords);
-              const resolvedIds = resolveCategoryIdsFromProduct(parsed, freshCatRecords);
-              setSelectedMainCatId(resolvedIds.parentCategoryId || '');
-              setSelectedSubCatId(resolvedIds.subcategoryId || '');
-              setSelectedChildCatId(resolvedIds.childSubcategoryId || '');
-              setImportAsUpcoming(Boolean(parsed.isUpcoming));
-              setExtractedProduct(parsed);
-              setSelectedCategory(parsed.category);
-              setIsLoading(false);
-
-              // Log success
-              logProductImport({
-                sourceUrl: rawUrl,
-                productTitle: parsed.name,
-                status: 'success',
-                variationsCount: parsed.variations?.length || 0,
-                imagesCount: (parsed.pictures?.length || 0) + (parsed.imageUrl ? 1 : 0),
-                notes: `Extracted ${parsed.variations?.length || 0} variations and ${parsed.pictures?.length || 0} gallery images.`,
-              });
-              setLogs(getProductImportLogs());
-            } catch (err: any) {
-              setIsLoading(false);
-              setImportError(err.message || 'Failed to extract product information from this URL.');
-              logProductImport({
-                sourceUrl: rawUrl,
-                productTitle: 'Unknown Product',
-                status: 'failed',
-                variationsCount: 0,
-                imagesCount: 0,
-                notes: err.message || 'Inaccessible or protected website',
-              });
-              setLogs(getProductImportLogs());
-            }
-          }, 400);
-        }, 400);
-      }, 400);
-    }, 400);
-  };
-
-  // PARSER HEURISTICS FOR MULTI-PLATFORM PRODUCTS
-  function parseProductFromUrl(url: string): ProductItem {
-    const lower = url.toLowerCase();
-    const urlObj = new URL(url);
-    const domain = urlObj.hostname.replace('www.', '');
-
-    let name = 'Imported Wholesale Product';
-    let urduName = 'امپورٹڈ ہول سیل پراڈکٹ';
-    let category = 'General Wholesale';
-    let brand = 'Imported Premium';
-    let shortDescription = 'High-turnover verified retail lot imported directly for Pakistani market distribution.';
-    let details = 'Full product specifications and details extracted from external supplier listing. Guaranteed wholesale lot quality.';
-    let marketPrice = 4500;
-    let ourPrice = 2800;
-    let costPrice = 1600;
-    let stockQty = 60;
-    let mainImage = 'https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=800&auto=format&fit=crop&q=80';
-    let pictures: string[] = [
-      mainImage,
-      'https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=800&auto=format&fit=crop&q=80',
-      'https://images.unsplash.com/photo-1572635196237-14b3f281503f?w=800&auto=format&fit=crop&q=80',
-    ];
-    let sizes = ['Standard Lot'];
-    let tags = ['imported', 'wholesale', 'trending'];
-    let specifications: Record<string, string> = {
-      'Source Domain': domain,
-      'Warranty': 'Local Replacement Warranty',
-      'Packaging': 'Factory Sealed Box',
-      'Quality Grade': 'A+ Export Grade Lot',
-    };
-    let features: string[] = [
-      'Genuine factory-grade component quality tested for high turnover',
-      'Complete ready-to-sell packaging with barcode verification',
-      'Available with instant nationwide Cash on Delivery (COD) dispatch',
-    ];
-    let variations: ProductVariation[] = [];
-
-    if (lower.includes('styler') || lower.includes('hair') || lower.includes('dryer') || lower.includes('curler')) {
-      name = '5-in-1 Hot Air Styler & Multi-Function Hair Curler Dryer';
-      urduName = 'فائیو ان ون ملٹی فنکشن ہیئر اسٹائلر اور ڈرائر سیٹ';
-      category = 'Cosmetics & Personal Care';
-      brand = '100DAGAR Salon Series';
-      marketPrice = 7500;
-      ourPrice = 3690;
-      costPrice = 2300;
-      stockQty = 80;
-      mainImage = 'https://images.unsplash.com/photo-1522337360788-8b13dee7a37e?w=800&auto=format&fit=crop&q=80';
-      pictures = [
-        'https://images.unsplash.com/photo-1522337360788-8b13dee7a37e?w=800&auto=format&fit=crop&q=80',
-        'https://images.unsplash.com/photo-1560066984-138dadb4c035?w=800&auto=format&fit=crop&q=80',
-        'https://images.unsplash.com/photo-1527799820374-dcf8d9d4a388?w=800&auto=format&fit=crop&q=80',
-      ];
-      shortDescription = 'All-in-one salon styling kit with 5 interchangeable ceramic heads for drying, curling, and volumizing without extreme heat damage.';
-      details = 'The 5-in-1 Hot Air Styler combines drying and styling in one simple step. Negative ion technology reduces frizz and leaves hair with brilliant shine. Complete with 5 specialized attachments.';
-      sizes = ['Standard Salon Kit (5 Heads)', 'Deluxe Travel Box (7 Heads)'];
-      tags = ['hair styler', 'curler', 'hot air brush', 'salon kit', 'women beauty'];
-      specifications = {
-        'Power': '1000W High Speed Ceramic Airflow Motor',
-        'Voltage': '220V - 240V, 50/60Hz (Pakistan Standard)',
-        'Speed / Heat': '3 Temperature Settings + Cool Shot Lock',
-        'Cord Length': '1.8m 360° Anti-Tangle Swivel Cord',
-        'Attachments': 'Airwrap Barrels (L/R), Volumizer Brush, Smoothing Brush, Pre-Styling Dryer',
-        'Warranty': '6 Months Replacement Warranty',
-      };
-      features = [
-        'Coanda aerodynamic technology wraps hair gently without burning',
-        'Ceramic tourmaline barrel generates negative ions for salon finish',
-        'Lightweight ergonomic body designed for effortless everyday use',
-      ];
-      variations = [
-        {
-          id: `var_${Date.now()}_1`,
-          sku: 'ELEC-HAIR-ROSE-5H',
-          attributes: { 'Color': 'Rose Gold & Grey', 'Size/Edition': 'Standard 5-Head Kit' },
-          size: 'Standard 5-Head Kit',
-          color: 'Rose Gold & Grey',
-          originalPrice: 7500,
-          salePrice: 3690,
-          stockQty: 50,
-          image: pictures[0],
-        },
-        {
-          id: `var_${Date.now()}_2`,
-          sku: 'ELEC-HAIR-BLK-5H',
-          attributes: { 'Color': 'Matte Black', 'Size/Edition': 'Standard 5-Head Kit' },
-          size: 'Standard 5-Head Kit',
-          color: 'Matte Black',
-          originalPrice: 7500,
-          salePrice: 3690,
-          stockQty: 30,
-          image: pictures[1],
-        },
-        {
-          id: `var_${Date.now()}_3`,
-          sku: 'ELEC-HAIR-PINK-7H',
-          attributes: { 'Color': 'Baby Pink', 'Size/Edition': 'Deluxe Travel Box (7 Heads)' },
-          size: 'Deluxe Travel Box (7 Heads)',
-          color: 'Baby Pink',
-          originalPrice: 8900,
-          salePrice: 4290,
-          stockQty: 20,
-          image: pictures[2],
-        },
-      ];
-    } else if (lower.includes('earbuds') || lower.includes('anc') || lower.includes('wireless') || lower.includes('bluetooth') || lower.includes('audio')) {
-      name = 'Wireless ANC Active Noise Cancelling Earbuds Pro';
-      urduName = 'وائرلیس ایکٹیو نوائز کینسلنگ ائربڈز پرو';
-      category = 'Smart phone Accessories';
-      brand = 'Acoustic Sound Pro';
-      marketPrice = 5990;
-      ourPrice = 2890;
-      costPrice = 1750;
-      stockQty = 100;
-      mainImage = 'https://images.unsplash.com/photo-1590658268037-6bf12165a8df?w=800&auto=format&fit=crop&q=80';
-      pictures = [
-        'https://images.unsplash.com/photo-1590658268037-6bf12165a8df?w=800&auto=format&fit=crop&q=80',
-        'https://images.unsplash.com/photo-1606220588913-b3aacb4d2f46?w=800&auto=format&fit=crop&q=80',
-      ];
-      shortDescription = 'True wireless Bluetooth 5.3 earbuds with -35dB Active Noise Cancelling, deep bass drivers, and 30-hour battery life.';
-      details = 'Experience crystal-clear acoustics and total silence with ANC technology. Features quad ENC microphones for clean call audio and ultra-low latency gaming mode.';
-      sizes = ['White Edition', 'Matte Black Edition', 'Titanium Grey'];
-      tags = ['earbuds', 'wireless bluetooth', 'anc earbuds', 'gaming earbuds'];
-      specifications = {
-        'Bluetooth': 'v5.3 Ultra Low Latency (40ms Gaming Mode)',
-        'Noise Cancellation': '-35dB Hybrid ANC + Environmental ENC Call Mic',
-        'Battery Life': '6.5 Hours on Buds + 24 Hours in Type-C Case',
-        'Water Resistance': 'IPX5 Sweat & Splash Proof',
-        'Driver Size': '13mm Composite Titanium Diaphragm',
-      };
-      features = [
-        'Smart Touch controls for music, calls, and ANC mode toggle',
-        'Fast charging case: 10 minutes charging gives 2 hours playback',
-        'Universal compatibility with Android, iPhone, Windows, and MacOS',
-      ];
-      variations = [
-        {
-          id: `var_${Date.now()}_4`,
-          sku: 'AUD-ANC-WHT',
-          attributes: { 'Color': 'Ceramic White' },
-          color: 'Ceramic White',
-          originalPrice: 5990,
-          salePrice: 2890,
-          stockQty: 40,
-          image: pictures[0],
-        },
-        {
-          id: `var_${Date.now()}_5`,
-          sku: 'AUD-ANC-BLK',
-          attributes: { 'Color': 'Matte Black' },
-          color: 'Matte Black',
-          originalPrice: 5990,
-          salePrice: 2890,
-          stockQty: 45,
-          image: pictures[1],
-        },
-        {
-          id: `var_${Date.now()}_6`,
-          sku: 'AUD-ANC-GRY',
-          attributes: { 'Color': 'Space Grey' },
-          color: 'Space Grey',
-          originalPrice: 6200,
-          salePrice: 2990,
-          stockQty: 15,
-          image: pictures[0],
-        },
-      ];
-    } else if (lower.includes('suit') || lower.includes('crepe') || lower.includes('dress') || lower.includes('kurti') || lower.includes('clothing')) {
-      name = '3PC Crepe Silk Luxury Embroidered Suit with Organza Dupatta';
-      urduName = 'تھری پیس کرپ سلک کڑھائی دار سوٹ مع آرگینزا دوپٹہ';
-      category = 'Fashion & Apparel';
-      brand = 'Al-Noor Textile Wholesale';
-      marketPrice = 7800;
-      ourPrice = 3850;
-      costPrice = 2600;
-      stockQty = 75;
-      mainImage = 'https://images.unsplash.com/photo-1610030469983-98e550d6193c?w=800&auto=format&fit=crop&q=80';
-      pictures = [
-        'https://images.unsplash.com/photo-1610030469983-98e550d6193c?w=800&auto=format&fit=crop&q=80',
-        'https://images.unsplash.com/photo-1583391733956-3750e0ff4e8b?w=800&auto=format&fit=crop&q=80',
-      ];
-      shortDescription = 'Luxury unstitched & stitched crepe silk 3-piece collection featuring detailed thread embroidery and gold printed organza dupatta.';
-      details = 'Crafted from pure crepe silk fabric, this 3-piece collection combines traditional craftsmanship with modern comfort. Includes shirt fabric, dyed trouser, and embroidered organza dupatta.';
-      sizes = ['Unstitched (3-Piece)', 'Stitched Small (S)', 'Stitched Medium (M)', 'Stitched Large (L)'];
-      tags = ['crepe silk', 'ladies suit', '3 piece unstitched', 'embroidered dress'];
-      specifications = {
-        'Shirt Fabric': 'Pure Fine Crepe Silk (3.0 Meters)',
-        'Trouser Fabric': 'Dyed Soft Raw Silk (2.5 Meters)',
-        'Dupatta': 'Digital Printed Organza Silk (2.5 Meters)',
-        'Embroidery': 'Zari & Resham Neckline & Border Patch Included',
-      };
-      features = [
-        'Guaranteed color fastness and shrink-resistant silk blend',
-        'Includes detailed heavy border lace patch for daman and sleeves',
-      ];
-      variations = [
-        {
-          id: `var_${Date.now()}_7`,
-          sku: 'FASH-SILK-UNST-BLU',
-          attributes: { 'Color': 'Royal Blue', 'Size': 'Unstitched (3-Piece)' },
-          size: 'Unstitched (3-Piece)',
-          color: 'Royal Blue',
-          originalPrice: 7800,
-          salePrice: 3850,
-          stockQty: 30,
-          image: pictures[0],
-        },
-        {
-          id: `var_${Date.now()}_8`,
-          sku: 'FASH-SILK-MED-BLU',
-          attributes: { 'Color': 'Royal Blue', 'Size': 'Stitched Medium (M)' },
-          size: 'Stitched Medium (M)',
-          color: 'Royal Blue',
-          originalPrice: 8800,
-          salePrice: 4450,
-          stockQty: 25,
-          image: pictures[0],
-        },
-        {
-          id: `var_${Date.now()}_9`,
-          sku: 'FASH-SILK-UNST-RED',
-          attributes: { 'Color': 'Crimson Maroon', 'Size': 'Unstitched (3-Piece)' },
-          size: 'Unstitched (3-Piece)',
-          color: 'Crimson Maroon',
-          originalPrice: 7800,
-          salePrice: 3850,
-          stockQty: 20,
-          image: pictures[1],
-        },
-      ];
-    } else {
-      // General URL slug detection
-      const slug = urlObj.pathname.split('/').filter(Boolean).pop() || 'imported-product';
-      const formattedTitle = slug
-        .replace(/[-_]/g, ' ')
-        .replace(/\b\w/g, (c) => c.toUpperCase());
-      name = formattedTitle.length > 3 ? formattedTitle : 'Imported E-Commerce Product';
-      urduName = 'امپورٹڈ ای کامرس پروڈکٹ لاٹ';
-      variations = [
-        {
-          id: `var_${Date.now()}_std`,
-          sku: `IMP-${Math.floor(1000 + Math.random() * 9000)}-STD`,
-          attributes: { 'Size/Variant': 'Standard Pack' },
-          size: 'Standard Pack',
-          originalPrice: marketPrice,
-          salePrice: ourPrice,
-          stockQty: 50,
-        },
-      ];
+    const res = await apiScrapeProductUrl(rawUrl, overrideHtml);
+    if (!res.ok || !res.product) {
+      setIsLoading(false);
+      setProgressPercent(0);
+      setImportError(
+        res.error ||
+          'Failed to extract product information from this URL. Some sites block automated requests — you can open the page source (Ctrl+U / Inspect) and paste HTML below as fallback.'
+      );
+      setShowHtmlFallback(true);
+      logProductImport({
+        sourceUrl: rawUrl,
+        productTitle: 'Failed Extraction',
+        status: 'failed',
+        variationsCount: 0,
+        imagesCount: 0,
+        notes: res.error || 'Inaccessible or protected website',
+      });
+      setLogs(getProductImportLogs());
+      return;
     }
 
-    const generatedSku = `IMP-${Math.floor(1000 + Math.random() * 9000)}`;
+    const parsed = res.product;
+    const diag = res.diagnostics;
+    setProgressPercent(100);
+    setProgressStep('Live extraction complete! Review & edit all fields below before saving.');
+    if (diag) {
+      setScrapeStatsSummary(
+        `Extracted via ${diag.strategiesUsed.join(' + ')} · ${diag.imagesFound} images · ${diag.specsFound} specs · ${diag.featuresFound} features · ${diag.variantsFound} variants${
+          diag.videoFound ? ' · Video URL found' : ''
+        } (${diag.currencyDetected})`
+      );
+    }
 
-    return {
-      id: `prod_imp_${Date.now()}`,
-      name,
-      urduName,
-      category,
-      sku: generatedSku,
-      costPrice,
-      marketPrice,
-      ourPrice,
-      stockQty,
-      minStockAlert: 10,
-      salesCount: 0,
-      totalRevenue: 0,
-      totalProfit: 0,
-      isWinningItem: true,
-      badgeText: 'IMPORTED LOT',
-      websiteUrl: url,
-      sourceUrl: url,
-      sourceWebsiteName: domain,
-      imageUrl: mainImage,
-      pictures,
-      sizes,
-      selectedSize: sizes[0],
-      brand,
-      shortDescription,
-      details,
-      description: details,
-      specifications,
-      features,
-      tags,
-      variations,
-      status: 'draft',
-      createdAt: new Date().toISOString().split('T')[0],
-    };
-  }
+    const existingMatch = existingProducts.find(
+      (p) =>
+        (p.sku && parsed.sku && p.sku.toLowerCase() === parsed.sku.toLowerCase()) ||
+        p.name.toLowerCase() === parsed.name.toLowerCase() ||
+        (p.websiteUrl && p.websiteUrl.toLowerCase() === rawUrl.toLowerCase())
+    );
+    if (existingMatch) {
+      setDuplicateMatch(existingMatch);
+    }
+
+    const freshCatRecords = getCategoryRecords();
+    setCategoryRecords(freshCatRecords);
+    const resolvedIds = resolveCategoryIdsFromProduct(parsed, freshCatRecords);
+    setSelectedMainCatId(resolvedIds.parentCategoryId || '');
+    setSelectedSubCatId(resolvedIds.subcategoryId || '');
+    setSelectedChildCatId(resolvedIds.childSubcategoryId || '');
+    setImportAsUpcoming(Boolean(parsed.isUpcoming));
+    setExtractedProduct(parsed);
+    setSelectedCategory(parsed.category);
+    setIsLoading(false);
+
+    logProductImport({
+      sourceUrl: rawUrl,
+      productTitle: parsed.name,
+      status: diag && diag.imagesFound > 0 ? 'success' : 'partial',
+      variationsCount: parsed.variations?.length || 0,
+      imagesCount: (parsed.pictures?.length || 0) + (parsed.imageUrl ? 1 : 0),
+      notes: diag
+        ? `Live scrape (${diag.strategiesUsed.join(', ')}): ${diag.imagesFound} imgs, ${diag.variantsFound} variants, ${diag.specsFound} specs.`
+        : 'Live extraction completed.',
+    });
+    setLogs(getProductImportLogs());
+  };
 
   // IMAGE MANAGEMENT: Local File Uploads
   const handleUploadMainImage = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -907,43 +624,41 @@ export const ProductImporterModal: React.FC<ProductImporterModalProps> = ({
                   </button>
                 </div>
 
-                {/* Quick Preset Links */}
-                <div className="flex flex-wrap items-center gap-1.5 text-[11px] text-slate-400 pt-1">
-                  <span>Quick Test Links:</span>
+                {/* Live Scrape Helper & Optional HTML Fallback */}
+                <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-500 pt-1">
+                  <span>
+                    Live backend scraper extracts Shopify JSON, JSON-LD, OpenGraph, all gallery images, specs, variations &amp; product video URLs.
+                  </span>
                   <button
                     type="button"
-                    onClick={() => {
-                      const url = 'https://pakistancatalog.pk/product/5-in-1-hot-air-styler-curler';
-                      setImportUrl(url);
-                      handleStartImport(url);
-                    }}
-                    className="px-2 py-0.5 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded text-blue-600 dark:text-blue-400 hover:underline cursor-pointer"
+                    onClick={() => setShowHtmlFallback(!showHtmlFallback)}
+                    className="text-amber-700 dark:text-amber-400 font-bold hover:underline cursor-pointer shrink-0"
                   >
-                    Hot Air Styler (Variations)
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      const url = 'https://electronicswholesale.com/audio/wireless-anc-earbuds-pro';
-                      setImportUrl(url);
-                      handleStartImport(url);
-                    }}
-                    className="px-2 py-0.5 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded text-blue-600 dark:text-blue-400 hover:underline cursor-pointer"
-                  >
-                    ANC Earbuds (Tech)
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      const url = 'https://textilehub.pk/fashion/3pc-crepe-silk-luxury-suit';
-                      setImportUrl(url);
-                      handleStartImport(url);
-                    }}
-                    className="px-2 py-0.5 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded text-blue-600 dark:text-blue-400 hover:underline cursor-pointer"
-                  >
-                    Crepe Silk Suit (Clothing)
+                    {showHtmlFallback ? 'Hide HTML Source Fallback' : 'Site blocked bots? Paste HTML Source'}
                   </button>
                 </div>
+
+                {showHtmlFallback && (
+                  <div className="pt-2 border-t border-slate-200 dark:border-slate-800 space-y-2">
+                    <textarea
+                      rows={4}
+                      value={htmlFallbackSource}
+                      onChange={(e) => setHtmlFallbackSource(e.target.value)}
+                      placeholder="Optional fallback: If a store uses Cloudflare/bot protection, copy page source (Ctrl+U -> Ctrl+A -> Ctrl+C) and paste HTML here, then click Extract from Pasted HTML..."
+                      className="w-full px-3 py-2 text-[11px] font-mono bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-lg text-slate-800 dark:text-slate-100"
+                    />
+                    <div className="flex justify-end">
+                      <button
+                        type="button"
+                        disabled={isLoading || !htmlFallbackSource.trim()}
+                        onClick={() => handleStartImport(importUrl || 'https://supplier.example.com/product', htmlFallbackSource)}
+                        className="px-4 py-1.5 bg-slate-900 dark:bg-amber-500 text-white dark:text-slate-950 font-bold text-xs rounded-lg cursor-pointer disabled:opacity-50"
+                      >
+                        Extract from Pasted HTML
+                      </button>
+                    </div>
+                  </div>
+                )}
               </div>
 
               {/* PROGRESS BAR & STATUS */}
@@ -962,6 +677,14 @@ export const ProductImporterModal: React.FC<ProductImporterModalProps> = ({
                       style={{ width: `${progressPercent}%` }}
                     />
                   </div>
+                </div>
+              )}
+
+              {/* SCRAPE DIAGNOSTICS BANNER */}
+              {scrapeStatsSummary && !isLoading && (
+                <div className="bg-emerald-50 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-800 rounded-xl px-4 py-2.5 text-xs text-emerald-800 dark:text-emerald-200 font-medium flex items-center gap-2">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                  <span>{scrapeStatsSummary}</span>
                 </div>
               )}
 

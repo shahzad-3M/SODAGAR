@@ -16,6 +16,7 @@ import {
   Investor,
   LuckyDrawEvent,
   LuckyDrawWinner,
+  MonthlyExpense,
   PaymentMode,
   ProductBroadcast,
   ProductItem,
@@ -76,6 +77,8 @@ import {
   subscribeToServerSync,
   setSessionToken,
   apiSubmitCheckoutOrder,
+  getMonthlyExpenses,
+  saveMonthlyExpenses,
 } from './utils/storage';
 import { isProductPurchaseBlocked } from './utils/locationCategoryHelpers';
 import {
@@ -124,6 +127,7 @@ import { CategoryManagementModal } from './components/CategoryManagementModal';
 import { BranchManagementView } from './components/BranchManagementView';
 import { WalkInSalesView } from './components/WalkInSalesView';
 import { ProductImporterModal } from './components/ProductImporterModal';
+import { FinancialMasterView } from './components/FinancialMasterView';
 import {
   ToastBanner,
   ToastMessage,
@@ -159,6 +163,7 @@ export default function App() {
   const [attendance, setAttendance] = useState<AttendanceRecord[]>(getAttendance);
   const [resellers, setResellers] = useState<Reseller[]>(getResellers);
   const [investors, setInvestors] = useState<Investor[]>(getInvestors);
+  const [monthlyExpenses, setMonthlyExpenses] = useState<MonthlyExpense[]>(getMonthlyExpenses);
   const [initialProductId, setInitialProductId] = useState<string | null>(() => {
     try {
       return new URLSearchParams(window.location.search).get('product');
@@ -195,14 +200,14 @@ export default function App() {
       return;
     }
 
-    // Strict Guest Restriction: When nobody is logged in, allow ONLY public catalog
+    // Strict Guest Restriction: When nobody is logged in, allow ONLY public catalog & read-only lucky draw showcase
     if (!currentUser?.isAuthenticated) {
-      if (tab !== 'store') {
+      if (tab !== 'store' && tab !== 'lucky_draw') {
         setCurrentTab('store');
         setIsRoleModalOpen(true);
         return;
       }
-      setCurrentTab('store');
+      setCurrentTab(tab);
       return;
     }
 
@@ -236,6 +241,8 @@ export default function App() {
         'monthly_statement',
         'history',
         'reports',
+        'hr_payroll',
+        'financial_master',
         'lucky_draw',
       ];
       if (!allowed.includes(tab)) {
@@ -359,6 +366,7 @@ export default function App() {
     const atts = getAttendance();
     const resells = getResellers();
     const invs = getInvestors();
+    const exps = getMonthlyExpenses();
 
     const balanced = recalculateCustomerBalances(rawCusts, rawTxs);
 
@@ -379,6 +387,7 @@ export default function App() {
     setAttendance(atts);
     setResellers(resells);
     setInvestors(invs);
+    setMonthlyExpenses(exps);
 
     const actRole = getActiveRole();
     const curUser = getCurrentUser();
@@ -885,6 +894,57 @@ export default function App() {
     setAttendance(updated);
     saveAttendance(updated);
     pushToast('Attendance entry deleted.', 'info');
+  };
+
+  // MONTHLY EXPENSES & FINANCIAL MASTER HANDLERS
+  const handleSaveMonthlyExpense = (expense: MonthlyExpense) => {
+    const exists = monthlyExpenses.some((e) => e.id === expense.id);
+    const updated = exists
+      ? monthlyExpenses.map((e) => (e.id === expense.id ? expense : e))
+      : [expense, ...monthlyExpenses];
+    setMonthlyExpenses(updated);
+    saveMonthlyExpenses(updated);
+  };
+
+  const handleDeleteMonthlyExpense = (expenseId: string) => {
+    const updated = monthlyExpenses.filter((e) => e.id !== expenseId);
+    setMonthlyExpenses(updated);
+    saveMonthlyExpenses(updated);
+  };
+
+  const handleCloneRecurringExpenses = (fromMonth: string, toMonth: string): number => {
+    const recurringSource = monthlyExpenses.filter(
+      (e) => e.isRecurringMonthly && (e.month === fromMonth || e.date.startsWith(fromMonth))
+    );
+    if (recurringSource.length === 0) return 0;
+
+    const existingToMonthTitles = new Set(
+      monthlyExpenses
+        .filter((e) => e.month === toMonth || e.date.startsWith(toMonth))
+        .map((e) => e.title.trim().toLowerCase())
+    );
+
+    const cloned: MonthlyExpense[] = [];
+    recurringSource.forEach((src, idx) => {
+      if (existingToMonthTitles.has(src.title.trim().toLowerCase())) return;
+      const dayPart = src.date.slice(8, 10) || '01';
+      cloned.push({
+        ...src,
+        id: `exp_${Date.now()}_${idx}_${Math.random().toString(36).slice(2, 5)}`,
+        month: toMonth,
+        date: `${toMonth}-${dayPart}`,
+        paymentStatus: 'pending',
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+    });
+
+    if (cloned.length > 0) {
+      const updated = [...cloned, ...monthlyExpenses];
+      setMonthlyExpenses(updated);
+      saveMonthlyExpenses(updated);
+    }
+    return cloned.length;
   };
 
   // RESELLER ACCOUNTS HANDLERS
@@ -1964,6 +2024,32 @@ export default function App() {
             onOpenInvoiceModal={openInvoiceModal}
             userRole={activeRole}
             currentUser={currentUser}
+            onOpenFinancialMaster={
+              activeRole === 'super_admin' || activeRole === 'admin' || activeRole === 'manager'
+                ? () => handleTabChange('financial_master')
+                : undefined
+            }
+          />
+        )}
+
+        {/* 9B. FINANCIAL MASTER FILE, MONTHLY EXPENSES & BREAKEVEN ENGINE */}
+        {currentTab === 'financial_master' && (
+          <FinancialMasterView
+            transactions={transactions}
+            customers={customers}
+            products={products}
+            codOrders={codOrders}
+            employees={employees}
+            attendance={attendance}
+            resellers={resellers}
+            investors={investors}
+            profile={profile}
+            monthlyExpenses={monthlyExpenses}
+            onSaveExpense={handleSaveMonthlyExpense}
+            onDeleteExpense={handleDeleteMonthlyExpense}
+            onCloneRecurringExpenses={handleCloneRecurringExpenses}
+            currentUser={currentUser}
+            onNavigateTab={handleTabChange}
           />
         )}
 
@@ -2025,8 +2111,6 @@ export default function App() {
             </span>
           </div>
           <div className="flex items-center gap-2 text-[11px]">
-            <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
-            <span className="text-slate-300 dark:text-slate-700">·</span>
             <button
               onClick={() => {
                 setIsRoleModalOpen(true);
