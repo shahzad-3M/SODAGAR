@@ -1,12 +1,19 @@
+import crypto from 'node:crypto';
+import fs from 'node:fs';
 import net from 'node:net';
+import path from 'node:path';
 import { CategoryRecord, ProductItem, ProductVariation } from '../types';
 import { normalizeTextKey, UPCOMING_CATEGORY_ID } from '../utils/locationCategoryHelpers';
+
+export const IMPORTED_MEDIA_DIR = path.resolve(process.cwd(), 'data', 'imported-media');
+fs.mkdirSync(IMPORTED_MEDIA_DIR, { recursive: true });
 
 export interface ScrapeDiagnostics {
   strategiesUsed: string[];
   currencyDetected: string;
   originalPriceText?: string;
   imagesFound: number;
+  imagesDownloaded?: number;
   specsFound: number;
   featuresFound: number;
   variantsFound: number;
@@ -96,6 +103,12 @@ function resolveAbsoluteUrl(candidate: string | undefined | null, baseUrl: strin
   if (!candidate) return null;
   let cleaned = decodeHtmlEntities(String(candidate)).trim();
   if (!cleaned || cleaned.startsWith('data:') || cleaned.startsWith('javascript:')) return null;
+  if (/\{width\}|%7Bwidth%7D/i.test(cleaned)) {
+    cleaned = cleaned.replace(/\{width\}|%7Bwidth%7D/gi, '1200');
+  }
+  if (/\{height\}|%7Bheight%7D/i.test(cleaned)) {
+    cleaned = cleaned.replace(/\{height\}|%7Bheight%7D/gi, '1200');
+  }
   if (cleaned.startsWith('//')) cleaned = `https:${cleaned}`;
   try {
     const resolved = new URL(cleaned, baseUrl);
@@ -106,31 +119,177 @@ function resolveAbsoluteUrl(candidate: string | undefined | null, baseUrl: strin
   }
 }
 
+export function upgradeProductImageUrl(rawUrl: string): string {
+  try {
+    let url = rawUrl
+      .replace(/\{width\}|%7Bwidth%7D/gi, '1200')
+      .replace(/\{height\}|%7Bheight%7D/gi, '1200');
+
+    // Upgrade Shopify small thumbnail filenames to full/high-res
+    url = url.replace(
+      /_(pico|icon|thumb|small|compact|medium)(_crop_center)?(\.(?:jpe?g|png|webp|gif))(\?.*)?$/i,
+      '$3$4'
+    );
+    // Upgrade Shopify _120x120.jpg or _300x.png (<450px) to _1200x
+    url = url.replace(
+      /_(\d{1,3})x(\d{0,3})(_crop_[a-z]+)?(\.(?:jpe?g|png|webp|gif))(\?.*)?$/i,
+      (full, wStr, _hStr, _crop, ext, qs = '') => {
+        const w = parseInt(wStr, 10);
+        return w > 0 && w < 450 ? `${ext}${qs}` : full;
+      }
+    );
+    // Upgrade WordPress -150x150.jpg / -300x300.png thumbnails to original image
+    url = url.replace(
+      /-(?:1[0-9]{2}|2[0-9]{2}|300)x(?:1[0-9]{2}|2[0-9]{2}|300)(\.(?:jpe?g|png|webp|gif))(\?.*)?$/i,
+      '$1$2'
+    );
+
+    const parsed = new URL(url);
+    for (const key of ['width', 'w']) {
+      const val = parsed.searchParams.get(key);
+      if (val && /^\d+$/.test(val) && Number(val) > 0 && Number(val) < 500) {
+        parsed.searchParams.set(key, '1200');
+      }
+    }
+    return parsed.href;
+  } catch {
+    return rawUrl;
+  }
+}
+
+function detectImageMagicExt(buf: Buffer, contentType: string): string | null {
+  if (!buf || buf.length < 250 || buf.length > 5 * 1024 * 1024) return null;
+  const ct = (contentType || '').toLowerCase();
+  if (ct.includes('svg') || ct.includes('text/html') || ct.includes('application/json')) {
+    return null;
+  }
+  // PNG
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return 'png';
+  // JPEG
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'jpg';
+  // GIF
+  if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x38) return 'gif';
+  // WEBP
+  if (
+    buf.length >= 12 &&
+    buf.toString('ascii', 0, 4) === 'RIFF' &&
+    buf.toString('ascii', 8, 12) === 'WEBP'
+  ) {
+    return 'webp';
+  }
+  // AVIF / HEIC ftyp box
+  if (buf.length >= 12 && buf.toString('ascii', 4, 8) === 'ftyp') {
+    const brand = buf.toString('ascii', 8, 12).toLowerCase();
+    if (brand.startsWith('avi') || brand.startsWith('hei') || brand.startsWith('mif')) {
+      return brand.startsWith('hei') ? 'heic' : 'avif';
+    }
+  }
+  // BMP
+  if (buf[0] === 0x42 && buf[1] === 0x4d) return 'bmp';
+
+  // Fallback to explicit raster Content-Type header (excluding SVG)
+  if (ct.startsWith('image/')) {
+    if (ct.includes('jpeg') || ct.includes('jpg')) return 'jpg';
+    if (ct.includes('png')) return 'png';
+    if (ct.includes('webp')) return 'webp';
+    if (ct.includes('gif')) return 'gif';
+    if (ct.includes('avif')) return 'avif';
+  }
+  return null;
+}
+
+async function fetchImageBuffer(targetUrl: string, referer?: string): Promise<{ buf: Buffer; ext: string } | null> {
+  let parsed: URL;
+  try {
+    parsed = new URL(targetUrl);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+  if (isBlockedHostOrIp(parsed.hostname)) return null;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8500);
+  try {
+    const headers: Record<string, string> = {
+      'User-Agent':
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+      Accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+    };
+    if (referer) {
+      try {
+        headers['Referer'] = new URL(referer).origin + '/';
+      } catch {
+        // ignore invalid referer
+      }
+    }
+    const res = await fetch(targetUrl, {
+      method: 'GET',
+      redirect: 'follow',
+      signal: controller.signal,
+      headers,
+    });
+    if (!res.ok) return null;
+    const contentType = res.headers.get('content-type') || '';
+    const arrayBuf = await res.arrayBuffer();
+    const buf = Buffer.from(arrayBuf);
+    const ext = detectImageMagicExt(buf, contentType);
+    if (!ext) return null;
+    return { buf, ext };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export async function downloadAndCacheExternalImage(
+  remoteUrl: string,
+  referer?: string
+): Promise<{ localUrl: string; downloaded: boolean }> {
+  const trimmed = (remoteUrl || '').trim();
+  if (!trimmed) return { localUrl: '', downloaded: false };
+  if (trimmed.startsWith('/api/media/imported/') || trimmed.startsWith('data:image/')) {
+    return { localUrl: trimmed, downloaded: false };
+  }
+
+  const upgraded = upgradeProductImageUrl(trimmed);
+  let result = await fetchImageBuffer(upgraded, referer);
+  if (!result && upgraded !== trimmed) {
+    result = await fetchImageBuffer(trimmed, referer);
+  }
+
+  if (!result) {
+    return { localUrl: upgraded, downloaded: false };
+  }
+
+  const hash = crypto.createHash('sha256').update(result.buf).digest('hex').slice(0, 16);
+  const fileName = `${hash}.${result.ext}`;
+  const filePath = path.join(IMPORTED_MEDIA_DIR, fileName);
+  if (!fs.existsSync(filePath)) {
+    fs.writeFileSync(filePath, result.buf);
+  }
+  return { localUrl: `/api/media/imported/${fileName}`, downloaded: true };
+}
+
 function isLikelyProductImage(url: string): boolean {
   const lower = url.toLowerCase();
-  if (lower.endsWith('.svg') || lower.includes('favicon')) return false;
+  if (lower.endsWith('.svg') || lower.includes('.svg?') || lower.includes('favicon')) return false;
   const blockedPatterns = [
     'logo',
-    'icon',
     'sprite',
     'avatar',
     'placeholder',
     'spinner',
     'loader',
-    'badge',
-    'payment',
-    'visa',
-    'mastercard',
+    'payment-icon',
+    'visa-icon',
+    'mastercard-icon',
     'jazzcash-logo',
     'easypaisa-logo',
-    'flag',
-    'social',
-    'facebook',
-    'instagram',
-    'tiktok',
     'whatsapp-icon',
     '1x1',
-    'pixel',
+    'pixel.',
     'analytics',
   ];
   return !blockedPatterns.some((p) => lower.includes(p));
@@ -404,6 +563,10 @@ interface ShopifyVariantJson {
   compare_at_price?: string | number | null;
   available?: boolean;
   inventory_quantity?: number;
+  weight?: number;
+  weight_unit?: string;
+  grams?: number;
+  image_id?: number | string | null;
   featured_image?: { src?: string } | null;
 }
 
@@ -413,7 +576,7 @@ interface ShopifyProductJson {
   vendor?: string;
   product_type?: string;
   tags?: string | string[];
-  images?: Array<{ src?: string; id?: number | string }>;
+  images?: Array<{ src?: string; id?: number | string; variant_ids?: Array<number | string> }>;
   options?: Array<{ name?: string; position?: number; values?: string[] }>;
   variants?: ShopifyVariantJson[];
 }
@@ -458,6 +621,7 @@ function tryExtractShopifyJsonFromHtml(html: string): ShopifyProductJson | null 
   const patterns = [
     /<script[^>]*type=["']application\/json["'][^>]*data-product-json[^>]*>([\s\S]*?)<\/script>/i,
     /<script[^>]*id=["']ProductJson[^"']*["'][^>]*>([\s\S]*?)<\/script>/i,
+    /var\s+meta\s*=\s*(\{"product":[\s\S]*?\});/i,
   ];
   for (const pat of patterns) {
     const m = html.match(pat);
@@ -486,38 +650,132 @@ function extractWooVariationsFromHtml(html: string, finalUrl: string): ProductVa
       display_regular_price?: number;
       is_in_stock?: boolean;
       max_qty?: number;
+      variation_description?: string;
+      weight_html?: string;
+      dimensions_html?: string;
       attributes?: Record<string, string>;
-      image?: { url?: string; full_src?: string };
+      image?: { url?: string; full_src?: string; src?: string };
     }>;
     if (!Array.isArray(list)) return [];
-    return list.slice(0, 25).map((v, idx) => {
+    return list.slice(0, 30).map((v, idx) => {
       const attrs: Record<string, string> = {};
       if (v.attributes) {
         Object.entries(v.attributes).forEach(([k, val]) => {
           if (val) {
-            const cleanKey = k.replace(/^attribute_(pa_)?/i, '').replace(/[-_]/g, ' ');
+            const cleanKey = k.replace(/^attribute_(pa_)?/i, '').replace(/[-_]/g, ' ').trim();
             attrs[cleanKey || `Option ${idx + 1}`] = String(val);
           }
         });
       }
+      const attrTitle = Object.values(attrs).filter(Boolean).join(' · ') || `Option ${idx + 1}`;
       const salePrice = typeof v.display_price === 'number' ? Math.round(v.display_price) : 0;
       const regularPrice =
         typeof v.display_regular_price === 'number' ? Math.round(v.display_regular_price) : salePrice;
+      const detailParts: string[] = [];
+      if (v.variation_description) {
+        const descText = stripHtmlTags(v.variation_description);
+        if (descText) detailParts.push(descText);
+      }
+      if (v.dimensions_html) {
+        const dimText = stripHtmlTags(v.dimensions_html);
+        if (dimText && !/n\/a/i.test(dimText)) detailParts.push(`Dimensions: ${dimText}`);
+      }
+      if (v.weight_html) {
+        const wtText = stripHtmlTags(v.weight_html);
+        if (wtText && !/n\/a/i.test(wtText)) detailParts.push(`Weight: ${wtText}`);
+      }
+      const sizeKey = Object.keys(attrs).find((k) => /size|dimension|capacity|pack|edition/i.test(k));
+      const colorKey = Object.keys(attrs).find((k) => /colou?r|shade|finish|style/i.test(k));
+
       return {
         id: `var_woo_${Date.now()}_${idx + 1}`,
+        title: attrTitle,
         sku: v.sku || `WOO-V${idx + 1}`,
-        attributes: Object.keys(attrs).length > 0 ? attrs : { Variant: `Option ${idx + 1}` },
-        size: attrs.size || attrs.Size || Object.values(attrs)[0] || undefined,
-        color: attrs.color || attrs.Color || attrs.colour || undefined,
+        attributes: Object.keys(attrs).length > 0 ? attrs : { Variant: attrTitle },
+        size: (sizeKey ? attrs[sizeKey] : undefined) || (!colorKey ? Object.values(attrs)[0] : undefined),
+        color: colorKey ? attrs[colorKey] : undefined,
+        details: detailParts.join(' | ') || undefined,
         originalPrice: regularPrice,
         salePrice,
         stockQty: v.is_in_stock === false ? 0 : typeof v.max_qty === 'number' && v.max_qty > 0 ? v.max_qty : 25,
-        image: resolveAbsoluteUrl(v.image?.full_src || v.image?.url, finalUrl) || undefined,
+        image: resolveAbsoluteUrl(v.image?.full_src || v.image?.url || v.image?.src, finalUrl) || undefined,
       };
     });
   } catch {
     return [];
   }
+}
+
+function extractHtmlFallbackVariations(
+  html: string,
+  baseSku: string,
+  baseSalePrice: number,
+  baseMarketPrice: number
+): ProductVariation[] {
+  const foundGroups: Array<{ optionName: string; values: string[] }> = [];
+
+  // 1. Parse variation <select> dropdowns
+  const selectRegex = /<select\b([^>]*)>([\s\S]*?)<\/select>/gi;
+  let selMatch: RegExpExecArray | null;
+  while ((selMatch = selectRegex.exec(html)) !== null && foundGroups.length < 3) {
+    const attrs = parseAttributes(`<select ${selMatch[1]}>`);
+    const idOrName = `${attrs.name || ''} ${attrs.id || ''} ${attrs['data-attribute_name'] || ''}`.toLowerCase();
+    if (!/(size|color|colour|option|variant|style|pack|weight|capacity|attribute_)/i.test(idOrName)) {
+      continue;
+    }
+    const cleanOptName = (attrs['data-attribute_name'] || attrs.name || attrs.id || 'Option')
+      .replace(/^attribute_(pa_)?/i, '')
+      .replace(/[-_]/g, ' ')
+      .replace(/\b\w/g, (c) => c.toUpperCase())
+      .trim();
+
+    const optValues: string[] = [];
+    const optRegex = /<option\b([^>]*)>([\s\S]*?)<\/option>/gi;
+    let optMatch: RegExpExecArray | null;
+    while ((optMatch = optRegex.exec(selMatch[2])) !== null && optValues.length < 15) {
+      const optAttrs = parseAttributes(`<option ${optMatch[1]}>`);
+      const label = stripHtmlTags(optMatch[2]).trim();
+      const val = (optAttrs.value || label).trim();
+      if (!val || /choose|select\s+an?\s+option|default\s+title/i.test(label)) continue;
+      if (!optValues.includes(label || val)) optValues.push(label || val);
+    }
+    if (optValues.length > 0) {
+      foundGroups.push({ optionName: cleanOptName || 'Option', values: optValues });
+    }
+  }
+
+  // 2. Parse swatch buttons/labels if no <select> variation options found
+  if (foundGroups.length === 0) {
+    const swatchVals = new Set<string>();
+    const swatchRegex = /<(?:button|label|li|a|span)\b[^>]*\bdata-(?:value|option|swatch-value|color)=["']([^"']+)["'][^>]*>/gi;
+    let swMatch: RegExpExecArray | null;
+    while ((swMatch = swatchRegex.exec(html)) !== null && swatchVals.size < 15) {
+      const v = decodeHtmlEntities(swMatch[1]).trim();
+      if (v && v.length <= 40 && !/^\{/.test(v)) swatchVals.add(v);
+    }
+    if (swatchVals.size > 1) {
+      foundGroups.push({ optionName: 'Option', values: Array.from(swatchVals) });
+    }
+  }
+
+  if (foundGroups.length === 0) return [];
+  const primary = foundGroups[0];
+  return primary.values.slice(0, 20).map((val, idx) => {
+    const isColor = /colou?r|shade|finish/i.test(primary.optionName);
+    const isSize = /size|dimension|capacity|weight|pack/i.test(primary.optionName) || !isColor;
+    return {
+      id: `var_html_${Date.now()}_${idx + 1}`,
+      title: val,
+      sku: `${baseSku || 'IMP'}-V${idx + 1}`,
+      attributes: { [primary.optionName]: val },
+      size: isSize ? val : undefined,
+      color: isColor ? val : undefined,
+      details: `${primary.optionName}: ${val}`,
+      originalPrice: baseMarketPrice,
+      salePrice: baseSalePrice,
+      stockQty: 25,
+    };
+  });
 }
 
 function collectJsonLdProducts(html: string): Array<Record<string, unknown>> {
@@ -534,7 +792,15 @@ function collectJsonLdProducts(html: string): Array<Record<string, unknown>> {
       const obj = node as Record<string, unknown>;
       const typeVal = obj['@type'];
       const types = Array.isArray(typeVal) ? typeVal.map(String) : typeVal ? [String(typeVal)] : [];
-      if (types.some((t) => t.toLowerCase() === 'product' || t.toLowerCase().endsWith('/product'))) {
+      if (
+        types.some(
+          (t) =>
+            t.toLowerCase() === 'product' ||
+            t.toLowerCase() === 'productgroup' ||
+            t.toLowerCase().endsWith('/product') ||
+            t.toLowerCase().endsWith('/productgroup')
+        )
+      ) {
         results.push(obj);
       }
       if (Array.isArray(obj['@graph'])) walk(obj['@graph']);
@@ -551,6 +817,64 @@ function collectJsonLdProducts(html: string): Array<Record<string, unknown>> {
     }
   }
   return results;
+}
+
+function extractInlineGalleryImagesFromScriptsAndCss(html: string, finalUrl: string): string[] {
+  const found: string[] = [];
+  const addCandidate = (raw: string) => {
+    const clean = raw.replace(/\\\//g, '/').trim();
+    if (!clean || clean.includes('{width}') === false && clean.length < 10) {
+      // allow template URLs cleanly via resolveAbsoluteUrl
+    }
+    const abs = resolveAbsoluteUrl(clean, finalUrl);
+    if (abs && isLikelyProductImage(abs)) {
+      found.push(abs);
+    }
+  };
+
+  // Match JSON arrays like "images": ["https://...", "//cdn..."] or "gallery": [...] or "media": [...]
+  const arrayRegex = /"(?:images|gallery|productImages|mediaGallery|media|zoomImages|large_images)"\s*:\s*\[([^\]]{10,12000})\]/gi;
+  let arrMatch: RegExpExecArray | null;
+  while ((arrMatch = arrayRegex.exec(html)) !== null && found.length < 30) {
+    const urlStrRegex = /["']((?:https?:)?\\?\/\\?\/[^"'\s<>]+\.(?:jpe?g|png|webp|gif|avif)(?:\?[^"'\s<>]*)?)["']/gi;
+    let uMatch: RegExpExecArray | null;
+    while ((uMatch = urlStrRegex.exec(arrMatch[1])) !== null && found.length < 30) {
+      addCandidate(uMatch[1]);
+    }
+  }
+
+  // Match inline CSS background-image: url(...)
+  const bgRegex = /background-image\s*:\s*url\((?:"|')?([^"')]+)(?:"|')?\)/gi;
+  let bgMatch: RegExpExecArray | null;
+  while ((bgMatch = bgRegex.exec(html)) !== null && found.length < 35) {
+    addCandidate(bgMatch[1]);
+  }
+
+  return found;
+}
+
+function matchBestGalleryImageForVariant(
+  v: ProductVariation,
+  originalImageUrls: string[]
+): string | undefined {
+  if (v.image) return v.image;
+  const tokens = [v.color, v.size, v.title, ...Object.values(v.attributes || {})]
+    .filter((t): t is string => Boolean(t && t.trim().length >= 3 && !/^(standard|default|none)$/i.test(t.trim())))
+    .flatMap((t) =>
+      t
+        .toLowerCase()
+        .split(/[^a-z0-9]+/)
+        .filter((tok) => tok.length >= 3)
+    );
+  if (tokens.length === 0) return undefined;
+
+  for (const imgUrl of originalImageUrls) {
+    const fileAndPath = imgUrl.toLowerCase();
+    if (tokens.some((tok) => fileAndPath.includes(tok))) {
+      return imgUrl;
+    }
+  }
+  return undefined;
 }
 
 export async function scrapeProductFromUrl(
@@ -614,6 +938,15 @@ export async function scrapeProductFromUrl(
   const categoryHints: string[] = [];
   const variations: ProductVariation[] = [];
 
+  const addImageUrl = (rawImgUrl: string | null | undefined): string | null => {
+    if (!rawImgUrl) return null;
+    const abs = resolveAbsoluteUrl(rawImgUrl, finalUrl);
+    if (!abs || !isLikelyProductImage(abs)) return null;
+    const upgraded = upgradeProductImageUrl(abs);
+    imageSet.add(upgraded);
+    return upgraded;
+  };
+
   // 1. Extract Meta Tags (OpenGraph / Twitter / Product Meta)
   const metaMap = new Map<string, string>();
   const metaTagRegex = /<meta\b[^>]*>/gi;
@@ -624,8 +957,7 @@ export async function scrapeProductFromUrl(
     const val = (attrs.content || '').trim();
     if (key && val) {
       if (key === 'og:image' || key === 'og:image:secure_url' || key === 'twitter:image') {
-        const abs = resolveAbsoluteUrl(val, finalUrl);
-        if (abs && isLikelyProductImage(abs)) imageSet.add(abs);
+        addImageUrl(val);
       } else if (key === 'og:video' || key === 'og:video:url' || key === 'og:video:secure_url') {
         const abs = resolveAbsoluteUrl(val, finalUrl);
         if (abs && !videoUrl) videoUrl = abs;
@@ -658,9 +990,17 @@ export async function scrapeProductFromUrl(
       const clean = t.trim().toLowerCase();
       if (clean && tagSet.size < 15) tagSet.add(clean);
     });
+
+    const shopifyImageById = new Map<string, string>();
+    const shopifyImageByVariantId = new Map<string, string>();
     (shopifyProd.images || []).forEach((img) => {
-      const abs = resolveAbsoluteUrl(img.src, finalUrl);
-      if (abs) imageSet.add(abs);
+      const added = addImageUrl(img.src);
+      if (added && img.id !== undefined) {
+        shopifyImageById.set(String(img.id), added);
+      }
+      if (added && Array.isArray(img.variant_ids)) {
+        img.variant_ids.forEach((vid) => shopifyImageByVariantId.set(String(vid), added));
+      }
     });
 
     const optNames = (shopifyProd.options || []).map((o) => o.name || 'Option');
@@ -673,7 +1013,7 @@ export async function scrapeProductFromUrl(
       if (firstPrice) salePriceRaw = firstPrice;
       if (firstCompare && firstCompare > (firstPrice || 0)) marketPriceRaw = firstCompare;
 
-      variantsList.slice(0, 25).forEach((v, idx) => {
+      variantsList.slice(0, 30).forEach((v, idx) => {
         const attrs: Record<string, string> = {};
         if (v.option1 && v.option1 !== 'Default Title') attrs[optNames[0] || 'Option 1'] = v.option1;
         if (v.option2) attrs[optNames[1] || 'Option 2'] = v.option2;
@@ -681,31 +1021,53 @@ export async function scrapeProductFromUrl(
         if (Object.keys(attrs).length === 0 && v.title && v.title !== 'Default Title') {
           attrs['Variant'] = v.title;
         }
+        const attrTitle =
+          (v.title && v.title !== 'Default Title' ? v.title : '') ||
+          Object.values(attrs).filter(Boolean).join(' / ') ||
+          `Variant ${idx + 1}`;
         const vPrice = parseNumericPrice(v.price) || salePriceRaw || 0;
         const vComp = parseNumericPrice(v.compare_at_price) || marketPriceRaw || vPrice;
+        const rawVarImg =
+          v.featured_image?.src ||
+          (v.image_id ? shopifyImageById.get(String(v.image_id)) : undefined) ||
+          (v.id ? shopifyImageByVariantId.get(String(v.id)) : undefined);
+        const varImg = rawVarImg ? addImageUrl(rawVarImg) || undefined : undefined;
+
+        const detailSegments = Object.entries(attrs).map(([k, val]) => `${k}: ${val}`);
+        if (v.weight && v.weight > 0) {
+          detailSegments.push(`Weight: ${v.weight} ${v.weight_unit || 'g'}`);
+        } else if (v.grams && v.grams > 0) {
+          detailSegments.push(`Weight: ${v.grams}g`);
+        }
+
+        const sizeKey = Object.keys(attrs).find((k) => /size|dimension|capacity|pack|model/i.test(k));
+        const colorKey = Object.keys(attrs).find((k) => /colou?r|shade|finish|style/i.test(k));
+
         variations.push({
           id: `var_imp_${Date.now()}_${idx + 1}`,
+          title: attrTitle,
           sku: v.sku || `${sku || 'IMP'}-V${idx + 1}`,
           attributes: Object.keys(attrs).length > 0 ? attrs : { Edition: 'Standard' },
-          size: attrs[optNames[0] || ''] || v.option1 || undefined,
-          color: attrs['Color'] || attrs['Colour'] || v.option2 || undefined,
+          size: (sizeKey ? attrs[sizeKey] : undefined) || v.option1 || undefined,
+          color: (colorKey ? attrs[colorKey] : undefined) || v.option2 || undefined,
+          details: detailSegments.join(' · ') || undefined,
           originalPrice: Math.round(vComp),
           salePrice: Math.round(vPrice),
           stockQty: typeof v.inventory_quantity === 'number' && v.inventory_quantity > 0 ? v.inventory_quantity : v.available === false ? 0 : 25,
-          image: resolveAbsoluteUrl(v.featured_image?.src, finalUrl) || undefined,
+          image: varImg,
         });
       });
     }
   }
 
-  // 3. Parse JSON-LD Product Schema
+  // 3. Parse JSON-LD Product & ProductGroup Schema
   const jsonLdProducts = collectJsonLdProducts(html);
   if (jsonLdProducts.length > 0) {
     strategiesUsed.push('JSON-LD Product Schema');
     for (const jp of jsonLdProducts) {
       if (!name && typeof jp.name === 'string') name = decodeHtmlEntities(jp.name).trim();
-      if (!sku && (typeof jp.sku === 'string' || typeof jp.mpn === 'string')) {
-        sku = String(jp.sku || jp.mpn).trim();
+      if (!sku && (typeof jp.sku === 'string' || typeof jp.mpn === 'string' || typeof jp.productGroupID === 'string')) {
+        sku = String(jp.sku || jp.mpn || jp.productGroupID).trim();
       }
       if (!brand && jp.brand) {
         if (typeof jp.brand === 'string') brand = jp.brand.trim();
@@ -718,19 +1080,24 @@ export async function scrapeProductFromUrl(
       }
       if (typeof jp.category === 'string') categoryHints.push(jp.category);
 
-      const collectLdImages = (imgNode: unknown) => {
-        if (!imgNode) return;
-        if (typeof imgNode === 'string') {
-          const abs = resolveAbsoluteUrl(imgNode, finalUrl);
-          if (abs) imageSet.add(abs);
-        } else if (Array.isArray(imgNode)) {
-          imgNode.forEach(collectLdImages);
-        } else if (typeof imgNode === 'object') {
-          const rec = imgNode as Record<string, unknown>;
-          collectLdImages(rec.url || rec.contentUrl);
+      const extractFirstLdImage = (imgNode: unknown): string | undefined => {
+        if (!imgNode) return undefined;
+        if (typeof imgNode === 'string') return addImageUrl(imgNode) || undefined;
+        if (Array.isArray(imgNode)) {
+          let first: string | undefined;
+          imgNode.forEach((n) => {
+            const added = extractFirstLdImage(n);
+            if (!first && added) first = added;
+          });
+          return first;
         }
+        if (typeof imgNode === 'object') {
+          const rec = imgNode as Record<string, unknown>;
+          return extractFirstLdImage(rec.url || rec.contentUrl);
+        }
+        return undefined;
       };
-      collectLdImages(jp.image);
+      extractFirstLdImage(jp.image);
 
       if (Array.isArray(jp.additionalProperty)) {
         for (const prop of jp.additionalProperty as Array<Record<string, unknown>>) {
@@ -751,6 +1118,54 @@ export async function scrapeProductFromUrl(
           stockQty = 0;
         }
       }
+
+      // Extract ProductGroup hasVariant items if variations are not yet populated
+      if (Array.isArray(jp.hasVariant) && variations.length === 0) {
+        const hvList = jp.hasVariant as Array<Record<string, unknown>>;
+        hvList.slice(0, 30).forEach((hv, idx) => {
+          const hvName = typeof hv.name === 'string' ? decodeHtmlEntities(hv.name).trim() : '';
+          const hvSize = typeof hv.size === 'string' ? hv.size.trim() : undefined;
+          const hvColor = typeof hv.color === 'string' ? hv.color.trim() : undefined;
+          const hvMat = typeof hv.material === 'string' ? hv.material.trim() : undefined;
+          const hvDesc = typeof hv.description === 'string' ? stripHtmlTags(hv.description) : '';
+          const hvOffers = Array.isArray(hv.offers) ? hv.offers[0] : hv.offers;
+          const offRec = (hvOffers && typeof hvOffers === 'object' ? hvOffers : {}) as Record<string, unknown>;
+          if (offRec.priceCurrency) currencyDetected = String(offRec.priceCurrency).toUpperCase();
+          const hvPrice = parseNumericPrice(offRec.price ?? offRec.lowPrice) || salePriceRaw || 0;
+          if (hvPrice && !salePriceRaw) salePriceRaw = hvPrice;
+          const hvImage = extractFirstLdImage(hv.image);
+          const attrs: Record<string, string> = {};
+          if (hvSize) attrs['Size'] = hvSize;
+          if (hvColor) attrs['Color'] = hvColor;
+          if (hvMat) attrs['Material'] = hvMat;
+          if (Object.keys(attrs).length === 0 && hvName) attrs['Variant'] = hvName;
+
+          const detailParts = [
+            hvDesc,
+            hvMat ? `Material: ${hvMat}` : '',
+            hvSize ? `Size: ${hvSize}` : '',
+            hvColor ? `Color: ${hvColor}` : '',
+          ].filter(Boolean);
+
+          variations.push({
+            id: `var_ld_${Date.now()}_${idx + 1}`,
+            title: hvName || [hvColor, hvSize].filter(Boolean).join(' · ') || `Variant ${idx + 1}`,
+            sku: typeof hv.sku === 'string' ? hv.sku.trim() : `${sku || 'IMP'}-V${idx + 1}`,
+            attributes: attrs,
+            size: hvSize || hvName || undefined,
+            color: hvColor,
+            details: detailParts.join(' · ') || undefined,
+            originalPrice: marketPriceRaw || hvPrice,
+            salePrice: hvPrice,
+            stockQty:
+              typeof offRec.availability === 'string' && offRec.availability.toLowerCase().includes('outofstock')
+                ? 0
+                : 25,
+            image: hvImage,
+          });
+        });
+        if (variations.length > 0) strategiesUsed.push('ProductGroup Variants');
+      }
     }
   }
 
@@ -767,7 +1182,6 @@ export async function scrapeProductFromUrl(
       ogTitle ||
       (titleTagMatch ? stripHtmlTags(titleTagMatch[1]) : '');
     if (rawTitle) {
-      // Strip trailing " | StoreName" or " - StoreName" when long
       name = rawTitle.replace(/\s+[|\-–—]\s+[^|\-–—]{2,35}$/, '').trim() || rawTitle.trim();
       strategiesUsed.push('HTML Title/H1');
     }
@@ -791,7 +1205,6 @@ export async function scrapeProductFromUrl(
   }
 
   if (!details) {
-    // Try common product description containers before falling back to meta
     const descBlocks = [
       /<div[^>]*(?:id|class)=["'][^"']*(?:product[-_ ]?description|woocommerce-product-details__short-description|tab-description|pdp-product-desc|product-details)[^"']*["'][^>]*>([\s\S]{30,5000}?)<\/div>/i,
       /<section[^>]*(?:id|class)=["'][^"']*(?:description|details)[^"']*["'][^>]*>([\s\S]{30,5000}?)<\/section>/i,
@@ -823,7 +1236,6 @@ export async function scrapeProductFromUrl(
   }
 
   if (!salePriceRaw) {
-    // Check common JSON/inline price properties or currency expressions near price classes
     const pricePatterns = [
       /"(?:salePrice|finalPrice|currentPrice|price)"\s*:\s*"?(\d+(?:\.\d{1,2})?)"?/i,
       /class=["'][^"']*(?:price|pdp-price|amount)[^"']*["'][^>]*>[^<]{0,40}((?:Rs\.?|PKR|USD|\$|£|€)\s*[\d,]+(?:\.\d{1,2})?)/i,
@@ -858,10 +1270,10 @@ export async function scrapeProductFromUrl(
     }
   }
 
-  // Gallery Image HTML Extraction (collect high-res zoom/data-src/srcset/img tags)
+  // Gallery Image HTML Extraction (high-res zoom/data-src/srcset/img tags + script JSON + CSS background)
   const imgTagRegex = /<img\b[^>]*>/gi;
   let imgMatch: RegExpExecArray | null;
-  while ((imgMatch = imgTagRegex.exec(html)) !== null && imageSet.size < 16) {
+  while ((imgMatch = imgTagRegex.exec(html)) !== null && imageSet.size < 20) {
     const attrs = parseAttributes(imgMatch[0]);
     const candidates = [
       attrs['data-zoom-image'],
@@ -875,11 +1287,15 @@ export async function scrapeProductFromUrl(
       attrs.src,
     ];
     for (const c of candidates) {
-      const abs = resolveAbsoluteUrl(c, finalUrl);
-      if (abs && isLikelyProductImage(abs)) {
-        imageSet.add(abs);
-        break;
-      }
+      if (addImageUrl(c)) break;
+    }
+  }
+
+  if (imageSet.size < 16) {
+    const scriptCssImages = extractInlineGalleryImagesFromScriptsAndCss(html, finalUrl);
+    for (const scImg of scriptCssImages) {
+      if (imageSet.size >= 20) break;
+      addImageUrl(scImg);
     }
   }
 
@@ -915,12 +1331,11 @@ export async function scrapeProductFromUrl(
     }
   }
 
-  // Bullet Features Extraction from <ul><li> inside descriptions or general meaningful bullets
+  // Bullet Features Extraction
   const liRegex = /<li[^>]*>([\s\S]{10,220}?)<\/li>/gi;
   let liMatch: RegExpExecArray | null;
   const featureSeen = new Set<string>();
   while ((liMatch = liRegex.exec(html)) !== null && features.length < 8) {
-    // Ignore nav/menu <li> containing nested links
     if (/<a\b/i.test(liMatch[1]) || /<(ul|nav|button)/i.test(liMatch[1])) continue;
     const text = stripHtmlTags(liMatch[1]);
     if (
@@ -934,12 +1349,30 @@ export async function scrapeProductFromUrl(
     }
   }
 
-  // 5. WooCommerce Embedded Variations Fallback
+  // 5. WooCommerce Embedded Variations & HTML Option Fallback
   if (variations.length === 0 && html) {
     const wooVars = extractWooVariationsFromHtml(html, finalUrl);
     if (wooVars.length > 0) {
+      wooVars.forEach((v) => {
+        if (v.image) {
+          v.image = addImageUrl(v.image) || v.image;
+        }
+      });
       variations.push(...wooVars);
       strategiesUsed.push('WooCommerce Variations JSON');
+    }
+  }
+
+  if (variations.length === 0 && html) {
+    const htmlVars = extractHtmlFallbackVariations(
+      html,
+      sku,
+      salePriceRaw || 0,
+      marketPriceRaw || salePriceRaw || 0
+    );
+    if (htmlVars.length > 0) {
+      variations.push(...htmlVars);
+      strategiesUsed.push('HTML Variation Options');
     }
   }
 
@@ -966,11 +1399,65 @@ export async function scrapeProductFromUrl(
     : 0;
   const costPrice = ourPrice > 0 ? Math.round(ourPrice * 0.68) : 0;
 
-  // Adjust variation prices to PKR if foreign currency detected
-  const normalizedVariations = variations.map((v) => ({
+  // Match any missing variation image against original gallery URLs BEFORE caching to hashed filenames
+  const rawGalleryList = Array.from(imageSet).slice(0, 20);
+  const preCachedVariations = variations.map((v, idx) => {
+    const matchedRawImage = v.image ? addImageUrl(v.image) || v.image : matchBestGalleryImageForVariant(v, rawGalleryList);
+    const titleStr =
+      v.title ||
+      [v.color, v.size, ...Object.values(v.attributes || {})].filter(Boolean).join(' · ') ||
+      v.sku ||
+      `Variant ${idx + 1}`;
+    const detailStr =
+      v.details ||
+      Object.entries(v.attributes || {})
+        .map(([k, val]) => `${k}: ${val}`)
+        .join(' · ') ||
+      undefined;
+    return {
+      ...v,
+      title: titleStr,
+      details: detailStr,
+      image: matchedRawImage,
+      originalPrice: v.originalPrice ? convertToPkrIfForeign(v.originalPrice, currencyDetected) : marketPrice,
+      salePrice: v.salePrice ? convertToPkrIfForeign(v.salePrice, currencyDetected) : ourPrice,
+    };
+  });
+
+  // Download & cache unique product + variant images locally on the server
+  const allRemoteImagesToCache = Array.from(
+    new Set([
+      ...rawGalleryList,
+      ...preCachedVariations.map((v) => v.image).filter((x): x is string => Boolean(x)),
+    ])
+  ).slice(0, 24);
+
+  const remoteToLocalMap = new Map<string, string>();
+  let imagesDownloaded = 0;
+
+  const CONCURRENCY = 6;
+  for (let i = 0; i < allRemoteImagesToCache.length; i += CONCURRENCY) {
+    const batch = allRemoteImagesToCache.slice(i, i + CONCURRENCY);
+    const results = await Promise.all(
+      batch.map(async (u) => ({
+        remote: u,
+        res: await downloadAndCacheExternalImage(u, finalUrl),
+      }))
+    );
+    for (const item of results) {
+      remoteToLocalMap.set(item.remote, item.res.localUrl);
+      if (item.res.downloaded) imagesDownloaded += 1;
+    }
+  }
+  if (imagesDownloaded > 0) strategiesUsed.push('Local Media Cache');
+
+  const pictures = Array.from(
+    new Set(rawGalleryList.map((u) => remoteToLocalMap.get(u) || u).filter(Boolean))
+  );
+
+  const normalizedVariations: ProductVariation[] = preCachedVariations.map((v) => ({
     ...v,
-    originalPrice: v.originalPrice ? convertToPkrIfForeign(v.originalPrice, currencyDetected) : marketPrice,
-    salePrice: v.salePrice ? convertToPkrIfForeign(v.salePrice, currencyDetected) : ourPrice,
+    image: v.image ? remoteToLocalMap.get(v.image) || v.image : undefined,
   }));
 
   if (currencyDetected !== 'PKR' && salePriceRaw) {
@@ -978,7 +1465,6 @@ export async function scrapeProductFromUrl(
   }
   specifications['Source Host'] = domain;
 
-  const pictures = Array.from(imageSet);
   if (!name) {
     const slug = parsedUrl.pathname.split('/').filter(Boolean).pop() || domain;
     name = slug.replace(/[-_]/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
@@ -1004,6 +1490,7 @@ export async function scrapeProductFromUrl(
     category: matchedCat?.name || categoryHints[0] || 'General Wholesale',
     parentCategoryId: matchedCat?.parentCategoryId ? undefined : matchedCat?.id,
     subcategoryId: matchedCat?.parentCategoryId ? matchedCat.id : undefined,
+    deliveryType: 'standard',
     sku: finalSku,
     costPrice,
     marketPrice,
@@ -1029,7 +1516,7 @@ export async function scrapeProductFromUrl(
     features,
     tags: Array.from(tagSet).filter(Boolean),
     variations: normalizedVariations,
-    sizes: normalizedVariations.map((v) => v.size || v.attributes?.Variant || '').filter(Boolean),
+    sizes: normalizedVariations.map((v) => v.size || v.title || v.attributes?.Variant || '').filter(Boolean),
     status: 'draft',
     createdAt: new Date().toISOString().split('T')[0],
   };
@@ -1041,6 +1528,7 @@ export async function scrapeProductFromUrl(
       currencyDetected,
       originalPriceText,
       imagesFound: pictures.length,
+      imagesDownloaded,
       specsFound: Object.keys(specifications).length,
       featuresFound: features.length,
       variantsFound: normalizedVariations.length,

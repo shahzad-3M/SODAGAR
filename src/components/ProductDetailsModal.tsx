@@ -16,6 +16,9 @@ import {
   Save,
   Share2,
   Copy,
+  Zap,
+  Lock,
+  CheckCircle2,
 } from 'lucide-react';
 import { AppUser, BusinessProfile, Customer, Investor, ProductItem } from '../types';
 import {
@@ -33,10 +36,13 @@ import { getInvestors } from '../utils/storage';
 import {
   DEFAULT_CITY_CENTER_DELIVERY_CHARGE,
   ensureCityAreasShape,
+  findFirstUnlockedExpressCityAndArea,
+  getProductDeliveryMeta,
   isMuzaffarabadCity,
   isProductPurchaseBlocked,
   normalizeTextKey,
   resolveDeliveryCharge,
+  resolveExpressAreaAvailability,
 } from '../utils/locationCategoryHelpers';
 
 interface ProductDetailsModalProps {
@@ -54,6 +60,7 @@ interface ProductDetailsModalProps {
 }
 
 const getVariationLabel = (v: NonNullable<ProductItem['variations']>[number]) =>
+  v.title ||
   [v.size, v.color, ...Object.values(v.attributes || {})].filter(Boolean).join(' · ') ||
   v.sku ||
   'Variant';
@@ -71,6 +78,7 @@ export const ProductDetailsModal: React.FC<ProductDetailsModalProps> = ({
   onUpdateProduct,
 }) => {
   const [activeImageIndex, setActiveImageIndex] = useState(0);
+  const [manualGalleryOverride, setManualGalleryOverride] = useState(false);
   const [selectedVariationIndex, setSelectedVariationIndex] = useState<number | null>(null);
   const [selectedSize, setSelectedSize] = useState<string>('Standard');
   const [quantity, setQuantity] = useState(1);
@@ -87,28 +95,34 @@ export const ProductDetailsModal: React.FC<ProductDetailsModalProps> = ({
       ? profile.deliveryCities
       : defaultDeliveryCities
   );
-  const activeDeliveryCities = cityConfigs.filter((c) => c.allowed);
-  const defaultEstimateCity =
-    activeDeliveryCities.find((c) => isMuzaffarabadCity(c.name))?.name ||
-    activeDeliveryCities[0]?.name ||
+  const firstExpressLocation = findFirstUnlockedExpressCityAndArea(cityConfigs);
+  const defaultStandardCity =
+    cityConfigs.find((c) => isMuzaffarabadCity(c.name))?.name ||
+    cityConfigs[0]?.name ||
     'Muzaffarabad';
 
   useEffect(() => {
     if (!isOpen || !product) return;
     setActiveImageIndex(0);
+    setManualGalleryOverride(false);
     setQuantity(1);
     setAddedAnimation(false);
     setVideoLinkInput(product.videoUrl || '');
     setVideoSavedToast(false);
     setShareFeedback(null);
-    setEstimateCity(defaultEstimateCity);
-    const cityObj = activeDeliveryCities.find(
-      (c) => normalizeTextKey(c.name) === normalizeTextKey(defaultEstimateCity)
-    );
-    const activeAreas = (cityObj?.areas || []).filter((a) => a.allowed);
-    setEstimateArea(
-      activeAreas[0]?.name || (isMuzaffarabadCity(defaultEstimateCity) ? 'City Center' : '')
-    );
+    const isExpress = product.deliveryType === 'express';
+    if (isExpress) {
+      setEstimateCity(firstExpressLocation.city);
+      setEstimateArea(firstExpressLocation.area);
+    } else {
+      setEstimateCity(defaultStandardCity);
+      const stdCityObj = cityConfigs.find(
+        (c) => normalizeTextKey(c.name) === normalizeTextKey(defaultStandardCity)
+      );
+      setEstimateArea(
+        stdCityObj?.areas?.[0]?.name || (isMuzaffarabadCity(defaultStandardCity) ? 'City Center' : '')
+      );
+    }
     if (product.variations && product.variations.length > 0) {
       setSelectedVariationIndex(0);
       setSelectedSize(getVariationLabel(product.variations[0]));
@@ -118,7 +132,7 @@ export const ProductDetailsModal: React.FC<ProductDetailsModalProps> = ({
         product.selectedSize || (product.sizes && product.sizes.length > 0 ? product.sizes[0] : 'Standard')
       );
     }
-  }, [isOpen, product?.id, product?.videoUrl, defaultEstimateCity]);
+  }, [isOpen, product?.id, product?.videoUrl, product?.deliveryType, firstExpressLocation.city, firstExpressLocation.area, defaultStandardCity]);
 
   if (!isOpen || !product) return null;
 
@@ -129,12 +143,17 @@ export const ProductDetailsModal: React.FC<ProductDetailsModalProps> = ({
     profile.phone || '03125256266'
   );
   const parsedVideo = parseProductVideoUrl(product.videoUrl);
+  const deliveryMeta = getProductDeliveryMeta(product);
 
-  const pictures = product.pictures && product.pictures.length > 0
-    ? product.pictures
-    : product.imageUrl
-    ? [product.imageUrl]
-    : [];
+  const pictures = Array.from(
+    new Set(
+      [
+        ...(product.pictures || []),
+        ...(product.imageUrl ? [product.imageUrl] : []),
+        ...((product.variations || []).map((v) => v.image).filter(Boolean) as string[]),
+      ].filter(Boolean)
+    )
+  );
 
   const activeVariation =
     selectedVariationIndex !== null && product.variations && product.variations[selectedVariationIndex]
@@ -145,7 +164,10 @@ export const ProductDetailsModal: React.FC<ProductDetailsModalProps> = ({
   const activeMarketPrice = activeVariation?.originalPrice || product.marketPrice;
 
   const activeImage =
-    activeVariation?.image || pictures[activeImageIndex] || product.imageUrl;
+    (!manualGalleryOverride && activeVariation?.image) ||
+    pictures[activeImageIndex] ||
+    activeVariation?.image ||
+    product.imageUrl;
 
   const savings = Math.max(0, activeMarketPrice - activePrice);
   const savingsPercent = activeMarketPrice > 0 ? Math.round((savings / activeMarketPrice) * 100) : 50;
@@ -169,11 +191,17 @@ export const ProductDetailsModal: React.FC<ProductDetailsModalProps> = ({
   const resolvedCustomerName =
     currentUser?.isAuthenticated && currentUser.name ? currentUser.name : undefined;
 
+  const isExpressProduct = deliveryMeta.isExpress;
   const selectedEstimateCityObj =
-    activeDeliveryCities.find(
-      (c) => normalizeTextKey(c.name) === normalizeTextKey(estimateCity)
-    ) || activeDeliveryCities[0];
-  const estimateCityAreas = (selectedEstimateCityObj?.areas || []).filter((a) => a.allowed);
+    cityConfigs.find((c) => normalizeTextKey(c.name) === normalizeTextKey(estimateCity)) ||
+    cityConfigs[0];
+  const estimateCityAreas = selectedEstimateCityObj?.areas || [];
+  const estimateAvailability = resolveExpressAreaAvailability(
+    cityConfigs,
+    selectedEstimateCityObj?.name || estimateCity,
+    estimateArea,
+    isExpressProduct
+  );
   const resolvedEstimateDelivery = resolveDeliveryCharge(
     cityConfigs,
     selectedEstimateCityObj?.name || estimateCity,
@@ -329,22 +357,28 @@ export const ProductDetailsModal: React.FC<ProductDetailsModalProps> = ({
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6 items-start">
             {/* LEFT: PICTURES GALLERY */}
             <div className="space-y-3">
-              <div className="relative bg-slate-100 dark:bg-slate-800 rounded-xl overflow-hidden border border-slate-200 dark:border-slate-800 aspect-square flex items-center justify-center">
+              <div className="relative bg-white dark:bg-slate-900 rounded-xl overflow-hidden border border-slate-200 dark:border-slate-800 aspect-square flex items-center justify-center">
                 {activeImage ? (
                   <img
                     src={activeImage}
                     alt={product.name}
-                    className="w-full h-full object-cover"
+                    referrerPolicy="no-referrer"
+                    className="w-full h-full object-contain p-2"
                   />
                 ) : (
                   <ShoppingBag className="w-16 h-16 text-slate-300" />
                 )}
 
-                {/* Savings Badge */}
+                {/* Savings & Express Symbol Badge */}
                 <div className="absolute top-3 left-3 flex flex-col gap-1 items-start">
                   <span className="bg-emerald-600 text-white font-extrabold text-xs px-2.5 py-1 rounded shadow-md">
                     -{savingsPercent}% OFF
                   </span>
+                  {isExpressProduct && !isProductPurchaseBlocked(product) && (
+                    <span className="bg-emerald-950/90 text-emerald-200 border border-emerald-400/50 font-extrabold text-[10px] px-2 py-0.5 rounded shadow-xs flex items-center gap-1">
+                      <Zap className="w-3 h-3 fill-emerald-300 text-emerald-300" /> EXPRESS
+                    </span>
+                  )}
                   {product.isWinningItem && (
                     <span className="bg-amber-500 text-slate-950 font-bold text-[10px] px-2 py-0.5 rounded shadow-xs flex items-center gap-1">
                       <Sparkles className="w-3 h-3 fill-slate-950" /> WINNING ITEM
@@ -366,19 +400,31 @@ export const ProductDetailsModal: React.FC<ProductDetailsModalProps> = ({
               {/* Thumbnails Row */}
               {pictures.length > 1 && (
                 <div className="flex items-center gap-2 overflow-x-auto pb-1">
-                  {pictures.map((pic, idx) => (
-                    <button
-                      key={idx}
-                      onClick={() => setActiveImageIndex(idx)}
-                      className={`w-16 h-16 rounded-lg overflow-hidden border-2 shrink-0 transition-all cursor-pointer ${
-                        activeImageIndex === idx
-                          ? 'border-amber-500 ring-2 ring-amber-400/50 scale-105'
-                          : 'border-slate-200 dark:border-slate-700 opacity-70 hover:opacity-100'
-                      }`}
-                    >
-                      <img src={pic} alt={`View ${idx + 1}`} className="w-full h-full object-cover" />
-                    </button>
-                  ))}
+                  {pictures.map((pic, idx) => {
+                    const isThumbActive = activeImage === pic;
+                    return (
+                      <button
+                        key={idx}
+                        type="button"
+                        onClick={() => {
+                          setActiveImageIndex(idx);
+                          setManualGalleryOverride(true);
+                        }}
+                        className={`w-16 h-16 rounded-lg overflow-hidden border-2 bg-white dark:bg-slate-900 shrink-0 transition-all cursor-pointer ${
+                          isThumbActive
+                            ? 'border-amber-500 ring-2 ring-amber-400/50 scale-105'
+                            : 'border-slate-200 dark:border-slate-700 opacity-75 hover:opacity-100'
+                        }`}
+                      >
+                        <img
+                          src={pic}
+                          alt={`View ${idx + 1}`}
+                          referrerPolicy="no-referrer"
+                          className="w-full h-full object-contain p-0.5"
+                        />
+                      </button>
+                    );
+                  })}
                 </div>
               )}
 
@@ -534,10 +580,10 @@ export const ProductDetailsModal: React.FC<ProductDetailsModalProps> = ({
                 )}
               </div>
 
-              {/* VARIATION SELECTOR (Sizes, Colors, Options) */}
+              {/* VARIATION SELECTOR (Sizes, Colors, Options + Separate Details) */}
               {product.variations && product.variations.length > 0 ? (
-                <div>
-                  <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1.5 flex items-center gap-1">
+                <div className="space-y-2.5">
+                  <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 flex items-center gap-1">
                     <Tag className="w-3.5 h-3.5 text-amber-500" />
                     <span>Select Variation / Option (ویریئنٹ منتخب کریں):</span>
                   </label>
@@ -552,6 +598,7 @@ export const ProductDetailsModal: React.FC<ProductDetailsModalProps> = ({
                           onClick={() => {
                             setSelectedVariationIndex(vIdx);
                             setSelectedSize(label);
+                            setManualGalleryOverride(false);
                           }}
                           className={`p-2 rounded-xl text-left border transition-all cursor-pointer flex items-center gap-2 ${
                             isSelected
@@ -560,7 +607,12 @@ export const ProductDetailsModal: React.FC<ProductDetailsModalProps> = ({
                           }`}
                         >
                           {v.image && (
-                            <img src={v.image} alt={label} className="w-8 h-8 rounded-lg object-cover shrink-0" />
+                            <img
+                              src={v.image}
+                              alt={label}
+                              referrerPolicy="no-referrer"
+                              className="w-9 h-9 rounded-lg object-contain bg-white border border-slate-200 shrink-0"
+                            />
                           )}
                           <div className="min-w-0 flex-1">
                             <span className="text-xs font-bold text-slate-900 dark:text-white block truncate">
@@ -574,6 +626,52 @@ export const ProductDetailsModal: React.FC<ProductDetailsModalProps> = ({
                       );
                     })}
                   </div>
+
+                  {/* Separate Selected Variant Details Panel */}
+                  {activeVariation && (
+                    <div className="p-2.5 rounded-xl bg-amber-50/70 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800/80 text-[11px] space-y-1">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <span className="font-extrabold text-slate-900 dark:text-white">
+                          Option: {getVariationLabel(activeVariation)}
+                        </span>
+                        <div className="flex items-center gap-1.5 font-mono text-[10px]">
+                          {activeVariation.sku && (
+                            <span className="px-1.5 py-0.5 rounded bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300">
+                              SKU: {activeVariation.sku}
+                            </span>
+                          )}
+                          <span
+                            className={`px-1.5 py-0.5 rounded font-bold ${
+                              (activeVariation.stockQty ?? 0) > 0
+                                ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300'
+                                : 'bg-red-100 text-red-700 dark:bg-red-950/60 dark:text-red-300'
+                            }`}
+                          >
+                            {(activeVariation.stockQty ?? 0) > 0
+                              ? `${activeVariation.stockQty} available`
+                              : 'Check availability'}
+                          </span>
+                        </div>
+                      </div>
+                      {activeVariation.attributes && Object.keys(activeVariation.attributes).length > 0 && (
+                        <div className="flex flex-wrap gap-1 pt-0.5">
+                          {Object.entries(activeVariation.attributes).map(([attrK, attrV]) => (
+                            <span
+                              key={attrK}
+                              className="px-1.5 py-0.5 rounded bg-white/80 dark:bg-slate-900/70 border border-amber-200/70 dark:border-amber-800/50 text-[10px] text-slate-700 dark:text-slate-300"
+                            >
+                              <b>{attrK}:</b> {attrV}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                      {activeVariation.details && (
+                        <p className="text-slate-700 dark:text-slate-300 leading-relaxed pt-0.5">
+                          {activeVariation.details}
+                        </p>
+                      )}
+                    </div>
+                  )}
                 </div>
               ) : product.sizes && product.sizes.length > 0 ? (
                 <div>
@@ -725,7 +823,7 @@ export const ProductDetailsModal: React.FC<ProductDetailsModalProps> = ({
               <div className="p-3.5 rounded-xl bg-slate-50/80 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-700/80 space-y-3">
                 <div className="flex items-center justify-between gap-2">
                   <span className="text-xs font-bold text-slate-900 dark:text-white flex items-center gap-1.5">
-                    <Truck className="w-3.5 h-3.5 text-amber-500" />
+                    {isExpressProduct && <Zap className="w-3.5 h-3.5 text-emerald-500 fill-emerald-500" />}
                     <span>Delivery &amp; Dispatch Estimate</span>
                   </span>
                   <span className="text-[11px] font-medium text-slate-500 dark:text-slate-400">
@@ -733,7 +831,7 @@ export const ProductDetailsModal: React.FC<ProductDetailsModalProps> = ({
                   </span>
                 </div>
 
-                {activeDeliveryCities.length > 0 && (
+                {cityConfigs.length > 0 && (
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                     <div>
                       <label className="block text-[10px] font-semibold text-slate-500 dark:text-slate-400 mb-1">
@@ -744,27 +842,38 @@ export const ProductDetailsModal: React.FC<ProductDetailsModalProps> = ({
                         onChange={(e) => {
                           const nextCity = e.target.value;
                           setEstimateCity(nextCity);
-                          const cObj = activeDeliveryCities.find(
+                          const cObj = cityConfigs.find(
                             (c) => normalizeTextKey(c.name) === normalizeTextKey(nextCity)
                           );
-                          const nextAreas = (cObj?.areas || []).filter((a) => a.allowed);
+                          const areas = cObj?.areas || [];
+                          const nextArea = isExpressProduct
+                            ? areas.find((a) => a.allowed)?.name || ''
+                            : areas[0]?.name || '';
                           setEstimateArea(
-                            nextAreas[0]?.name || (isMuzaffarabadCity(nextCity) ? 'City Center' : '')
+                            nextArea || (isMuzaffarabadCity(nextCity) ? 'City Center' : '')
                           );
                         }}
                         className="w-full px-2.5 py-1.5 text-xs rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-amber-400"
                       >
-                        {activeDeliveryCities.map((c) => (
-                          <option key={c.id || c.name} value={c.name}>
-                            {c.name}
-                          </option>
-                        ))}
+                        {cityConfigs.map((c) => {
+                          const cityUnlocked = isMuzaffarabadCity(c.name) || c.allowed;
+                          const lockedForExpress = isExpressProduct && !cityUnlocked;
+                          return (
+                            <option
+                              key={c.id || c.name}
+                              value={c.name}
+                              disabled={lockedForExpress}
+                            >
+                              {lockedForExpress ? `🔒 ${c.name} (Locked)` : c.name}
+                            </option>
+                          );
+                        })}
                       </select>
                     </div>
 
                     <div>
                       <label className="block text-[10px] font-semibold text-slate-500 dark:text-slate-400 mb-1">
-                        Area / Sector
+                        Sub-City / Area
                       </label>
                       {estimateCityAreas.length > 0 ? (
                         <select
@@ -772,16 +881,25 @@ export const ProductDetailsModal: React.FC<ProductDetailsModalProps> = ({
                           onChange={(e) => setEstimateArea(e.target.value)}
                           className="w-full px-2.5 py-1.5 text-xs rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-amber-400"
                         >
-                          {estimateCityAreas.map((a) => (
-                            <option key={a.id} value={a.name}>
-                              {a.name}
-                              {typeof a.deliveryCharge === 'number' ? ` (Rs. ${a.deliveryCharge})` : ''}
-                            </option>
-                          ))}
+                          {estimateCityAreas.map((a) => {
+                            const lockedForExpress = isExpressProduct && !a.allowed;
+                            return (
+                              <option
+                                key={a.id}
+                                value={a.name}
+                                disabled={lockedForExpress}
+                              >
+                                {lockedForExpress ? `🔒 ${a.name} (Locked)` : a.name}
+                                {typeof a.deliveryCharge === 'number' ? ` (Rs. ${a.deliveryCharge})` : ''}
+                              </option>
+                            );
+                          })}
                         </select>
                       ) : (
                         <div className="px-2.5 py-1.5 text-xs rounded-lg border border-slate-200 dark:border-slate-700 bg-white/70 dark:bg-slate-900/60 text-slate-500 dark:text-slate-400">
-                          Standard City Coverage
+                          {isExpressProduct
+                            ? 'All areas in unlocked city covered'
+                            : 'Open across all areas'}
                         </div>
                       )}
                     </div>
@@ -805,12 +923,63 @@ export const ProductDetailsModal: React.FC<ProductDetailsModalProps> = ({
                   )}
                 </div>
 
+                {/* Delivery Conditions Banner: Express Symbol+Lock vs Standard Open Without Symbol */}
+                {!isProductPurchaseBlocked(product) && (
+                  isExpressProduct ? (
+                    <div
+                      className={`p-2.5 rounded-lg border text-[11px] flex items-center justify-between gap-2 ${
+                        estimateAvailability.allowed
+                          ? 'bg-emerald-50 dark:bg-emerald-950/40 border-emerald-200 dark:border-emerald-800 text-emerald-900 dark:text-emerald-200'
+                          : 'bg-rose-50 dark:bg-rose-950/40 border-rose-200 dark:border-rose-800 text-rose-900 dark:text-rose-200'
+                      }`}
+                    >
+                      <div className="flex items-center gap-2 min-w-0">
+                        {estimateAvailability.allowed ? (
+                          <Zap className="w-4 h-4 text-emerald-600 fill-emerald-500 shrink-0" />
+                        ) : (
+                          <Lock className="w-4 h-4 text-rose-600 shrink-0" />
+                        )}
+                        <div className="min-w-0">
+                          <span className="font-extrabold flex items-center gap-1">
+                            <span>⚡ {deliveryMeta.badgeLabel}</span>
+                            {estimateAvailability.allowed ? (
+                              <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 inline" />
+                            ) : null}
+                          </span>
+                          <span className="text-[10px] opacity-90 block">
+                            {estimateAvailability.allowed
+                              ? 'Instant Express delivery available only in manually selected cities & sub-cities (others locked).'
+                              : estimateAvailability.reason}
+                          </span>
+                        </div>
+                      </div>
+                      <span className="font-urdu text-[10px] font-semibold shrink-0 text-right">
+                        {deliveryMeta.urduLabel}
+                      </span>
+                    </div>
+                  ) : (
+                    <div className="p-2.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white/80 dark:bg-slate-900/60 text-slate-700 dark:text-slate-300 text-[11px] flex items-center justify-between gap-2">
+                      <div className="min-w-0">
+                        <span className="font-bold text-slate-900 dark:text-white block">
+                          Delivery in 3 to 6 working days depending on logistics
+                        </span>
+                        <span className="text-[10px] text-slate-500 dark:text-slate-400 block">
+                          Open across all cities &amp; all their sub-cities
+                        </span>
+                      </div>
+                      <span className="font-urdu text-[10px] font-semibold shrink-0 text-right text-slate-600 dark:text-slate-300">
+                        {deliveryMeta.urduLabel}
+                      </span>
+                    </div>
+                  )
+                )}
+
                 <div className="text-[11px] text-slate-500 dark:text-slate-400 flex flex-wrap items-center gap-x-2 gap-y-1">
                   <span>
                     {isProductPurchaseBlocked(product)
                       ? 'Pre-arrival informational item · Delivery charges apply once stocked'
                       : product.stockQty > 0
-                      ? `${product.stockQty} units ready to dispatch · Same-day dispatch inside Muzaffarabad`
+                      ? `${product.stockQty} units in stock · ${deliveryMeta.etaText}`
                       : 'Temporarily out of stock · Confirm restock via WhatsApp'}
                   </span>
                 </div>

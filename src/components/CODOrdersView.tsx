@@ -38,8 +38,10 @@ import { getWasalSettlements, saveWasalSettlements } from '../utils/storage';
 import { defaultDeliveryCities } from '../utils/defaultData';
 import {
   DEFAULT_CITY_CENTER_DELIVERY_CHARGE,
+  getProductDeliveryMeta,
   isProductPurchaseBlocked,
   resolveDeliveryCharge,
+  resolveExpressAreaAvailability,
 } from '../utils/locationCategoryHelpers';
 import { AddressFieldsGroup } from './AddressFieldsGroup';
 import {
@@ -275,6 +277,17 @@ export const CODOrdersView: React.FC<CODOrdersViewProps> = ({
     const prod = purchasableProducts.find((p) => p.id === newProductId) || purchasableProducts[0];
     if (!prod || isProductPurchaseBlocked(prod)) {
       const errMsg = 'Upcoming / Coming Soon products cannot be booked for COD orders until arrival is confirmed.';
+      setCreateOrderError(errMsg);
+      pushToast(errMsg, 'error');
+      return;
+    }
+
+    const isExpressProd = getProductDeliveryMeta(prod).isExpress;
+    const areaCheck = resolveExpressAreaAvailability(deliveryCitiesList, newCity, newArea, isExpressProd);
+    if (!areaCheck.allowed) {
+      const errMsg =
+        areaCheck.reason ||
+        'Selected city or sub-city is locked for Express delivery. Choose an unlocked Express city & sub-city.';
       setCreateOrderError(errMsg);
       pushToast(errMsg, 'error');
       return;
@@ -1157,7 +1170,14 @@ export const CODOrdersView: React.FC<CODOrdersViewProps> = ({
                   mohalla={newMohalla}
                   landmark={newLandmark}
                   address={newAddress}
-                  filterActiveCitiesOnly={true}
+                  filterActiveCitiesOnly={false}
+                  deliveryMode={
+                    getProductDeliveryMeta(
+                      purchasableProducts.find((p) => p.id === newProductId) || purchasableProducts[0]
+                    ).isExpress
+                      ? 'express_locked'
+                      : 'all_open'
+                  }
                   showCompleteAddress={true}
                   required={true}
                   compact={true}
@@ -1195,6 +1215,7 @@ export const CODOrdersView: React.FC<CODOrdersViewProps> = ({
                   >
                     {purchasableProducts.map((p) => (
                       <option key={p.id} value={p.id}>
+                        {getProductDeliveryMeta(p).isExpress ? '⚡ [EXPRESS] ' : ''}
                         {p.name} - {profile.currencySymbol}{p.ourPrice}
                       </option>
                     ))}

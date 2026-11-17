@@ -25,8 +25,11 @@ import {
   Phone,
   FolderTree,
   ChevronDown,
+  Zap,
+  Truck,
+  Lock,
 } from 'lucide-react';
-import { AppUser, BusinessProfile, CartItem, CategoryRecord, Customer, Investor, ProductItem } from '../types';
+import { AppUser, BusinessProfile, CartItem, CategoryRecord, Customer, DeliverySpeedCategory, Investor, ProductItem } from '../types';
 import { ProductDetailsModal } from './ProductDetailsModal';
 import {
   buildDirectProductWhatsAppMessage,
@@ -39,6 +42,7 @@ import {
   UPCOMING_CATEGORY_ID,
   UPCOMING_CATEGORY_NAME,
   doesProductMatchCategoryFilter,
+  getProductDeliveryMeta,
   isProductPurchaseBlocked,
   normalizeTextKey,
 } from '../utils/locationCategoryHelpers';
@@ -98,6 +102,7 @@ export const StoreCatalogView: React.FC<StoreCatalogViewProps> = ({
 }) => {
   const [sortBy, setSortBy] = useState<'default' | 'winning_profit' | 'highest_savings' | 'price_low' | 'price_high'>('default');
   const [customerTypeFilter, setCustomerTypeFilter] = useState<'all' | 'individual' | 'retail'>('all');
+  const [deliveryFilter, setDeliveryFilter] = useState<'all' | DeliverySpeedCategory>('all');
   const [showWinningOnly, setShowWinningOnly] = useState(false);
   const [selectedDetailProduct, setSelectedDetailProduct] = useState<ProductItem | null>(null);
   const [isMobileFilterOpen, setIsMobileFilterOpen] = useState(false);
@@ -208,6 +213,12 @@ export const StoreCatalogView: React.FC<StoreCatalogViewProps> = ({
           return false;
         }
 
+        // Delivery Speed category filter (Express Instant vs Standard Logistics 3-6 days)
+        if (deliveryFilter !== 'all') {
+          const pDelivery = getProductDeliveryMeta(p).deliveryType;
+          if (pDelivery !== deliveryFilter) return false;
+        }
+
         // Search filter
         if (searchQuery.trim()) {
           const q = searchQuery.toLowerCase().trim();
@@ -237,7 +248,331 @@ export const StoreCatalogView: React.FC<StoreCatalogViewProps> = ({
         }
         return 0;
       });
-  }, [products, selectedCategory, searchQuery, sortBy, showWinningOnly, effectiveCatRecords]);
+  }, [products, selectedCategory, searchQuery, sortBy, showWinningOnly, deliveryFilter, effectiveCatRecords]);
+
+  const expressProductCount = useMemo(
+    () => products.filter((p) => !isProductPurchaseBlocked(p) && getProductDeliveryMeta(p).isExpress).length,
+    [products]
+  );
+  const standardProductCount = useMemo(
+    () => products.filter((p) => !isProductPurchaseBlocked(p) && !getProductDeliveryMeta(p).isExpress).length,
+    [products]
+  );
+
+  const expressGroupProducts = useMemo(
+    () =>
+      filteredProducts.filter(
+        (p) => !isProductPurchaseBlocked(p) && getProductDeliveryMeta(p).isExpress
+      ),
+    [filteredProducts]
+  );
+  const standardGroupProducts = useMemo(
+    () =>
+      filteredProducts.filter(
+        (p) => isProductPurchaseBlocked(p) || !getProductDeliveryMeta(p).isExpress
+      ),
+    [filteredProducts]
+  );
+
+  const renderProductCard = (product: ProductItem) => {
+    const savings = product.marketPrice - product.ourPrice;
+    const savingsPercent = product.marketPrice > 0 ? Math.round((savings / product.marketPrice) * 100) : 0;
+    const inCart = cart.find((it) => it.product.id === product.id);
+    const isUpcomingBlocked = isProductPurchaseBlocked(product);
+    const dMeta = getProductDeliveryMeta(product);
+    const isExpress = !isUpcomingBlocked && dMeta.isExpress;
+
+    return (
+      <div
+        key={product.id}
+        className={`bg-white dark:bg-slate-900 border rounded-xl overflow-hidden hover:shadow-md transition-all flex flex-col justify-between group ${
+          isExpress
+            ? 'border-emerald-300 dark:border-emerald-800/80'
+            : 'border-slate-200 dark:border-slate-800'
+        }`}
+      >
+        {/* Top Image */}
+        <div
+          onClick={() => setSelectedDetailProduct(product)}
+          className="relative bg-white dark:bg-slate-900 border-b border-slate-100 dark:border-slate-800 h-36 sm:h-48 overflow-hidden flex items-center justify-center cursor-pointer"
+        >
+          {product.imageUrl ? (
+            <img
+              src={product.imageUrl}
+              alt={product.name}
+              referrerPolicy="no-referrer"
+              className="w-full h-full object-contain p-1.5 group-hover:scale-105 transition-transform duration-300"
+              loading="lazy"
+            />
+          ) : (
+            <div className="text-slate-400 text-xs flex flex-col items-center gap-1 font-mono">
+              <ShoppingBag className="w-6 h-6 sm:w-8 sm:h-8 opacity-40" />
+              <span className="text-[10px]">100DAGAR Lot</span>
+            </div>
+          )}
+
+          {/* Discount / Upcoming / Winning Badges */}
+          <div className="absolute top-1.5 left-1.5 sm:top-2 sm:left-2 flex flex-col gap-1 items-start">
+            {isUpcomingBlocked ? (
+              <span className="bg-purple-600 text-white font-extrabold text-[9px] sm:text-[10px] px-1.5 sm:px-2 py-0.5 rounded shadow-xs">
+                COMING SOON
+              </span>
+            ) : (
+              <span className="bg-emerald-600 text-white font-extrabold text-[9px] sm:text-[11px] px-1.5 sm:px-2 py-0.5 rounded shadow-xs">
+                -{savingsPercent}%
+              </span>
+            )}
+            {product.isWinningItem && (
+              <span className="bg-amber-500 text-slate-950 font-bold text-[8px] sm:text-[9px] px-1 sm:px-1.5 py-0.2 rounded shadow-xs flex items-center gap-0.5">
+                <Sparkles className="w-2 h-2 sm:w-2.5 sm:h-2.5" /> WINNING
+              </span>
+            )}
+          </div>
+
+          {/* Express Symbol Stamp (Shown ONLY on Express items) */}
+          {isExpress && (
+            <div className="absolute bottom-1.5 left-1.5 sm:bottom-2 sm:left-2">
+              <span
+                title="Express Delivery — Available only in manually unlocked cities & sub-cities"
+                className="inline-flex items-center gap-0.5 bg-slate-950/90 dark:bg-emerald-500 text-emerald-300 dark:text-slate-950 font-black text-[9px] sm:text-[10px] px-1.5 sm:px-2 py-0.5 rounded shadow-md border border-emerald-400/60"
+              >
+                <Zap className="w-3 h-3 fill-current shrink-0" />
+                <span>EXPRESS</span>
+              </span>
+            </div>
+          )}
+
+          {/* Stock Alert Badge */}
+          <div className="absolute top-1.5 right-1.5 sm:top-2 sm:right-2">
+            <span className={`text-[8px] sm:text-[10px] font-mono px-1.5 sm:px-2 py-0.5 rounded font-bold ${
+              isUpcomingBlocked
+                ? 'bg-purple-900/90 text-white'
+                : product.stockQty <= product.minStockAlert
+                ? 'bg-red-500 text-white'
+                : 'bg-slate-900/80 text-white backdrop-blur-xs'
+            }`}>
+              {isUpcomingBlocked ? 'Expected Soon' : `${product.stockQty} in stock`}
+            </span>
+          </div>
+        </div>
+
+        {/* Content Area */}
+        <div className="p-2.5 sm:p-4 flex-1 flex flex-col justify-between space-y-2">
+          <div>
+            {/* Category kicker */}
+            <span className="text-[10px] sm:text-[11px] text-slate-400 dark:text-slate-500 block truncate">
+              {product.category}
+            </span>
+
+            {/* Title */}
+            <h3
+              onClick={() => setSelectedDetailProduct(product)}
+              className="text-[11px] sm:text-xs font-bold text-blue-600 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-300 line-clamp-2 mt-0.5 cursor-pointer leading-tight"
+              title={product.name}
+            >
+              {product.name}
+            </h3>
+
+            {/* Urdu Name */}
+            {product.urduName && (
+              <p className="font-urdu text-[10px] sm:text-[11px] text-slate-500 dark:text-slate-400 mt-0.5 truncate leading-snug">
+                {product.urduName}
+              </p>
+            )}
+
+            {/* Express Symbol Badge (ONLY Express items show symbol; remaining products show no symbols) */}
+            {(isExpress || (product.variations && product.variations.length > 0)) && (
+              <div className="mt-1 flex flex-wrap items-center gap-1">
+                {isExpress && (
+                  <span
+                    title={dMeta.etaText}
+                    className="inline-flex items-center gap-0.5 text-[9px] font-extrabold text-emerald-800 dark:text-emerald-300 bg-emerald-50 dark:bg-emerald-950/60 px-1.5 py-0.5 rounded border border-emerald-200 dark:border-emerald-800"
+                  >
+                    <Zap className="w-2.5 h-2.5 fill-current shrink-0" /> Express · Selected Cities
+                  </span>
+                )}
+                {product.variations && product.variations.length > 0 && (
+                  <span className="inline-flex items-center gap-0.5 text-[9px] font-bold text-slate-700 dark:text-slate-300 bg-slate-100 dark:bg-slate-800 px-1.5 py-0.5 rounded border border-slate-200 dark:border-slate-700">
+                    {product.variations.length} Options
+                  </span>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* Pricing Block with Market Price, Our Price & Customer Savings */}
+          <div className="pt-1.5 sm:pt-2 border-t border-slate-100 dark:border-slate-800">
+            <div className="flex items-baseline gap-1.5 sm:gap-2">
+              <span className="text-sm sm:text-base font-extrabold text-slate-900 dark:text-white font-mono tabular-nums">
+                {profile.currencySymbol}{product.ourPrice.toLocaleString('en-PK')}
+              </span>
+              <span className="text-[10px] sm:text-xs text-slate-400 line-through font-mono tabular-nums">
+                {profile.currencySymbol}{product.marketPrice.toLocaleString('en-PK')}
+              </span>
+            </div>
+
+            <div className="mt-1 flex items-center justify-between text-[9px] sm:text-[11px] font-medium bg-emerald-50 dark:bg-emerald-950/40 text-emerald-800 dark:text-emerald-300 px-1.5 sm:px-2 py-0.5 sm:py-1 rounded">
+              <span className="truncate">بچت (Save):</span>
+              <span className="font-mono font-bold shrink-0">
+                {profile.currencySymbol}{savings.toLocaleString('en-PK')}
+              </span>
+            </div>
+
+            {!isCustomerView && !hideCostPrice && (
+              <div className="mt-1 flex items-center justify-between text-[9px] text-slate-400">
+                <span>Cost: {profile.currencySymbol}{product.costPrice.toLocaleString('en-PK')}</span>
+                <span className="text-amber-600 dark:text-amber-400 font-medium">
+                  +{profile.currencySymbol}{(product.ourPrice - product.costPrice).toLocaleString('en-PK')}
+                </span>
+              </div>
+            )}
+          </div>
+
+          {/* Specs & Detailed Pictures Quick View Trigger */}
+          <button
+            type="button"
+            onClick={() => setSelectedDetailProduct(product)}
+            className="w-full inline-flex items-center justify-center gap-1 py-1 sm:py-1.5 px-2 rounded-lg bg-amber-50 hover:bg-amber-100 dark:bg-amber-950/30 dark:hover:bg-amber-900/50 text-amber-900 dark:text-amber-200 text-[10px] sm:text-[11px] font-bold transition-colors cursor-pointer border border-amber-200/80 dark:border-amber-900 truncate"
+          >
+            <Eye className="w-3 h-3 text-amber-600 shrink-0" />
+            <span className="truncate">Specs &amp; Photos (تفصیل)</span>
+          </button>
+
+          {product.websiteUrl && (
+            <a
+              href={product.websiteUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="w-full inline-flex items-center justify-center gap-1 py-1 sm:py-1.5 px-2 rounded-lg bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-blue-600 dark:text-blue-400 text-[10px] sm:text-[11px] font-semibold transition-colors cursor-pointer truncate"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <ExternalLink className="w-3 h-3 text-blue-500 shrink-0" />
+              <span className="truncate">View on Website</span>
+            </a>
+          )}
+
+          {/* Action Bar: Add to Cart / WhatsApp Ordering Options */}
+          <div className="pt-0.5 space-y-1">
+            {isUpcomingBlocked && product.expectedArrivalDate && (
+              <div className="text-[10px] font-semibold text-purple-700 dark:text-purple-300 bg-purple-50 dark:bg-purple-950/30 px-2 py-0.5 rounded text-center truncate">
+                Arrival: {product.expectedArrivalDate}
+              </div>
+            )}
+            {(() => {
+              const invContact = resolveProductInvestorContact(
+                product,
+                effectiveInvestors,
+                profile.phone || '03125256266'
+              );
+              const activeCustomerName =
+                currentUser?.isAuthenticated ? currentUser.name : undefined;
+              const handleInvestorInquiry = () => {
+                const text = buildInvestorProductInquiryMessage(product, profile, {
+                  customerName: activeCustomerName,
+                  investorName: invContact.investorName,
+                  imageUrl: product.imageUrl,
+                });
+                openWhatsAppDirect(invContact.whatsapp, text);
+              };
+              const handleDirectProductWhatsApp = () => {
+                const text = buildDirectProductWhatsAppMessage(product, profile, {
+                  customerName: activeCustomerName,
+                  imageUrl: product.imageUrl,
+                });
+                openWhatsAppDirect(profile.phone || '03125256266', text);
+              };
+              const inquiryTitle = invContact.isInvestorAssigned
+                ? `Product Inquiry to Investor (${invContact.investorName ? `${invContact.investorName} · ` : ''}${invContact.whatsapp})`
+                : `Product Inquiry (${invContact.whatsapp})`;
+
+              if (isUpcomingBlocked) {
+                return (
+                  <div className="flex items-center gap-1">
+                    <button
+                      type="button"
+                      disabled
+                      className="flex-1 py-1.5 px-2 bg-slate-200 dark:bg-slate-800 text-slate-500 dark:text-slate-400 text-[10px] sm:text-[11px] font-bold rounded-lg cursor-not-allowed text-center truncate"
+                    >
+                      Coming Soon · View Only
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleDirectProductWhatsApp}
+                      className="p-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg cursor-pointer transition-colors shadow-2xs shrink-0"
+                      title="WhatsApp Store Desk"
+                    >
+                      <Phone className="w-3.5 h-3.5" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleInvestorInquiry}
+                      className="p-1.5 bg-teal-600 hover:bg-teal-500 text-white rounded-lg cursor-pointer transition-colors shadow-2xs shrink-0"
+                      title={inquiryTitle}
+                      aria-label={inquiryTitle}
+                    >
+                      <Tag className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                );
+              }
+
+              return (
+                <div className="flex items-center gap-1">
+                  {inCart ? (
+                    <div className="flex-1 flex items-center justify-between bg-amber-50 dark:bg-amber-950/40 border border-amber-300 dark:border-amber-700 rounded-lg p-0.5">
+                      <button
+                        onClick={() => onUpdateCartQty(product.id, inCart.quantity - 1)}
+                        className="w-6 h-6 flex items-center justify-center bg-white dark:bg-slate-800 text-slate-800 dark:text-white rounded shadow-2xs hover:bg-slate-100 cursor-pointer"
+                      >
+                        <Minus className="w-3 h-3" />
+                      </button>
+                      <span className="font-mono font-bold text-[10px] sm:text-xs text-amber-900 dark:text-amber-200">
+                        {inCart.quantity} in cart
+                      </span>
+                      <button
+                        onClick={() => onUpdateCartQty(product.id, inCart.quantity + 1)}
+                        className="w-6 h-6 flex items-center justify-center bg-amber-500 text-slate-950 rounded shadow-2xs hover:bg-amber-400 cursor-pointer"
+                      >
+                        <Plus className="w-3 h-3" />
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      onClick={() => onAddToCart(product, 1)}
+                      className="flex-1 inline-flex items-center justify-center gap-1 py-1.5 sm:py-2 px-2 bg-slate-900 hover:bg-slate-800 dark:bg-amber-500 dark:text-slate-950 dark:hover:bg-amber-400 text-white text-[10px] sm:text-[11px] font-bold rounded-lg shadow-2xs transition-colors cursor-pointer truncate"
+                    >
+                      <ShoppingBag className="w-3 h-3 shrink-0" />
+                      <span className="truncate">Add to Cart</span>
+                    </button>
+                  )}
+
+                  <button
+                    type="button"
+                    onClick={handleDirectProductWhatsApp}
+                    className="p-1.5 sm:p-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg cursor-pointer transition-colors shrink-0 shadow-2xs"
+                    title="Order directly on WhatsApp"
+                    aria-label="Order directly on WhatsApp"
+                  >
+                    <Phone className="w-3.5 h-3.5" />
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={handleInvestorInquiry}
+                    className="p-1.5 sm:p-2 bg-teal-600 hover:bg-teal-500 text-white rounded-lg cursor-pointer transition-colors shrink-0 shadow-2xs"
+                    title={inquiryTitle}
+                    aria-label={inquiryTitle}
+                  >
+                    <Tag className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              );
+            })()}
+          </div>
+        </div>
+      </div>
+    );
+  };
 
   return (
     <div className="space-y-6">
@@ -593,6 +928,44 @@ export const StoreCatalogView: React.FC<StoreCatalogViewProps> = ({
             </div>
           </div>
 
+          {/* Two-Category Delivery Speed Bar: Express Group vs Standard (All Cities Open, 3-6 Working Days) */}
+          <div className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 p-2 shadow-2xs flex flex-wrap items-center gap-1.5 text-xs">
+            <button
+              type="button"
+              onClick={() => setDeliveryFilter('all')}
+              className={`px-3 py-1.5 rounded-lg font-bold transition-colors cursor-pointer ${
+                deliveryFilter === 'all'
+                  ? 'bg-slate-900 text-white dark:bg-amber-500 dark:text-slate-950'
+                  : 'text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800'
+              }`}
+            >
+              All Products ({products.length})
+            </button>
+            <button
+              type="button"
+              onClick={() => setDeliveryFilter('express')}
+              className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg font-bold transition-colors cursor-pointer ${
+                deliveryFilter === 'express'
+                  ? 'bg-emerald-600 text-white shadow-xs'
+                  : 'bg-emerald-50 dark:bg-emerald-950/40 text-emerald-800 dark:text-emerald-300 hover:bg-emerald-100'
+              }`}
+            >
+              <Zap className="w-3.5 h-3.5 fill-current" />
+              <span>Express Group · Instant ({expressProductCount})</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setDeliveryFilter('standard')}
+              className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg font-bold transition-colors cursor-pointer ${
+                deliveryFilter === 'standard'
+                  ? 'bg-amber-500 text-slate-950 shadow-xs'
+                  : 'bg-slate-100 dark:bg-slate-800 text-slate-800 dark:text-slate-200 hover:bg-slate-200'
+              }`}
+            >
+              <span>Standard · 3–6 Working Days ({standardProductCount})</span>
+            </button>
+          </div>
+
           {/* Subcategory Quick Chips when a parent category is selected */}
           {selectedCatChildren.length > 0 && (
             <div className="flex flex-wrap items-center gap-1.5 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-2.5 shadow-2xs">
@@ -612,286 +985,72 @@ export const StoreCatalogView: React.FC<StoreCatalogViewProps> = ({
             </div>
           )}
 
-          {/* PRODUCT CARDS GRID (USER DIRECTIVE: Strictly 2 products in row on mobile, 3 on tablet, 4 on desktop, 5 on xl) */}
-          <div className="grid grid-cols-2 gap-2 sm:gap-3.5 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-4 xl:grid-cols-5">
-            {filteredProducts.map((product) => {
-              const savings = product.marketPrice - product.ourPrice;
-              const savingsPercent = product.marketPrice > 0 ? Math.round((savings / product.marketPrice) * 100) : 0;
-              const inCart = cart.find((it) => it.product.id === product.id);
-              const isUpcomingBlocked = isProductPurchaseBlocked(product);
-
-              return (
-                <div
-                  key={product.id}
-                  className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden hover:shadow-md transition-all flex flex-col justify-between group"
-                >
-                  {/* Top Image */}
-                  <div
-                    onClick={() => setSelectedDetailProduct(product)}
-                    className="relative bg-slate-100 dark:bg-slate-800 h-32 sm:h-44 overflow-hidden flex items-center justify-center cursor-pointer"
-                  >
-                    {product.imageUrl ? (
-                      <img
-                        src={product.imageUrl}
-                        alt={product.name}
-                        className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
-                        loading="lazy"
-                      />
-                    ) : (
-                      <div className="text-slate-400 text-xs flex flex-col items-center gap-1 font-mono">
-                        <ShoppingBag className="w-6 h-6 sm:w-8 sm:h-8 opacity-40" />
-                        <span className="text-[10px]">100DAGAR Lot</span>
-                      </div>
-                    )}
-
-                    {/* Discount or Upcoming Badge */}
-                    <div className="absolute top-1.5 left-1.5 sm:top-2 sm:left-2 flex flex-col gap-1 items-start">
-                      {isUpcomingBlocked ? (
-                        <span className="bg-purple-600 text-white font-extrabold text-[9px] sm:text-[10px] px-1.5 sm:px-2 py-0.5 rounded shadow-xs">
-                          COMING SOON
-                        </span>
-                      ) : (
-                        <span className="bg-emerald-600 text-white font-extrabold text-[9px] sm:text-[11px] px-1.5 sm:px-2 py-0.5 rounded shadow-xs">
-                          -{savingsPercent}%
-                        </span>
-                      )}
-                      {product.isWinningItem && (
-                        <span className="bg-amber-500 text-slate-950 font-bold text-[8px] sm:text-[9px] px-1 sm:px-1.5 py-0.2 rounded shadow-xs flex items-center gap-0.5">
-                          <Sparkles className="w-2 h-2 sm:w-2.5 sm:h-2.5" /> WINNING
-                        </span>
-                      )}
-                    </div>
-
-                    {/* Stock Alert Badge */}
-                    <div className="absolute top-1.5 right-1.5 sm:top-2 sm:right-2">
-                      <span className={`text-[8px] sm:text-[10px] font-mono px-1.5 sm:px-2 py-0.5 rounded font-bold ${
-                        isUpcomingBlocked
-                          ? 'bg-purple-900/90 text-white'
-                          : product.stockQty <= product.minStockAlert
-                          ? 'bg-red-500 text-white'
-                          : 'bg-slate-900/80 text-white backdrop-blur-xs'
-                      }`}>
-                        {isUpcomingBlocked ? 'Expected Soon' : `${product.stockQty} in stock`}
-                      </span>
-                    </div>
+          {/* DEDICATED EXPRESS DELIVERY GROUP (All Express Items Together in One Place) */}
+          {expressGroupProducts.length > 0 && deliveryFilter !== 'standard' && (
+            <div className="rounded-2xl border-2 border-emerald-400/70 dark:border-emerald-700/80 bg-gradient-to-br from-emerald-50/80 via-white to-amber-50/30 dark:from-emerald-950/30 dark:via-slate-900 dark:to-slate-900 p-3 sm:p-4 space-y-3 shadow-xs">
+              <div className="flex flex-wrap items-center justify-between gap-2 pb-2 border-b border-emerald-200/80 dark:border-emerald-800/70">
+                <div className="flex items-center gap-2.5">
+                  <div className="w-8 h-8 rounded-xl bg-emerald-600 text-white flex items-center justify-center shadow-xs shrink-0">
+                    <Zap className="w-4 h-4 fill-current" />
                   </div>
-
-                  {/* Content Area */}
-                  <div className="p-2.5 sm:p-4 flex-1 flex flex-col justify-between space-y-2">
-                    <div>
-                      {/* Category kicker */}
-                      <span className="text-[10px] sm:text-[11px] text-slate-400 dark:text-slate-500 block truncate">
-                        {product.category}
+                  <div>
+                    <h2 className="text-sm font-black text-slate-900 dark:text-white flex items-center gap-2">
+                      <span>Express Delivery Group ({expressGroupProducts.length})</span>
+                      <span className="font-urdu text-xs font-semibold text-emerald-700 dark:text-emerald-300">
+                        ایکسپریس آئٹمز
                       </span>
-
-                      {/* Title */}
-                      <h3
-                        onClick={() => setSelectedDetailProduct(product)}
-                        className="text-[11px] sm:text-xs font-bold text-blue-600 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-300 line-clamp-2 mt-0.5 cursor-pointer leading-tight"
-                        title={product.name}
-                      >
-                        {product.name}
-                      </h3>
-
-                      {/* Urdu Name */}
-                      {product.urduName && (
-                        <p className="font-urdu text-[10px] sm:text-[11px] text-slate-500 dark:text-slate-400 mt-0.5 truncate leading-snug">
-                          {product.urduName}
-                        </p>
-                      )}
-
-                      {/* Variation badge if variations exist */}
-                      {product.variations && product.variations.length > 0 && (
-                        <div className="mt-1">
-                          <span className="inline-flex items-center gap-0.5 text-[9px] font-bold text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-950/60 px-1.5 py-0.5 rounded border border-amber-200 dark:border-amber-800">
-                            ✨ {product.variations.length} Options
-                          </span>
-                        </div>
-                      )}
-                    </div>
-
-                    {/* Pricing Block with Market Price, Our Price & Customer Savings */}
-                    <div className="pt-1.5 sm:pt-2 border-t border-slate-100 dark:border-slate-800">
-                      <div className="flex items-baseline gap-1.5 sm:gap-2">
-                        {/* Our Price */}
-                        <span className="text-sm sm:text-base font-extrabold text-slate-900 dark:text-white font-mono tabular-nums">
-                          {profile.currencySymbol}{product.ourPrice.toLocaleString('en-PK')}
-                        </span>
-
-                        {/* Strikethrough Market Price */}
-                        <span className="text-[10px] sm:text-xs text-slate-400 line-through font-mono tabular-nums">
-                          {profile.currencySymbol}{product.marketPrice.toLocaleString('en-PK')}
-                        </span>
-                      </div>
-
-                      {/* Customer Savings Highlight Badge */}
-                      <div className="mt-1 flex items-center justify-between text-[9px] sm:text-[11px] font-medium bg-emerald-50 dark:bg-emerald-950/40 text-emerald-800 dark:text-emerald-300 px-1.5 sm:px-2 py-0.5 sm:py-1 rounded">
-                        <span className="truncate">بچت (Save):</span>
-                        <span className="font-mono font-bold shrink-0">
-                          {profile.currencySymbol}{savings.toLocaleString('en-PK')}
-                        </span>
-                      </div>
-
-                      {/* Profit Metrics for Store Manager (STRICTLY HIDDEN IN CUSTOMER VIEW!) */}
-                      {!isCustomerView && !hideCostPrice && (
-                        <div className="mt-1 flex items-center justify-between text-[9px] text-slate-400">
-                          <span>Cost: {profile.currencySymbol}{product.costPrice.toLocaleString('en-PK')}</span>
-                          <span className="text-amber-600 dark:text-amber-400 font-medium">
-                            +{profile.currencySymbol}{(product.ourPrice - product.costPrice).toLocaleString('en-PK')}
-                          </span>
-                        </div>
-                      )}
-                    </div>
-
-                    {/* Specs & Detailed Pictures Quick View Trigger */}
-                    <button
-                      type="button"
-                      onClick={() => setSelectedDetailProduct(product)}
-                      className="w-full inline-flex items-center justify-center gap-1 py-1 sm:py-1.5 px-2 rounded-lg bg-amber-50 hover:bg-amber-100 dark:bg-amber-950/30 dark:hover:bg-amber-900/50 text-amber-900 dark:text-amber-200 text-[10px] sm:text-[11px] font-bold transition-colors cursor-pointer border border-amber-200/80 dark:border-amber-900 truncate"
-                    >
-                      <Eye className="w-3 h-3 text-amber-600 shrink-0" />
-                      <span className="truncate">Specs &amp; Photos (تفصیل)</span>
-                    </button>
-
-                    {/* Website Link (User requirement: keep website link to see more details) */}
-                    {product.websiteUrl && (
-                      <a
-                        href={product.websiteUrl}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="w-full inline-flex items-center justify-center gap-1 py-1 sm:py-1.5 px-2 rounded-lg bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-blue-600 dark:text-blue-400 text-[10px] sm:text-[11px] font-semibold transition-colors cursor-pointer truncate"
-                        onClick={(e) => e.stopPropagation()}
-                      >
-                        <ExternalLink className="w-3 h-3 text-blue-500 shrink-0" />
-                        <span className="truncate">View on Website</span>
-                      </a>
-                    )}
-
-                    {/* Action Bar: Add to Cart / WhatsApp Ordering Options */}
-                    <div className="pt-0.5 space-y-1">
-                      {isUpcomingBlocked && product.expectedArrivalDate && (
-                        <div className="text-[10px] font-semibold text-purple-700 dark:text-purple-300 bg-purple-50 dark:bg-purple-950/30 px-2 py-0.5 rounded text-center truncate">
-                          Arrival: {product.expectedArrivalDate}
-                        </div>
-                      )}
-                      {(() => {
-                        const invContact = resolveProductInvestorContact(
-                          product,
-                          effectiveInvestors,
-                          profile.phone || '03125256266'
-                        );
-                        const activeCustomerName =
-                          currentUser?.isAuthenticated ? currentUser.name : undefined;
-                        const handleInvestorInquiry = () => {
-                          const text = buildInvestorProductInquiryMessage(product, profile, {
-                            customerName: activeCustomerName,
-                            investorName: invContact.investorName,
-                            imageUrl: product.imageUrl,
-                          });
-                          openWhatsAppDirect(invContact.whatsapp, text);
-                        };
-                        const handleDirectProductWhatsApp = () => {
-                          const text = buildDirectProductWhatsAppMessage(product, profile, {
-                            customerName: activeCustomerName,
-                            imageUrl: product.imageUrl,
-                          });
-                          openWhatsAppDirect(profile.phone || '03125256266', text);
-                        };
-                        const inquiryTitle = invContact.isInvestorAssigned
-                          ? `Product Inquiry to Investor (${invContact.investorName ? `${invContact.investorName} · ` : ''}${invContact.whatsapp})`
-                          : `Product Inquiry (${invContact.whatsapp})`;
-
-                        if (isUpcomingBlocked) {
-                          return (
-                            <div className="flex items-center gap-1">
-                              <button
-                                type="button"
-                                disabled
-                                className="flex-1 py-1.5 px-2 bg-slate-200 dark:bg-slate-800 text-slate-500 dark:text-slate-400 text-[10px] sm:text-[11px] font-bold rounded-lg cursor-not-allowed text-center truncate"
-                              >
-                                Coming Soon · View Only
-                              </button>
-                              <button
-                                type="button"
-                                onClick={handleDirectProductWhatsApp}
-                                className="p-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg cursor-pointer transition-colors shadow-2xs shrink-0"
-                                title="WhatsApp Store Desk"
-                              >
-                                <Phone className="w-3.5 h-3.5" />
-                              </button>
-                              <button
-                                type="button"
-                                onClick={handleInvestorInquiry}
-                                className="p-1.5 bg-teal-600 hover:bg-teal-500 text-white rounded-lg cursor-pointer transition-colors shadow-2xs shrink-0"
-                                title={inquiryTitle}
-                                aria-label={inquiryTitle}
-                              >
-                                <Tag className="w-3.5 h-3.5" />
-                              </button>
-                            </div>
-                          );
-                        }
-
-                        return (
-                          <div className="flex items-center gap-1">
-                            {inCart ? (
-                              <div className="flex-1 flex items-center justify-between bg-amber-50 dark:bg-amber-950/40 border border-amber-300 dark:border-amber-700 rounded-lg p-0.5">
-                                <button
-                                  onClick={() => onUpdateCartQty(product.id, inCart.quantity - 1)}
-                                  className="w-6 h-6 flex items-center justify-center bg-white dark:bg-slate-800 text-slate-800 dark:text-white rounded shadow-2xs hover:bg-slate-100 cursor-pointer"
-                                >
-                                  <Minus className="w-3 h-3" />
-                                </button>
-                                <span className="font-mono font-bold text-[10px] sm:text-xs text-amber-900 dark:text-amber-200">
-                                  {inCart.quantity} in cart
-                                </span>
-                                <button
-                                  onClick={() => onUpdateCartQty(product.id, inCart.quantity + 1)}
-                                  className="w-6 h-6 flex items-center justify-center bg-amber-500 text-slate-950 rounded shadow-2xs hover:bg-amber-400 cursor-pointer"
-                                >
-                                  <Plus className="w-3 h-3" />
-                                </button>
-                              </div>
-                            ) : (
-                              <button
-                                onClick={() => onAddToCart(product, 1)}
-                                className="flex-1 inline-flex items-center justify-center gap-1 py-1.5 sm:py-2 px-2 bg-slate-900 hover:bg-slate-800 dark:bg-amber-500 dark:text-slate-950 dark:hover:bg-amber-400 text-white text-[10px] sm:text-[11px] font-bold rounded-lg shadow-2xs transition-colors cursor-pointer truncate"
-                              >
-                                <ShoppingBag className="w-3 h-3 shrink-0" />
-                                <span className="truncate">Add to Cart</span>
-                              </button>
-                            )}
-
-                            {/* Option 2: Direct Store WhatsApp Ordering Button */}
-                            <button
-                              type="button"
-                              onClick={handleDirectProductWhatsApp}
-                              className="p-1.5 sm:p-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg cursor-pointer transition-colors shrink-0 shadow-2xs"
-                              title="Order directly on WhatsApp"
-                              aria-label="Order directly on WhatsApp"
-                            >
-                              <Phone className="w-3.5 h-3.5" />
-                            </button>
-
-                            {/* Option 3: Product Inquiry sent directly to Investor WhatsApp with Product Link */}
-                            <button
-                              type="button"
-                              onClick={handleInvestorInquiry}
-                              className="p-1.5 sm:p-2 bg-teal-600 hover:bg-teal-500 text-white rounded-lg cursor-pointer transition-colors shrink-0 shadow-2xs"
-                              title={inquiryTitle}
-                              aria-label={inquiryTitle}
-                            >
-                              <Tag className="w-3.5 h-3.5" />
-                            </button>
-                          </div>
-                        );
-                      })()}
-                    </div>
+                    </h2>
+                    <p className="text-[11px] text-emerald-800 dark:text-emerald-300 flex items-center gap-1 font-medium">
+                      <Lock className="w-3 h-3 shrink-0" />
+                      <span>
+                        Instant Express delivery ONLY in manually selected cities &amp; sub-cities (others locked)
+                      </span>
+                    </p>
                   </div>
                 </div>
-              );
-            })}
-          </div>
+                {deliveryFilter === 'all' ? (
+                  <button
+                    type="button"
+                    onClick={() => setDeliveryFilter('express')}
+                    className="px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-[11px] cursor-pointer"
+                  >
+                    Open Express Group Only
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => setDeliveryFilter('all')}
+                    className="px-2.5 py-1 rounded-lg bg-slate-200 dark:bg-slate-800 text-slate-800 dark:text-slate-200 font-bold text-[11px] cursor-pointer"
+                  >
+                    Show All Products
+                  </button>
+                )}
+              </div>
+
+              <div className="grid grid-cols-2 gap-2 sm:gap-3.5 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-4 xl:grid-cols-5">
+                {expressGroupProducts.map(renderProductCard)}
+              </div>
+            </div>
+          )}
+
+          {/* REMAINING PRODUCTS GRID (Without Delivery Symbols; All Cities & Sub-Cities Open, 3-6 Working Days) */}
+          {standardGroupProducts.length > 0 && deliveryFilter !== 'express' && (
+            <div className="space-y-2.5">
+              {(expressGroupProducts.length > 0 || deliveryFilter === 'standard') && (
+                <div className="flex flex-wrap items-center justify-between gap-2 px-1">
+                  <span className="text-xs font-extrabold text-slate-800 dark:text-slate-200">
+                    All Catalog Products ({standardGroupProducts.length})
+                  </span>
+                  <span className="text-[11px] text-slate-500 dark:text-slate-400">
+                    Open across all cities &amp; sub-cities · Delivery in 3 to 6 working days depending on logistics
+                  </span>
+                </div>
+              )}
+              <div className="grid grid-cols-2 gap-2 sm:gap-3.5 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-4 xl:grid-cols-5">
+                {standardGroupProducts.map(renderProductCard)}
+              </div>
+            </div>
+          )}
 
           {filteredProducts.length === 0 && (
             <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-12 text-center text-slate-500">
@@ -906,6 +1065,7 @@ export const StoreCatalogView: React.FC<StoreCatalogViewProps> = ({
                 onClick={() => {
                   onCategoryChange('All Categories');
                   onSearchChange('');
+                  setDeliveryFilter('all');
                   setShowWinningOnly(false);
                 }}
                 className="mt-4 px-4 py-2 text-xs font-semibold bg-amber-500 text-slate-900 rounded-lg hover:bg-amber-400 cursor-pointer"

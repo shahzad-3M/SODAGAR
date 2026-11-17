@@ -23,6 +23,9 @@ import {
   DollarSign,
   Package,
   Video,
+  Zap,
+  Truck,
+  Check,
 } from 'lucide-react';
 import { ProductItem, ProductVariation, ProductImportLog, CategoryRecord } from '../types';
 import {
@@ -32,6 +35,7 @@ import {
   getProductImportLogs,
   logProductImport,
   apiScrapeProductUrl,
+  apiCacheExternalImage,
 } from '../utils/storage';
 import {
   UPCOMING_CATEGORY_ID,
@@ -124,11 +128,14 @@ export const ProductImporterModal: React.FC<ProductImporterModalProps> = ({
   const [newCategoryName, setNewCategoryName] = useState<string>('');
   const [parentCategory, setParentCategory] = useState<string>('');
 
-  // Manual image upload refs
+  // Manual image upload & imported media picker refs
   const mainImageInputRef = useRef<HTMLInputElement>(null);
   const galleryImageInputRef = useRef<HTMLInputElement>(null);
   const [variationImageTargetIndex, setVariationImageTargetIndex] = useState<number | null>(null);
   const variationImageInputRef = useRef<HTMLInputElement>(null);
+  const [mediaPickerVarIndex, setMediaPickerVarIndex] = useState<number | null>(null);
+  const [manualImageUrlInput, setManualImageUrlInput] = useState('');
+  const [isCachingImageUrl, setIsCachingImageUrl] = useState(false);
 
   // Form helpers
   const [newSpecKey, setNewSpecKey] = useState('');
@@ -219,7 +226,9 @@ export const ProductImporterModal: React.FC<ProductImporterModalProps> = ({
     setProgressStep('Live extraction complete! Review & edit all fields below before saving.');
     if (diag) {
       setScrapeStatsSummary(
-        `Extracted via ${diag.strategiesUsed.join(' + ')} · ${diag.imagesFound} images · ${diag.specsFound} specs · ${diag.featuresFound} features · ${diag.variantsFound} variants${
+        `Extracted via ${diag.strategiesUsed.join(' + ')} · ${diag.imagesFound} images${
+          diag.imagesDownloaded ? ` (${diag.imagesDownloaded} downloaded locally)` : ''
+        } · ${diag.specsFound} specs · ${diag.featuresFound} features · ${diag.variantsFound} variants${
           diag.videoFound ? ' · Video URL found' : ''
         } (${diag.currencyDetected})`
       );
@@ -329,8 +338,11 @@ export const ProductImporterModal: React.FC<ProductImporterModalProps> = ({
           ...vars[variationImageTargetIndex],
           image: dataUrl,
         };
+        const existingPics = extractedProduct.pictures || [];
+        const nextPics = existingPics.includes(dataUrl) ? existingPics : [...existingPics, dataUrl];
         setExtractedProduct({
           ...extractedProduct,
+          pictures: nextPics,
           variations: vars,
         });
       }
@@ -339,24 +351,57 @@ export const ProductImporterModal: React.FC<ProductImporterModalProps> = ({
     }
   };
 
+  const handleSetMainGalleryImage = (idx: number) => {
+    if (!extractedProduct?.pictures || !extractedProduct.pictures[idx]) return;
+    const pics = [...extractedProduct.pictures];
+    const [picked] = pics.splice(idx, 1);
+    const nextPics = [picked, ...pics];
+    setExtractedProduct({
+      ...extractedProduct,
+      imageUrl: picked,
+      pictures: nextPics,
+    });
+  };
+
+  const handleAddExternalImageUrl = async () => {
+    const raw = manualImageUrlInput.trim();
+    if (!raw || !extractedProduct) return;
+    setIsCachingImageUrl(true);
+    const cached = await apiCacheExternalImage(raw, extractedProduct.sourceUrl || extractedProduct.websiteUrl);
+    setIsCachingImageUrl(false);
+    const finalImgUrl = cached.localUrl || raw;
+    const existingPics = extractedProduct.pictures || [];
+    const nextPics = existingPics.includes(finalImgUrl) ? existingPics : [...existingPics, finalImgUrl];
+    setExtractedProduct({
+      ...extractedProduct,
+      imageUrl: extractedProduct.imageUrl || nextPics[0] || '',
+      pictures: nextPics,
+    });
+    setManualImageUrlInput('');
+  };
+
   // VARIATIONS MANAGEMENT
   const handleAddVariation = () => {
     if (!extractedProduct) return;
     const vars = extractedProduct.variations || [];
     const newVar: ProductVariation = {
       id: `var_${Date.now()}_${vars.length + 1}`,
+      title: `Variant ${vars.length + 1}`,
       sku: `${extractedProduct.sku}-VAR-${vars.length + 1}`,
-      attributes: { 'Option': `Variant ${vars.length + 1}` },
+      attributes: { Option: `Variant ${vars.length + 1}` },
       size: 'Standard',
       color: 'Default',
+      details: '',
       originalPrice: extractedProduct.marketPrice,
       salePrice: extractedProduct.ourPrice,
       stockQty: 20,
+      image: extractedProduct.pictures?.[0] || extractedProduct.imageUrl || undefined,
     };
     setExtractedProduct({
       ...extractedProduct,
       variations: [...vars, newVar],
     });
+    setMediaPickerVarIndex(vars.length);
   };
 
   const handleUpdateVariation = (index: number, field: keyof ProductVariation, value: any) => {
@@ -484,10 +529,17 @@ export const ProductImporterModal: React.FC<ProductImporterModalProps> = ({
       parentCategoryId: finalParentId,
       subcategoryId: finalSubId,
       childSubcategoryId: finalChildId,
+      deliveryType: extractedProduct.deliveryType === 'express' ? 'express' : 'standard',
       isUpcoming: isUpcomingItem,
       upcomingStatus: isUpcomingItem ? 'coming_soon' : 'available',
       expectedArrivalDate: isUpcomingItem ? (upcomingArrivalDate.trim() || extractedProduct.expectedArrivalDate) : undefined,
       stockQty: isUpcomingItem ? 0 : extractedProduct.stockQty,
+      sizes:
+        extractedProduct.variations && extractedProduct.variations.length > 0
+          ? extractedProduct.variations
+              .map((v) => v.title || [v.size, v.color].filter(Boolean).join(' · ') || v.sku || '')
+              .filter(Boolean)
+          : extractedProduct.sizes,
       videoUrl: extractedProduct.videoUrl?.trim() || undefined,
       status: publishImmediately ? 'published' : (isDraft ? 'draft' : 'published'),
       updatedAt: new Date().toISOString(),
@@ -1057,15 +1109,85 @@ export const ProductImporterModal: React.FC<ProductImporterModalProps> = ({
                         </div>
                       </div>
                     )}
+                    {/* Delivery Speed Category: Express Delivery vs Standard 3-6 Working Days */}
+                    <div className="pt-3 border-t border-slate-200 dark:border-slate-800 space-y-2">
+                      <span className="text-xs font-bold text-slate-800 dark:text-slate-200 flex items-center gap-1.5">
+                        <Truck className="w-4 h-4 text-amber-500" />
+                        Delivery Speed Category (Express Instant vs 3–6 Working Days Logistics)
+                      </span>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setExtractedProduct({
+                              ...extractedProduct,
+                              deliveryType: 'express',
+                            })
+                          }
+                          className={`p-3 rounded-xl border-2 text-left transition-all cursor-pointer flex items-start gap-2.5 ${
+                            extractedProduct.deliveryType === 'express'
+                              ? 'border-emerald-500 bg-emerald-50 dark:bg-emerald-950/40 ring-2 ring-emerald-400/50'
+                              : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 hover:border-slate-300'
+                          }`}
+                        >
+                          <Zap
+                            className={`w-4 h-4 shrink-0 mt-0.5 ${
+                              extractedProduct.deliveryType === 'express'
+                                ? 'text-emerald-600 dark:text-emerald-400 fill-emerald-500'
+                                : 'text-slate-400'
+                            }`}
+                          />
+                          <div className="min-w-0">
+                            <span className="text-xs font-extrabold text-slate-900 dark:text-white block">
+                              Express Delivery (Instant Available)
+                            </span>
+                            <span className="text-[11px] text-slate-600 dark:text-slate-400 block mt-0.5">
+                              In-hand / immediate stock available for same-day &amp; instant dispatch.
+                            </span>
+                          </div>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setExtractedProduct({
+                              ...extractedProduct,
+                              deliveryType: 'standard',
+                            })
+                          }
+                          className={`p-3 rounded-xl border-2 text-left transition-all cursor-pointer flex items-start gap-2.5 ${
+                            extractedProduct.deliveryType !== 'express'
+                              ? 'border-amber-500 bg-amber-50 dark:bg-amber-950/40 ring-2 ring-amber-400/50'
+                              : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 hover:border-slate-300'
+                          }`}
+                        >
+                          <Truck
+                            className={`w-4 h-4 shrink-0 mt-0.5 ${
+                              extractedProduct.deliveryType !== 'express'
+                                ? 'text-amber-600 dark:text-amber-400'
+                                : 'text-slate-400'
+                            }`}
+                          />
+                          <div className="min-w-0">
+                            <span className="text-xs font-extrabold text-slate-900 dark:text-white block">
+                              Standard Logistics (3–6 Working Days)
+                            </span>
+                            <span className="text-[11px] text-slate-600 dark:text-slate-400 block mt-0.5">
+                              Express not selected — takes 3 to 6 working days depending on logistics.
+                            </span>
+                          </div>
+                        </button>
+                      </div>
+                    </div>
                   </div>
 
-                  {/* 4. IMAGE MANAGEMENT & GALLERY (Upload, Replace, Reorder, Delete) */}
+                  {/* 4. IMAGE MANAGEMENT & GALLERY (Downloaded Media, Upload, Reorder, Add URL) */}
                   <div className="space-y-3 bg-slate-50 dark:bg-slate-950/40 p-4 rounded-xl border border-slate-200 dark:border-slate-800">
                     <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
                       <div className="flex items-center gap-2">
                         <ImageIcon className="w-4 h-4 text-amber-500" />
                         <span className="text-xs font-bold text-slate-900 dark:text-white">
-                          Image Management &amp; Product Gallery ({extractedProduct.pictures?.length || 0})
+                          Imported Product Media Gallery ({extractedProduct.pictures?.length || 0} photos)
                         </span>
                       </div>
                       <div className="flex items-center gap-2">
@@ -1105,60 +1227,97 @@ export const ProductImporterModal: React.FC<ProductImporterModalProps> = ({
                       </div>
                     </div>
 
-                    <div className="grid grid-cols-2 sm:grid-cols-4 md:grid-cols-6 gap-3 pt-2">
-                      {extractedProduct.pictures?.map((pic, idx) => (
-                        <div
-                          key={idx}
-                          className={`relative group rounded-lg overflow-hidden border-2 ${
-                            idx === 0
-                              ? 'border-amber-500 shadow-sm'
-                              : 'border-slate-200 dark:border-slate-700'
-                          }`}
-                        >
-                          <img
-                            src={pic}
-                            alt={`Product pic ${idx + 1}`}
-                            className="w-full h-24 object-cover"
-                          />
-                          {idx === 0 && (
-                            <span className="absolute top-1 left-1 bg-amber-500 text-slate-950 text-[9px] font-black px-1.5 py-0.5 rounded shadow-xs">
-                              MAIN
-                            </span>
-                          )}
-
-                          <div className="absolute inset-0 bg-slate-900/60 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center gap-1">
-                            {idx > 0 && (
-                              <button
-                                type="button"
-                                onClick={() => handleMoveGalleryImage(idx, idx - 1)}
-                                className="p-1 bg-white/80 hover:bg-white text-slate-900 rounded cursor-pointer"
-                                title="Move left"
-                              >
-                                ←
-                              </button>
-                            )}
-                            <button
-                              type="button"
-                              onClick={() => handleRemoveGalleryImage(idx)}
-                              className="p-1 bg-red-600 hover:bg-red-500 text-white rounded cursor-pointer"
-                              title="Delete photo"
-                            >
-                              <Trash2 className="w-3 h-3" />
-                            </button>
-                            {idx < (extractedProduct.pictures?.length || 0) - 1 && (
-                              <button
-                                type="button"
-                                onClick={() => handleMoveGalleryImage(idx, idx + 1)}
-                                className="p-1 bg-white/80 hover:bg-white text-slate-900 rounded cursor-pointer"
-                                title="Move right"
-                              >
-                                →
-                              </button>
-                            )}
-                          </div>
-                        </div>
-                      ))}
+                    {/* Paste / Download Extra Image URL */}
+                    <div className="flex flex-col sm:flex-row gap-2">
+                      <input
+                        type="url"
+                        value={manualImageUrlInput}
+                        onChange={(e) => setManualImageUrlInput(e.target.value)}
+                        placeholder="Paste additional photo URL to download & add to product media..."
+                        className="flex-1 px-3 py-1.5 text-xs bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-lg font-mono text-slate-800 dark:text-slate-100"
+                      />
+                      <button
+                        type="button"
+                        disabled={isCachingImageUrl || !manualImageUrlInput.trim()}
+                        onClick={handleAddExternalImageUrl}
+                        className="px-3 py-1.5 bg-slate-900 hover:bg-slate-800 dark:bg-slate-700 text-white font-bold text-xs rounded-lg cursor-pointer disabled:opacity-50 shrink-0"
+                      >
+                        {isCachingImageUrl ? 'Downloading...' : '+ Download & Add Photo'}
+                      </button>
                     </div>
+
+                    {extractedProduct.pictures && extractedProduct.pictures.length > 0 ? (
+                      <div className="grid grid-cols-2 sm:grid-cols-4 md:grid-cols-6 gap-3 pt-1">
+                        {extractedProduct.pictures.map((pic, idx) => (
+                          <div
+                            key={`${pic}_${idx}`}
+                            className={`relative group rounded-lg overflow-hidden border-2 bg-white dark:bg-slate-900 ${
+                              idx === 0
+                                ? 'border-amber-500 shadow-sm'
+                                : 'border-slate-200 dark:border-slate-700'
+                            }`}
+                          >
+                            <img
+                              src={pic}
+                              alt={`Product pic ${idx + 1}`}
+                              referrerPolicy="no-referrer"
+                              className="w-full h-24 object-contain bg-slate-100 dark:bg-slate-800"
+                            />
+                            {idx === 0 ? (
+                              <span className="absolute top-1 left-1 bg-amber-500 text-slate-950 text-[9px] font-black px-1.5 py-0.5 rounded shadow-xs">
+                                MAIN
+                              </span>
+                            ) : (
+                              <button
+                                type="button"
+                                onClick={() => handleSetMainGalleryImage(idx)}
+                                className="absolute top-1 left-1 bg-slate-900/80 hover:bg-amber-500 hover:text-slate-950 text-white text-[9px] font-bold px-1.5 py-0.5 rounded cursor-pointer opacity-0 group-hover:opacity-100 transition-opacity"
+                                title="Set as main product photo"
+                              >
+                                Set Main
+                              </button>
+                            )}
+
+                            <div className="flex items-center justify-between gap-1 px-1.5 py-1 bg-slate-50 dark:bg-slate-800/90 border-t border-slate-200 dark:border-slate-700 text-[10px]">
+                              <div className="flex items-center gap-1">
+                                {idx > 0 && (
+                                  <button
+                                    type="button"
+                                    onClick={() => handleMoveGalleryImage(idx, idx - 1)}
+                                    className="px-1.5 py-0.5 bg-white dark:bg-slate-700 border border-slate-200 dark:border-slate-600 rounded cursor-pointer font-bold"
+                                    title="Move left"
+                                  >
+                                    ←
+                                  </button>
+                                )}
+                                {idx < (extractedProduct.pictures?.length || 0) - 1 && (
+                                  <button
+                                    type="button"
+                                    onClick={() => handleMoveGalleryImage(idx, idx + 1)}
+                                    className="px-1.5 py-0.5 bg-white dark:bg-slate-700 border border-slate-200 dark:border-slate-600 rounded cursor-pointer font-bold"
+                                    title="Move right"
+                                  >
+                                    →
+                                  </button>
+                                )}
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() => handleRemoveGalleryImage(idx)}
+                                className="p-1 text-red-600 hover:bg-red-50 dark:hover:bg-red-950/50 rounded cursor-pointer"
+                                title="Delete photo"
+                              >
+                                <Trash2 className="w-3 h-3" />
+                              </button>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="p-4 text-center rounded-lg border border-dashed border-slate-300 dark:border-slate-700 text-xs text-slate-500">
+                        No photos extracted from link yet. Use "Upload Gallery" or "Download &amp; Add Photo" above.
+                      </div>
+                    )}
 
                     {/* Product Video Link Paste Area */}
                     <div className="pt-3 border-t border-slate-200 dark:border-slate-800 space-y-1.5">
@@ -1181,25 +1340,25 @@ export const ProductImporterModal: React.FC<ProductImporterModalProps> = ({
                     </div>
                   </div>
 
-                  {/* 5. MULTI-DIMENSIONAL VARIATIONS EXTRACTION & EDITOR */}
+                  {/* 5. MULTI-DIMENSIONAL VARIATIONS WITH SEPARATE DETAILS & MEDIA PICKER */}
                   <div className="space-y-3 bg-slate-50 dark:bg-slate-950/40 p-4 rounded-xl border border-slate-200 dark:border-slate-800">
                     <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
                       <div>
                         <span className="text-xs font-bold text-slate-900 dark:text-white flex items-center gap-1.5">
                           <Sliders className="w-4 h-4 text-amber-500" />
-                          Multi-Dimensional Variations ({extractedProduct.variations?.length || 0})
+                          Variations &amp; Separate Variant Details ({extractedProduct.variations?.length || 0})
                         </span>
                         <p className="text-[11px] text-slate-500 dark:text-slate-400">
-                          Sizes, colors, variation SKUs, pricing and stock extracted for individual management.
+                          Each variant has separate title, photo (pick directly from imported media or upload), pricing, stock &amp; specifications.
                         </p>
                       </div>
 
                       <button
                         type="button"
                         onClick={handleAddVariation}
-                        className="px-2.5 py-1 text-xs bg-slate-900 hover:bg-slate-800 dark:bg-slate-700 text-white font-bold rounded-lg cursor-pointer flex items-center gap-1 self-start sm:self-auto"
+                        className="px-3 py-1.5 text-xs bg-slate-900 hover:bg-slate-800 dark:bg-slate-700 text-white font-bold rounded-lg cursor-pointer flex items-center gap-1 self-start sm:self-auto"
                       >
-                        <Plus className="w-3 h-3" />
+                        <Plus className="w-3.5 h-3.5" />
                         Add Variation
                       </button>
                     </div>
@@ -1214,102 +1373,246 @@ export const ProductImporterModal: React.FC<ProductImporterModalProps> = ({
                     />
 
                     {extractedProduct.variations && extractedProduct.variations.length > 0 ? (
-                      <div className="overflow-x-auto border border-slate-200 dark:border-slate-800 rounded-lg">
-                        <table className="w-full text-left text-xs">
-                          <thead className="bg-slate-100 dark:bg-slate-800/60 text-slate-600 dark:text-slate-300">
-                            <tr>
-                              <th className="p-2">Image</th>
-                              <th className="p-2">Size / Dimension</th>
-                              <th className="p-2">Color</th>
-                              <th className="p-2">Variation SKU</th>
-                              <th className="p-2">Price (Rs.)</th>
-                              <th className="p-2">Stock</th>
-                              <th className="p-2 text-right">Action</th>
-                            </tr>
-                          </thead>
-                          <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
-                            {extractedProduct.variations.map((v, idx) => (
-                              <tr key={v.id} className="hover:bg-slate-50/50 dark:hover:bg-slate-800/30">
-                                <td className="p-2">
-                                  <div
-                                    onClick={() => {
-                                      setVariationImageTargetIndex(idx);
-                                      variationImageInputRef.current?.click();
-                                    }}
-                                    className="w-8 h-8 rounded border border-slate-300 dark:border-slate-700 overflow-hidden cursor-pointer hover:opacity-80 flex items-center justify-center bg-slate-100"
-                                    title="Click to upload/change image"
-                                  >
+                      <div className="space-y-3">
+                        {extractedProduct.variations.map((v, idx) => {
+                          const isPickerOpen = mediaPickerVarIndex === idx;
+                          const importedPics = extractedProduct.pictures || [];
+                          return (
+                            <div
+                              key={v.id}
+                              className="p-3 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-xl space-y-3 shadow-2xs"
+                            >
+                              <div className="flex flex-col sm:flex-row items-start gap-3">
+                                {/* Variant Image Preview + Picker Trigger */}
+                                <div className="flex sm:flex-col items-center gap-2 shrink-0">
+                                  <div className="w-16 h-16 rounded-lg border border-slate-200 dark:border-slate-700 overflow-hidden bg-slate-100 dark:bg-slate-800 flex items-center justify-center">
                                     {v.image ? (
-                                      <img src={v.image} alt="var" className="w-full h-full object-cover" />
+                                      <img
+                                        src={v.image}
+                                        alt={v.title || `Variant ${idx + 1}`}
+                                        referrerPolicy="no-referrer"
+                                        className="w-full h-full object-contain"
+                                      />
                                     ) : (
-                                      <Upload className="w-3.5 h-3.5 text-slate-400" />
+                                      <ImageIcon className="w-6 h-6 text-slate-400" />
                                     )}
                                   </div>
-                                </td>
-                                <td className="p-2">
-                                  <input
-                                    type="text"
-                                    value={v.size || ''}
-                                    onChange={(e) => handleUpdateVariation(idx, 'size', e.target.value)}
-                                    placeholder="e.g. Large / Standard"
-                                    className="w-28 px-2 py-1 text-xs border border-slate-200 dark:border-slate-700 rounded bg-white dark:bg-slate-900"
-                                  />
-                                </td>
-                                <td className="p-2">
-                                  <input
-                                    type="text"
-                                    value={v.color || ''}
-                                    onChange={(e) => handleUpdateVariation(idx, 'color', e.target.value)}
-                                    placeholder="e.g. Rose Gold"
-                                    className="w-24 px-2 py-1 text-xs border border-slate-200 dark:border-slate-700 rounded bg-white dark:bg-slate-900"
-                                  />
-                                </td>
-                                <td className="p-2">
-                                  <input
-                                    type="text"
-                                    value={v.sku || ''}
-                                    onChange={(e) => handleUpdateVariation(idx, 'sku', e.target.value)}
-                                    className="w-32 px-2 py-1 text-xs border border-slate-200 dark:border-slate-700 rounded bg-white dark:bg-slate-900 font-mono"
-                                  />
-                                </td>
-                                <td className="p-2">
-                                  <input
-                                    type="number"
-                                    value={v.salePrice || 0}
-                                    onChange={(e) =>
-                                      handleUpdateVariation(idx, 'salePrice', parseFloat(e.target.value) || 0)
-                                    }
-                                    className="w-20 px-2 py-1 text-xs border border-slate-200 dark:border-slate-700 rounded bg-white dark:bg-slate-900 font-mono font-bold text-emerald-600"
-                                  />
-                                </td>
-                                <td className="p-2">
-                                  <input
-                                    type="number"
-                                    value={v.stockQty || 0}
-                                    onChange={(e) =>
-                                      handleUpdateVariation(idx, 'stockQty', parseInt(e.target.value, 10) || 0)
-                                    }
-                                    className="w-16 px-2 py-1 text-xs border border-slate-200 dark:border-slate-700 rounded bg-white dark:bg-slate-900 font-mono"
-                                  />
-                                </td>
-                                <td className="p-2 text-right">
-                                  <button
-                                    type="button"
-                                    onClick={() => handleRemoveVariation(idx)}
-                                    className="text-red-500 hover:text-red-700 p-1 cursor-pointer"
-                                    title="Remove variation"
-                                  >
-                                    <Trash2 className="w-3.5 h-3.5" />
-                                  </button>
-                                </td>
-                              </tr>
-                            ))}
-                          </tbody>
-                        </table>
+                                  <div className="flex flex-col gap-1">
+                                    <button
+                                      type="button"
+                                      onClick={() => setMediaPickerVarIndex(isPickerOpen ? null : idx)}
+                                      className={`px-2 py-1 rounded text-[10px] font-bold cursor-pointer border transition-colors ${
+                                        isPickerOpen
+                                          ? 'bg-amber-500 text-slate-950 border-amber-500'
+                                          : 'bg-amber-50 hover:bg-amber-100 dark:bg-amber-950/40 text-amber-800 dark:text-amber-300 border-amber-300 dark:border-amber-800'
+                                      }`}
+                                    >
+                                      {isPickerOpen
+                                        ? 'Close Media Picker'
+                                        : `Pick Media (${importedPics.length})`}
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        setVariationImageTargetIndex(idx);
+                                        variationImageInputRef.current?.click();
+                                      }}
+                                      className="px-2 py-1 rounded text-[10px] font-semibold bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-300 cursor-pointer flex items-center justify-center gap-1"
+                                    >
+                                      <Upload className="w-2.5 h-2.5" />
+                                      Upload
+                                    </button>
+                                  </div>
+                                </div>
+
+                                {/* Variant Fields Grid */}
+                                <div className="flex-1 w-full space-y-2.5">
+                                  <div className="flex items-center justify-between gap-2">
+                                    <span className="text-[10px] font-black uppercase tracking-wider text-amber-600 dark:text-amber-400">
+                                      Variant #{idx + 1}
+                                    </span>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleRemoveVariation(idx)}
+                                      className="text-red-500 hover:text-red-700 text-[11px] font-bold flex items-center gap-1 cursor-pointer"
+                                    >
+                                      <Trash2 className="w-3 h-3" />
+                                      Remove
+                                    </button>
+                                  </div>
+
+                                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2 text-xs">
+                                    <div>
+                                      <label className="text-[10px] font-bold text-slate-500 block mb-0.5">
+                                        Variant Title / Option
+                                      </label>
+                                      <input
+                                        type="text"
+                                        value={v.title || ''}
+                                        onChange={(e) => handleUpdateVariation(idx, 'title', e.target.value)}
+                                        placeholder="e.g. Rose Gold · Large"
+                                        className="w-full px-2.5 py-1.5 text-xs border border-slate-200 dark:border-slate-700 rounded-lg bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-white font-semibold"
+                                      />
+                                    </div>
+                                    <div>
+                                      <label className="text-[10px] font-bold text-slate-500 block mb-0.5">
+                                        Size / Dimension
+                                      </label>
+                                      <input
+                                        type="text"
+                                        value={v.size || ''}
+                                        onChange={(e) => handleUpdateVariation(idx, 'size', e.target.value)}
+                                        placeholder="e.g. Large / 500ml"
+                                        className="w-full px-2.5 py-1.5 text-xs border border-slate-200 dark:border-slate-700 rounded-lg bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-white"
+                                      />
+                                    </div>
+                                    <div>
+                                      <label className="text-[10px] font-bold text-slate-500 block mb-0.5">
+                                        Color / Finish
+                                      </label>
+                                      <input
+                                        type="text"
+                                        value={v.color || ''}
+                                        onChange={(e) => handleUpdateVariation(idx, 'color', e.target.value)}
+                                        placeholder="e.g. Black / Rose Gold"
+                                        className="w-full px-2.5 py-1.5 text-xs border border-slate-200 dark:border-slate-700 rounded-lg bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-white"
+                                      />
+                                    </div>
+                                    <div>
+                                      <label className="text-[10px] font-bold text-slate-500 block mb-0.5">
+                                        Variation SKU
+                                      </label>
+                                      <input
+                                        type="text"
+                                        value={v.sku || ''}
+                                        onChange={(e) => handleUpdateVariation(idx, 'sku', e.target.value)}
+                                        className="w-full px-2.5 py-1.5 text-xs border border-slate-200 dark:border-slate-700 rounded-lg bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-white font-mono"
+                                      />
+                                    </div>
+                                  </div>
+
+                                  <div className="grid grid-cols-3 gap-2 text-xs">
+                                    <div>
+                                      <label className="text-[10px] font-bold text-slate-500 block mb-0.5">
+                                        Market Price (Rs.)
+                                      </label>
+                                      <input
+                                        type="number"
+                                        value={v.originalPrice || 0}
+                                        onChange={(e) =>
+                                          handleUpdateVariation(idx, 'originalPrice', parseFloat(e.target.value) || 0)
+                                        }
+                                        className="w-full px-2.5 py-1.5 text-xs border border-slate-200 dark:border-slate-700 rounded-lg bg-slate-50 dark:bg-slate-800 font-mono"
+                                      />
+                                    </div>
+                                    <div>
+                                      <label className="text-[10px] font-bold text-emerald-700 dark:text-emerald-400 block mb-0.5">
+                                        Our Price (Rs.)
+                                      </label>
+                                      <input
+                                        type="number"
+                                        value={v.salePrice || 0}
+                                        onChange={(e) =>
+                                          handleUpdateVariation(idx, 'salePrice', parseFloat(e.target.value) || 0)
+                                        }
+                                        className="w-full px-2.5 py-1.5 text-xs border border-emerald-300 dark:border-emerald-700 rounded-lg bg-slate-50 dark:bg-slate-800 font-mono font-bold text-emerald-700 dark:text-emerald-400"
+                                      />
+                                    </div>
+                                    <div>
+                                      <label className="text-[10px] font-bold text-slate-500 block mb-0.5">
+                                        Stock Qty
+                                      </label>
+                                      <input
+                                        type="number"
+                                        value={v.stockQty || 0}
+                                        onChange={(e) =>
+                                          handleUpdateVariation(idx, 'stockQty', parseInt(e.target.value, 10) || 0)
+                                        }
+                                        className="w-full px-2.5 py-1.5 text-xs border border-slate-200 dark:border-slate-700 rounded-lg bg-slate-50 dark:bg-slate-800 font-mono"
+                                      />
+                                    </div>
+                                  </div>
+
+                                  <div>
+                                    <label className="text-[10px] font-bold text-slate-600 dark:text-slate-400 block mb-0.5">
+                                      Separate Variant Details / Specs (shown to customer when selecting this variant)
+                                    </label>
+                                    <textarea
+                                      rows={2}
+                                      value={v.details || ''}
+                                      onChange={(e) => handleUpdateVariation(idx, 'details', e.target.value)}
+                                      placeholder="Specific dimensions, capacity, packaging, color note or specs for this variant..."
+                                      className="w-full px-2.5 py-1.5 text-xs border border-slate-200 dark:border-slate-700 rounded-lg bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-white"
+                                    />
+                                  </div>
+                                </div>
+                              </div>
+
+                              {/* Inline Select Variant Image from Imported Media Picker */}
+                              {isPickerOpen && (
+                                <div className="p-3 rounded-lg bg-amber-50/70 dark:bg-amber-950/30 border border-amber-300 dark:border-amber-800 space-y-2">
+                                  <div className="flex items-center justify-between">
+                                    <span className="text-[11px] font-bold text-amber-900 dark:text-amber-200">
+                                      Select Photo for Variant #{idx + 1} from Imported Link Media ({importedPics.length}):
+                                    </span>
+                                    {v.image && (
+                                      <button
+                                        type="button"
+                                        onClick={() => handleUpdateVariation(idx, 'image', undefined)}
+                                        className="text-[10px] font-bold text-red-600 hover:underline cursor-pointer"
+                                      >
+                                        Clear Variant Photo
+                                      </button>
+                                    )}
+                                  </div>
+
+                                  {importedPics.length > 0 ? (
+                                    <div className="grid grid-cols-4 sm:grid-cols-6 md:grid-cols-8 gap-2">
+                                      {importedPics.map((mediaUrl, mIdx) => {
+                                        const isSelected = v.image === mediaUrl;
+                                        return (
+                                          <button
+                                            key={`${mediaUrl}_${mIdx}`}
+                                            type="button"
+                                            onClick={() => {
+                                              handleUpdateVariation(idx, 'image', mediaUrl);
+                                              setMediaPickerVarIndex(null);
+                                            }}
+                                            className={`relative rounded-lg overflow-hidden border-2 h-14 bg-white dark:bg-slate-900 cursor-pointer transition-all ${
+                                              isSelected
+                                                ? 'border-amber-500 ring-2 ring-amber-400 scale-105'
+                                                : 'border-slate-200 dark:border-slate-700 hover:border-amber-400'
+                                            }`}
+                                          >
+                                            <img
+                                              src={mediaUrl}
+                                              alt={`Media ${mIdx + 1}`}
+                                              referrerPolicy="no-referrer"
+                                              className="w-full h-full object-contain"
+                                            />
+                                            {isSelected && (
+                                              <span className="absolute top-0.5 right-0.5 bg-amber-500 text-slate-950 rounded-full p-0.5">
+                                                <Check className="w-2.5 h-2.5 stroke-[3]" />
+                                              </span>
+                                            )}
+                                          </button>
+                                        );
+                                      })}
+                                    </div>
+                                  ) : (
+                                    <p className="text-[11px] text-slate-500">
+                                      No imported media in gallery yet. Upload gallery photos above or upload directly for this variant.
+                                    </p>
+                                  )}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
                       </div>
                     ) : (
                       <p className="text-xs text-slate-400">
-                        No variations extracted. Single standard SKU will be created.
+                        No variations extracted. Click "Add Variation" to define choices with separate photos &amp; details.
                       </p>
                     )}
                   </div>

@@ -467,7 +467,8 @@ export const CustomerPortalView: React.FC<CustomerPortalViewProps> = ({
                     mohalla={addrMohalla}
                     landmark={addrLandmark}
                     address={addrLine}
-                    filterActiveCitiesOnly={true}
+                    filterActiveCitiesOnly={false}
+                    deliveryMode="all_open"
                     showCompleteAddress={true}
                     onChange={(patch) => {
                       if (patch.city !== undefined) setAddrCity(patch.city);

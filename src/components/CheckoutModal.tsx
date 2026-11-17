@@ -15,14 +15,19 @@ import {
   RotateCcw,
   Plus,
   Settings2,
+  Zap,
+  Lock,
 } from 'lucide-react';
 import { AppUser, BusinessProfile, CartItem, Customer, DeliveryCityConfig, PaymentMode, SalePaymentType } from '../types';
 import { defaultDeliveryCities } from '../utils/defaultData';
 import {
   DEFAULT_CITY_CENTER_DELIVERY_CHARGE,
   ensureCityAreasShape,
+  findFirstUnlockedExpressCityAndArea,
+  getProductDeliveryMeta,
   isMuzaffarabadCity,
   resolveDeliveryCharge,
+  resolveExpressAreaAvailability,
   slugifyId,
 } from '../utils/locationCategoryHelpers';
 import { apiToggleOtherCities, apiUpdateCity } from '../utils/storage';
@@ -81,11 +86,25 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
       ? profile.deliveryCities
       : defaultDeliveryCities
   );
-  const allowedCities = cityConfigs.filter((c) => c.allowed);
-  const defaultActiveCity =
-    allowedCities.find((c) => isMuzaffarabadCity(c.name))?.name ||
-    allowedCities[0]?.name ||
-    'Muzaffarabad';
+  const hasExpressInCart = cart.some((it) => getProductDeliveryMeta(it.product).isExpress);
+  const checkoutDeliveryMode: 'express_locked' | 'all_open' = hasExpressInCart
+    ? 'express_locked'
+    : 'all_open';
+
+  const allowedCities = hasExpressInCart
+    ? cityConfigs.filter((c) => isMuzaffarabadCity(c.name) || c.allowed)
+    : cityConfigs;
+  const expressFallback = findFirstUnlockedExpressCityAndArea(cityConfigs);
+  const defaultActiveCity = hasExpressInCart
+    ? expressFallback.city
+    : cityConfigs.find((c) => isMuzaffarabadCity(c.name))?.name ||
+      cityConfigs[0]?.name ||
+      'Muzaffarabad';
+  const defaultActiveArea = hasExpressInCart
+    ? expressFallback.area
+    : isMuzaffarabadCity(defaultActiveCity)
+    ? 'City Center'
+    : '';
 
   const canManageCities =
     Boolean(onSaveProfile) &&
@@ -172,21 +191,48 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
         setSaleType(isCustomerView ? 'cod' : 'full');
       }
     }
+    const resolvePreferredCityAndArea = (candidateCity?: string, candidateArea?: string) => {
+      if (hasExpressInCart) {
+        const check = resolveExpressAreaAvailability(cityConfigs, candidateCity, candidateArea, true);
+        if (check.allowed && candidateCity) {
+          return { city: candidateCity, area: candidateArea || '' };
+        }
+        if (check.cityUnlocked && candidateCity) {
+          const cityObj = cityConfigs.find(
+            (c) => c.name.toLowerCase() === candidateCity.toLowerCase()
+          );
+          const firstUnlockedArea = (cityObj?.areas || []).find((a) => a.allowed)?.name || '';
+          return { city: candidateCity, area: firstUnlockedArea };
+        }
+        return { city: expressFallback.city, area: expressFallback.area };
+      }
+
+      if (candidateCity && cityConfigs.some((c) => c.name.toLowerCase() === candidateCity.toLowerCase())) {
+        const cityObj = cityConfigs.find(
+          (c) => c.name.toLowerCase() === candidateCity.toLowerCase()
+        );
+        return {
+          city: cityObj?.name || candidateCity,
+          area:
+            candidateArea ||
+            cityObj?.areas?.[0]?.name ||
+            (isMuzaffarabadCity(candidateCity) ? 'City Center' : ''),
+        };
+      }
+      return { city: defaultActiveCity, area: defaultActiveArea };
+    };
+
     if (isCustomerView) {
       if (matchedLoggedCustomer) {
         setSelectedCustomerId(matchedLoggedCustomer.id);
         setBuyerName(matchedLoggedCustomer.name || '');
         setBuyerPhone(matchedLoggedCustomer.phone || '');
-        const custCityAllowed = allowedCities.some(
-          (c) => c.name.toLowerCase() === (matchedLoggedCustomer.city || '').toLowerCase()
+        const resolvedLoc = resolvePreferredCityAndArea(
+          matchedLoggedCustomer.city,
+          matchedLoggedCustomer.area
         );
-        setBuyerCity(custCityAllowed && matchedLoggedCustomer.city ? matchedLoggedCustomer.city : defaultActiveCity);
-        setBuyerArea(
-          matchedLoggedCustomer.area ||
-            (isMuzaffarabadCity(custCityAllowed && matchedLoggedCustomer.city ? matchedLoggedCustomer.city : defaultActiveCity)
-              ? 'City Center'
-              : '')
-        );
+        setBuyerCity(resolvedLoc.city);
+        setBuyerArea(resolvedLoc.area);
         setBuyerMohalla(matchedLoggedCustomer.mohalla || '');
         setBuyerLandmark(matchedLoggedCustomer.landmark || '');
         setBuyerAddress(matchedLoggedCustomer.address || matchedLoggedCustomer.area || '');
@@ -195,32 +241,25 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
         setBuyerName(currentUser?.isAuthenticated ? currentUser.name : '');
         setBuyerPhone(currentUser?.isAuthenticated ? currentUser.phone || '' : '');
         setBuyerCity(defaultActiveCity);
-        if (!buyerArea && isMuzaffarabadCity(defaultActiveCity)) {
-          setBuyerArea('City Center');
-        }
+        setBuyerArea(defaultActiveArea);
       }
     } else if (selectedCustomerId && selectedCustomerId !== 'new_checkout_buyer') {
       const cust = customers.find((c) => c.id === selectedCustomerId);
       if (cust) {
         setBuyerName(cust.name || '');
         setBuyerPhone(cust.phone || '');
-        const custCityAllowed = allowedCities.some(
-          (c) => c.name.toLowerCase() === (cust.city || '').toLowerCase()
-        );
-        const resolvedCustCity = custCityAllowed && cust.city ? cust.city : defaultActiveCity;
-        setBuyerCity(resolvedCustCity);
-        setBuyerArea(cust.area || (isMuzaffarabadCity(resolvedCustCity) ? 'City Center' : ''));
+        const resolvedLoc = resolvePreferredCityAndArea(cust.city, cust.area);
+        setBuyerCity(resolvedLoc.city);
+        setBuyerArea(resolvedLoc.area);
         setBuyerMohalla(cust.mohalla || '');
         setBuyerLandmark(cust.landmark || '');
         setBuyerAddress(cust.address || cust.area || '');
       }
     } else {
       setBuyerCity(defaultActiveCity);
-      if (!buyerArea && isMuzaffarabadCity(defaultActiveCity)) {
-        setBuyerArea('City Center');
-      }
+      setBuyerArea(defaultActiveArea);
     }
-  }, [isOpen, isCustomerView, isCreditAuthorizedSeller, selectedCustomerId, matchedLoggedCustomer, currentUser, customers]);
+  }, [isOpen, isCustomerView, isCreditAuthorizedSeller, selectedCustomerId, matchedLoggedCustomer, currentUser, customers, hasExpressInCart]);
 
   if (!isOpen) return null;
 
@@ -230,7 +269,17 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
   const totalSavings = totalMarketPrice - totalOurPrice;
   const savingsPercent = totalMarketPrice > 0 ? Math.round((totalSavings / totalMarketPrice) * 100) : 0;
 
-  const activeBuyerCity = allowedCities.some((c) => c.name === buyerCity) ? buyerCity : defaultActiveCity;
+  const activeBuyerCity = hasExpressInCart
+    ? allowedCities.some((c) => c.name === buyerCity)
+      ? buyerCity
+      : defaultActiveCity
+    : buyerCity || defaultActiveCity;
+  const currentLocationCheck = resolveExpressAreaAvailability(
+    cityConfigs,
+    activeBuyerCity,
+    buyerArea,
+    hasExpressInCart
+  );
   const resolvedDelivery = resolveDeliveryCharge(
     cityConfigs,
     activeBuyerCity,
@@ -377,13 +426,22 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
       return;
     }
 
-    if (allowedCities.length === 0) {
-      setFormError('No delivery cities are currently enabled. Please ask store admin to enable delivery cities.');
+    if (hasExpressInCart && allowedCities.length === 0) {
+      setFormError('No Express delivery cities are currently unlocked. Please ask store admin to enable Express cities & sub-cities.');
       return;
     }
 
-    if (!buyerCity.trim() || !allowedCities.some((c) => c.name === buyerCity)) {
-      setFormError('Selected city is not active for delivery. Please choose an allowed delivery city.');
+    const submitAvail = resolveExpressAreaAvailability(
+      cityConfigs,
+      activeBuyerCity,
+      buyerArea,
+      hasExpressInCart
+    );
+    if (!submitAvail.allowed) {
+      setFormError(
+        submitAvail.reason ||
+          'Selected city or sub-city is locked for Express delivery. Please choose a manually unlocked city & sub-city.'
+      );
       return;
     }
 
@@ -521,15 +579,24 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
             </div>
 
             <div className="space-y-2.5">
-              <div className="flex items-center justify-between">
-                <span className="text-[10px] text-emerald-700 dark:text-emerald-400 font-medium">
-                  ✓ {allowedCities.length} active delivery {allowedCities.length === 1 ? 'city' : 'cities'} (Default: Muzaffarabad)
-                </span>
+              <div className="flex items-center justify-between gap-2">
+                {hasExpressInCart ? (
+                  <span className="text-[10px] text-emerald-700 dark:text-emerald-400 font-semibold flex items-center gap-1">
+                    <Lock className="w-3 h-3 shrink-0" />
+                    <span>
+                      Express Mode: {allowedCities.length} unlocked {allowedCities.length === 1 ? 'city' : 'cities'} &amp; selected sub-cities only (others locked)
+                    </span>
+                  </span>
+                ) : (
+                  <span className="text-[10px] text-slate-600 dark:text-slate-400 font-semibold">
+                    Open across all {cityConfigs.length} cities &amp; sub-cities (3–6 working days)
+                  </span>
+                )}
                 {canManageCities && (
                   <button
                     type="button"
                     onClick={() => setShowCityManager(!showCityManager)}
-                    className="text-[10px] font-bold text-amber-700 dark:text-amber-400 hover:underline flex items-center gap-0.5 cursor-pointer"
+                    className="text-[10px] font-bold text-amber-700 dark:text-amber-400 hover:underline flex items-center gap-0.5 cursor-pointer shrink-0"
                   >
                     <Settings2 className="w-3 h-3" />
                     <span>{showCityManager ? 'Hide Cities' : 'Cities Setup'}</span>
@@ -537,7 +604,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                 )}
               </div>
 
-              {allowedCities.length > 0 ? (
+              {cityConfigs.length > 0 ? (
                 <div className="space-y-2.5">
                   <AddressFieldsGroup
                     cities={cityConfigs}
@@ -546,7 +613,8 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                     mohalla={buyerMohalla}
                     landmark={buyerLandmark}
                     address={buyerAddress}
-                    filterActiveCitiesOnly={true}
+                    filterActiveCitiesOnly={false}
+                    deliveryMode={checkoutDeliveryMode}
                     showCompleteAddress={true}
                     required={saleType === 'cod'}
                     compact={true}
@@ -558,6 +626,13 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                       if (patch.address !== undefined) setBuyerAddress(patch.address);
                     }}
                   />
+
+                  {hasExpressInCart && !currentLocationCheck.allowed && (
+                    <div className="px-3 py-2 rounded-lg bg-rose-50 dark:bg-rose-950/50 border border-rose-200 dark:border-rose-800 text-[11px] font-semibold text-rose-800 dark:text-rose-200 flex items-center gap-2">
+                      <Lock className="w-3.5 h-3.5 shrink-0" />
+                      <span>{currentLocationCheck.reason}</span>
+                    </div>
+                  )}
 
                   {/* Live Customer Visibility Banner for Delivery Charges */}
                   <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-2 rounded-lg bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800/80 text-[11px]">
@@ -599,10 +674,10 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                 <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 dark:border-slate-800 pb-2">
                   <div>
                     <span className="font-bold text-slate-900 dark:text-white text-[11px] block">
-                      Delivery Cities &amp; Fees (Checkmark Allow / Enter Rs. Fee)
+                      Express Delivery Cities &amp; Fees (Unlock Cities / Enter Rs. Fee)
                     </span>
                     <span className="text-[10px] text-slate-500">
-                      Muzaffarabad stays ON (Default Rs. {profile.defaultCityCenterDeliveryCharge ?? 50}). Toggle other cities ON/OFF anytime.
+                      Unchecked cities &amp; sub-cities remain locked 🔒 for Express items. Standard 3–6 working day products stay open everywhere.
                     </span>
                   </div>
                   <div className="flex items-center gap-1.5">
@@ -723,27 +798,69 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
             </div>
 
             <div className="max-h-28 overflow-y-auto space-y-1 pr-1 text-[11px]">
-              {cart.map((it) => (
-                <div
-                  key={it.product.id}
-                  className="flex items-center justify-between text-slate-600 dark:text-slate-300"
-                >
-                  <span className="truncate max-w-[260px]">
-                    {it.product.name} ({it.quantity}x)
-                  </span>
-                  <div className="flex items-center gap-2 font-mono tabular-nums">
-                    <span className="text-slate-400 line-through">
-                      {profile.currencySymbol}
-                      {(it.marketPrice * it.quantity).toLocaleString('en-PK')}
-                    </span>
-                    <span className="font-bold text-slate-900 dark:text-white">
-                      {profile.currencySymbol}
-                      {(it.unitPrice * it.quantity).toLocaleString('en-PK')}
+              {cart.map((it, idx) => {
+                const itemDelivery = getProductDeliveryMeta(it.product);
+                return (
+                  <div
+                    key={`${it.product.id}-${it.product.selectedSize || idx}`}
+                    className="flex items-center justify-between text-slate-600 dark:text-slate-300 gap-2"
+                  >
+                    <div className="flex items-center gap-1.5 min-w-0">
+                      <span className="truncate max-w-[210px]">
+                        {it.product.name} ({it.quantity}x)
+                      </span>
+                      {itemDelivery.isExpress && (
+                        <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[9px] font-extrabold shrink-0 bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300 border border-emerald-300/60 dark:border-emerald-800">
+                          <Zap className="w-2.5 h-2.5 fill-emerald-600 text-emerald-600" />
+                          <span>EXPRESS</span>
+                        </span>
+                      )}
+                    </div>
+                    <div className="flex items-center gap-2 font-mono tabular-nums shrink-0">
+                      <span className="text-slate-400 line-through">
+                        {profile.currencySymbol}
+                        {(it.marketPrice * it.quantity).toLocaleString('en-PK')}
+                      </span>
+                      <span className="font-bold text-slate-900 dark:text-white">
+                        {profile.currencySymbol}
+                        {(it.unitPrice * it.quantity).toLocaleString('en-PK')}
+                      </span>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            {(() => {
+              const expressCount = cart.filter((it) => getProductDeliveryMeta(it.product).isExpress).length;
+              const standardCount = cart.length - expressCount;
+              if (cart.length === 0) return null;
+              if (standardCount === 0) {
+                return (
+                  <div className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 text-[11px] text-emerald-900 dark:text-emerald-200 font-semibold">
+                    <Zap className="w-3.5 h-3.5 text-emerald-600 fill-emerald-500 shrink-0" />
+                    <span>⚡ Express Delivery: Instant dispatch ONLY in manually unlocked cities &amp; sub-cities (others locked)</span>
+                  </div>
+                );
+              }
+              if (expressCount === 0) {
+                return (
+                  <div className="px-2.5 py-1.5 rounded-lg bg-white/80 dark:bg-slate-900/60 border border-slate-200 dark:border-slate-700 text-[11px] text-slate-700 dark:text-slate-300 font-medium">
+                    <span>
+                      Delivery in 3 to 6 working days depending on logistics · Open across all cities &amp; sub-cities
                     </span>
                   </div>
+                );
+              }
+              return (
+                <div className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800 text-[11px] text-amber-950 dark:text-amber-200 font-semibold">
+                  <Zap className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                  <span>
+                    Mixed Cart: {expressCount} ⚡ Express item(s) (unlocked cities &amp; sub-cities only) · {standardCount} item(s) take 3–6 working days depending on logistics
+                  </span>
                 </div>
-              ))}
-            </div>
+              );
+            })()}
 
             {deliveryFee > 0 && (
               <div className="flex items-center justify-between text-[11px] text-slate-700 dark:text-slate-200 pt-1">

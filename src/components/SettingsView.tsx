@@ -1349,10 +1349,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               <div className="p-3.5 rounded-xl bg-slate-50 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-700 flex flex-wrap items-center justify-between gap-3">
                 <div>
                   <span className="text-xs font-bold text-slate-900 dark:text-white block">
-                    Other Cities Except Muzaffarabad ({activeOtherCitiesCount}/{otherCities.length} ON)
+                    Express Delivery — Other Cities Except Muzaffarabad ({activeOtherCitiesCount}/{otherCities.length} Unlocked)
                   </span>
                   <span className="text-[11px] text-slate-500 dark:text-slate-400">
-                    Quickly enable or disable all outside cities while keeping Muzaffarabad ON
+                    Unchecked cities &amp; sub-cities remain locked 🔒 for Express items. Standard products (3–6 working days) stay open in ALL cities &amp; sub-cities.
                   </span>
                 </div>
                 <div className="inline-flex rounded-lg border border-slate-300 dark:border-slate-600 overflow-hidden bg-white dark:bg-slate-900">
@@ -1474,9 +1474,17 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                           )}
                         </button>
 
-                        {isMzd && (
+                        {isMzd ? (
                           <span className="px-2 py-0.5 text-[10px] font-bold rounded bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300">
-                            Default ON
+                            ⚡ Express Default Unlocked
+                          </span>
+                        ) : c.allowed ? (
+                          <span className="px-2 py-0.5 text-[10px] font-bold rounded bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300">
+                            ⚡ Express Unlocked
+                          </span>
+                        ) : (
+                          <span className="px-2 py-0.5 text-[10px] font-bold rounded bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400">
+                            🔒 Express Locked
                           </span>
                         )}
 

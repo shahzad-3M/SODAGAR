@@ -23,8 +23,12 @@ import {
   Video,
   Users,
   Phone,
+  Zap,
+  Truck,
+  Image as ImageIcon,
+  Upload,
 } from 'lucide-react';
-import { AppUser, BusinessProfile, CategoryRecord, Investor, ProductItem, ProductVariation } from '../types';
+import { AppUser, BusinessProfile, CategoryRecord, DeliverySpeedCategory, Investor, ProductItem, ProductVariation } from '../types';
 import {
   getCategories,
   addCategory,
@@ -32,6 +36,7 @@ import {
   getInvestors,
   apiSaveCategoryRecord,
   apiActivateProductArrival,
+  apiCacheExternalImage,
 } from '../utils/storage';
 import {
   UPCOMING_CATEGORY_ID,
@@ -41,6 +46,7 @@ import {
   doesProductMatchCategoryFilter,
   resolveCategoryIdsFromProduct,
   getCategoryBreadcrumb,
+  getProductDeliveryMeta,
 } from '../utils/locationCategoryHelpers';
 import { ProductImporterModal } from './ProductImporterModal';
 import { CategoryCascadingSelect } from './CategoryCascadingSelect';
@@ -76,6 +82,7 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
 }) => {
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedCategory, setSelectedCategory] = useState('all');
+  const [selectedDeliveryFilter, setSelectedDeliveryFilter] = useState<'all' | DeliverySpeedCategory>('all');
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
   const [isImportModalOpen, setIsImportModalOpen] = useState(isExternalImportOpen);
   const [editingProduct, setEditingProduct] = useState<ProductItem | null>(null);
@@ -89,6 +96,7 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
   const [formChildCatId, setFormChildCatId] = useState<string>('');
   const [formIsUpcoming, setFormIsUpcoming] = useState(false);
   const [formExpectedArrivalDate, setFormExpectedArrivalDate] = useState('');
+  const [formDeliveryType, setFormDeliveryType] = useState<DeliverySpeedCategory>('standard');
   const [formDetails, setFormDetails] = useState('');
   const [formSku, setFormSku] = useState('');
   const [formCostPrice, setFormCostPrice] = useState('');
@@ -98,6 +106,12 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
   const [formMinStock, setFormMinStock] = useState('10');
   const [formIsWinning, setFormIsWinning] = useState(false);
   const [formImageUrl, setFormImageUrl] = useState('');
+  const [formPictures, setFormPictures] = useState<string[]>([]);
+  const [formExtraPictureUrl, setFormExtraPictureUrl] = useState('');
+  const [formCachePictureLoading, setFormCachePictureLoading] = useState(false);
+  const [formCachePictureError, setFormCachePictureError] = useState('');
+  const [formVariations, setFormVariations] = useState<ProductVariation[]>([]);
+  const [editVarMediaPickerIdx, setEditVarMediaPickerIdx] = useState<number | null>(null);
   const [formWebsiteUrl, setFormWebsiteUrl] = useState('');
   const [formVideoUrl, setFormVideoUrl] = useState('');
   const [formInvestorId, setFormInvestorId] = useState('');
@@ -119,6 +133,7 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
   const [arrivalMainCatId, setArrivalMainCatId] = useState('');
   const [arrivalSubCatId, setArrivalSubCatId] = useState<string | undefined>(undefined);
   const [arrivalChildCatId, setArrivalChildCatId] = useState<string | undefined>(undefined);
+  const [arrivalDeliveryType, setArrivalDeliveryType] = useState<DeliverySpeedCategory>('standard');
   const [arrivalOurPrice, setArrivalOurPrice] = useState('');
   const [arrivalMarketPrice, setArrivalMarketPrice] = useState('');
   const [arrivalCostPrice, setArrivalCostPrice] = useState('');
@@ -188,6 +203,10 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
     ) {
       return false;
     }
+    if (selectedDeliveryFilter !== 'all') {
+      const pDelivery = getProductDeliveryMeta(p).deliveryType;
+      if (pDelivery !== selectedDeliveryFilter) return false;
+    }
     if (searchTerm.trim()) {
       const q = searchTerm.toLowerCase();
       const matchName = p.name.toLowerCase().includes(q);
@@ -211,6 +230,7 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
       setFormChildCatId(resolvedIds.childSubcategoryId || '');
       setFormIsUpcoming(isProductPurchaseBlocked(prod));
       setFormExpectedArrivalDate(prod.expectedArrivalDate || '');
+      setFormDeliveryType(prod.deliveryType === 'express' ? 'express' : 'standard');
       setFormDetails(prod.details || prod.description || '');
       setFormSku(prod.sku);
       setFormCostPrice(String(prod.costPrice));
@@ -219,7 +239,18 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
       setFormStockQty(isProductPurchaseBlocked(prod) ? '0' : String(prod.stockQty));
       setFormMinStock(String(prod.minStockAlert));
       setFormIsWinning(prod.isWinningItem);
-      setFormImageUrl(prod.imageUrl || '');
+      const initialPics = Array.from(
+        new Set(
+          [
+            ...(prod.pictures || []),
+            ...(prod.imageUrl ? [prod.imageUrl] : []),
+            ...((prod.variations || []).map((v) => v.image).filter(Boolean) as string[]),
+          ].filter(Boolean)
+        )
+      );
+      setFormPictures(initialPics);
+      setFormImageUrl(initialPics[0] || prod.imageUrl || '');
+      setFormVariations(prod.variations ? prod.variations.map((v) => ({ ...v })) : []);
       setFormWebsiteUrl(prod.websiteUrl || '');
       setFormVideoUrl(prod.videoUrl || '');
       const matchedInv =
@@ -242,6 +273,7 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
       setFormChildCatId('');
       setFormIsUpcoming(false);
       setFormExpectedArrivalDate('');
+      setFormDeliveryType('standard');
       setFormDetails('');
       setFormSku(`SKU-${Math.floor(1000 + Math.random() * 9000)}`);
       setFormCostPrice('');
@@ -251,11 +283,16 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
       setFormMinStock('10');
       setFormIsWinning(false);
       setFormImageUrl('');
+      setFormPictures([]);
+      setFormVariations([]);
       setFormWebsiteUrl('');
       setFormVideoUrl('');
       setFormInvestorId('');
       setFormInvestorWhatsApp('');
     }
+    setFormExtraPictureUrl('');
+    setFormCachePictureError('');
+    setEditVarMediaPickerIdx(null);
     setIsCreatingNewCategory(false);
     setNewCategoryInput('');
     setNewCategoryParentId('');
@@ -271,6 +308,7 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
     setArrivalMainCatId(defaultMain?.id || '');
     setArrivalSubCatId(undefined);
     setArrivalChildCatId(undefined);
+    setArrivalDeliveryType(prod.deliveryType === 'express' ? 'express' : 'standard');
     setArrivalOurPrice(String(prod.ourPrice || ''));
     setArrivalMarketPrice(String(prod.marketPrice || ''));
     setArrivalCostPrice(String(prod.costPrice || ''));
@@ -307,6 +345,7 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
       parentCategoryId: arrivalMainCatId,
       subcategoryId: arrivalSubCatId,
       childSubcategoryId: arrivalChildCatId,
+      deliveryType: arrivalDeliveryType,
       ourPrice: ourP,
       marketPrice: parseFloat(arrivalMarketPrice) || ourP,
       costPrice: parseFloat(arrivalCostPrice) || 0,
@@ -323,6 +362,45 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
 
     onRefreshProducts?.();
     setArrivalTarget(null);
+  };
+
+  const handleAddAndCacheFormPicture = async () => {
+    const raw = formExtraPictureUrl.trim();
+    if (!raw) return;
+    setFormCachePictureError('');
+    setFormCachePictureLoading(true);
+    try {
+      const res = await apiCacheExternalImage(raw, formWebsiteUrl.trim() || undefined);
+      const finalUrl = res.ok && res.localUrl ? res.localUrl : raw;
+      if (!formPictures.includes(finalUrl)) {
+        const nextPics = [...formPictures, finalUrl];
+        setFormPictures(nextPics);
+        if (!formImageUrl.trim()) setFormImageUrl(finalUrl);
+      }
+      setFormExtraPictureUrl('');
+    } catch (err: any) {
+      setFormCachePictureError(err?.message || 'Could not cache image');
+    } finally {
+      setFormCachePictureLoading(false);
+    }
+  };
+
+  const handleUploadFormPictureFile = (file: File | undefined, targetVarIdx?: number) => {
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const dataUrl = String(reader.result || '');
+      if (!dataUrl) return;
+      if (typeof targetVarIdx === 'number') {
+        setFormVariations((prev) =>
+          prev.map((v, i) => (i === targetVarIdx ? { ...v, image: dataUrl } : v))
+        );
+        setEditVarMediaPickerIdx(null);
+      }
+      setFormPictures((prev) => (prev.includes(dataUrl) ? prev : [...prev, dataUrl]));
+      if (!formImageUrl.trim()) setFormImageUrl(dataUrl);
+    };
+    reader.readAsDataURL(file);
   };
 
   const handleSaveSubmit = (e: React.FormEvent) => {
@@ -345,6 +423,39 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
       setCentralCategories(catResult.categories);
     }
 
+    const cleanedPictures = Array.from(
+      new Set([formImageUrl.trim(), ...formPictures].filter((u) => Boolean(u)))
+    );
+
+    const cleanedVariations: ProductVariation[] = formVariations
+      .filter(
+        (v) =>
+          v.title?.trim() ||
+          v.size?.trim() ||
+          v.color?.trim() ||
+          v.sku?.trim() ||
+          v.details?.trim() ||
+          v.image
+      )
+      .map((v, idx) => ({
+        ...v,
+        id: v.id || `var_${Date.now()}_${idx}`,
+        title: v.title?.trim() || [v.size, v.color].filter(Boolean).join(' · ') || `Variant ${idx + 1}`,
+        details: v.details?.trim() || undefined,
+      }));
+
+    const resolvedSizes: string[] | undefined =
+      cleanedVariations.length > 0
+        ? cleanedVariations
+            .map(
+              (v) =>
+                v.title ||
+                [v.size, v.color, ...Object.values(v.attributes || {})].filter(Boolean).join(' · ') ||
+                v.sku
+            )
+            .filter((s): s is string => Boolean(s))
+        : editingProduct?.sizes;
+
     const prodToSave: ProductItem = {
       ...(editingProduct || {}),
       id: editingProduct ? editingProduct.id : `prod_${Date.now()}`,
@@ -354,6 +465,7 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
       parentCategoryId: isUpcomingItem ? UPCOMING_CATEGORY_ID : formParentCatId || undefined,
       subcategoryId: isUpcomingItem ? undefined : formSubCatId || undefined,
       childSubcategoryId: isUpcomingItem ? undefined : formChildCatId || undefined,
+      deliveryType: formDeliveryType,
       sku: formSku.trim() || `SKU-${Date.now()}`,
       costPrice: cost,
       marketPrice: market,
@@ -368,7 +480,10 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
       upcomingStatus: isUpcomingItem ? 'coming_soon' : 'available',
       expectedArrivalDate: isUpcomingItem ? formExpectedArrivalDate.trim() || undefined : undefined,
       details: formDetails.trim() || editingProduct?.details,
-      imageUrl: formImageUrl.trim() || undefined,
+      imageUrl: cleanedPictures[0] || formImageUrl.trim() || undefined,
+      pictures: cleanedPictures.length > 0 ? cleanedPictures : undefined,
+      variations: cleanedVariations.length > 0 ? cleanedVariations : undefined,
+      sizes: resolvedSizes,
       websiteUrl: formWebsiteUrl.trim() || undefined,
       videoUrl: formVideoUrl.trim() || undefined,
       investorId: formInvestorId || undefined,
@@ -508,7 +623,7 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
             </div>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <select
               value={selectedCategory}
               onChange={(e) => setSelectedCategory(e.target.value)}
@@ -518,6 +633,16 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
               {categories.map((c) => (
                 <option key={c} value={c}>{c}</option>
               ))}
+            </select>
+
+            <select
+              value={selectedDeliveryFilter}
+              onChange={(e) => setSelectedDeliveryFilter(e.target.value as 'all' | DeliverySpeedCategory)}
+              className="px-3 py-2 text-xs rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-slate-800 dark:text-slate-200 focus:outline-hidden cursor-pointer"
+            >
+              <option value="all">All Delivery Speeds</option>
+              <option value="express">⚡ Express Delivery (Instant)</option>
+              <option value="standard">🚚 Standard Logistics (3–6 Working Days)</option>
             </select>
 
             <button
@@ -569,9 +694,18 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
                         <p className="font-bold text-slate-900 dark:text-white line-clamp-1">
                           {p.name}
                         </p>
-                        {isUpcomingBlocked && (
+                        {isUpcomingBlocked ? (
                           <span className="px-1.5 py-0.5 rounded bg-purple-100 dark:bg-purple-950 text-purple-800 dark:text-purple-300 text-[9px] font-black uppercase">
                             Coming Soon
+                          </span>
+                        ) : getProductDeliveryMeta(p).isExpress ? (
+                          <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-emerald-100 dark:bg-emerald-950 text-emerald-800 dark:text-emerald-300 text-[9px] font-black border border-emerald-200 dark:border-emerald-800">
+                            <Zap className="w-2.5 h-2.5 fill-current" /> EXPRESS
+                          </span>
+                        ) : null}
+                        {p.variations && p.variations.length > 0 && (
+                          <span className="px-1.5 py-0.5 rounded bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 text-[9px] font-semibold">
+                            {p.variations.length} variants
                           </span>
                         )}
                       </div>
@@ -705,7 +839,7 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
       {/* 4. ADD / EDIT PRODUCT MODAL */}
       {isAddModalOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/70 backdrop-blur-xs p-4 overflow-y-auto">
-          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl w-full max-w-xl overflow-hidden shadow-2xl my-4 max-h-[92vh] flex flex-col">
+          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl w-full max-w-2xl overflow-hidden shadow-2xl my-4 max-h-[92vh] flex flex-col">
             <div className="bg-[#FFD200] p-4 flex items-center justify-between text-slate-900 shrink-0">
               <h2 className="text-base font-extrabold tracking-tight">
                 {editingProduct ? 'Edit Product Details' : 'Add New Inventory Item (نیا آئٹم)'}
@@ -992,17 +1126,399 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
                 </div>
               </div>
 
-              <div className="space-y-1">
-                <label className="font-bold text-slate-800 dark:text-slate-200 block">
-                  Image URL (تصویر کا لنک)
+              {/* Product Delivery Speed Category: Express (Instant) vs Standard Logistics (3-6 Working Days) */}
+              <div className="p-3 rounded-xl bg-slate-50 dark:bg-slate-850 border border-slate-200 dark:border-slate-800 space-y-2">
+                <label className="font-bold text-slate-800 dark:text-slate-200 flex items-center justify-between">
+                  <span className="flex items-center gap-1.5">
+                    <Truck className="w-3.5 h-3.5 text-amber-500" />
+                    <span>Delivery Speed Category (ڈیلیوری کیٹگری)</span>
+                  </span>
+                  <span className="text-[10px] font-normal text-slate-500">
+                    If Express is not selected, 3–6 working days logistics applies
+                  </span>
                 </label>
-                <input
-                  type="url"
-                  value={formImageUrl}
-                  onChange={(e) => setFormImageUrl(e.target.value)}
-                  placeholder="https://images.unsplash.com/photo-..."
-                  className="w-full px-3 py-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white font-mono"
-                />
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setFormDeliveryType('express')}
+                    className={`p-2.5 rounded-xl border text-left transition-all cursor-pointer ${
+                      formDeliveryType === 'express'
+                        ? 'border-emerald-500 bg-emerald-50 dark:bg-emerald-950/40 ring-2 ring-emerald-400'
+                        : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900'
+                    }`}
+                  >
+                    <div className="flex items-center gap-1.5 font-extrabold text-emerald-800 dark:text-emerald-300">
+                      <Zap className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                      <span>Express Delivery (Instant)</span>
+                    </div>
+                    <p className="text-[10px] text-slate-500 dark:text-slate-400 mt-0.5">
+                      Available for instant same-day / express dispatch
+                    </p>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setFormDeliveryType('standard')}
+                    className={`p-2.5 rounded-xl border text-left transition-all cursor-pointer ${
+                      formDeliveryType === 'standard'
+                        ? 'border-amber-500 bg-amber-50 dark:bg-amber-950/40 ring-2 ring-amber-400'
+                        : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900'
+                    }`}
+                  >
+                    <div className="flex items-center gap-1.5 font-extrabold text-amber-800 dark:text-amber-300">
+                      <Truck className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+                      <span>Standard Logistics (3–6 Days)</span>
+                    </div>
+                    <p className="text-[10px] text-slate-500 dark:text-slate-400 mt-0.5">
+                      Takes 3 to 6 working days depending on logistics
+                    </p>
+                  </button>
+                </div>
+              </div>
+
+              {/* Product Media Gallery & Cached Images */}
+              <div className="p-3 rounded-xl bg-slate-50 dark:bg-slate-850 border border-slate-200 dark:border-slate-800 space-y-2.5">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <label className="font-bold text-slate-800 dark:text-slate-200 flex items-center gap-1.5">
+                    <ImageIcon className="w-3.5 h-3.5 text-amber-500" />
+                    <span>Product Media Gallery ({formPictures.length} Photos)</span>
+                  </label>
+                  <label className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-200 dark:bg-slate-800 hover:bg-slate-300 text-slate-800 dark:text-slate-200 text-[10px] font-bold cursor-pointer">
+                    <Upload className="w-3 h-3" />
+                    <span>Upload Photo</span>
+                    <input
+                      type="file"
+                      accept="image/*"
+                      className="hidden"
+                      onChange={(e) => {
+                        handleUploadFormPictureFile(e.target.files?.[0]);
+                        e.target.value = '';
+                      }}
+                    />
+                  </label>
+                </div>
+
+                {formPictures.length > 0 && (
+                  <div className="grid grid-cols-4 sm:grid-cols-6 gap-2">
+                    {formPictures.map((pic, idx) => {
+                      const isMain = (formImageUrl || formPictures[0]) === pic;
+                      return (
+                        <div
+                          key={`${pic.slice(0, 28)}-${idx}`}
+                          className={`relative rounded-lg overflow-hidden border bg-white dark:bg-slate-900 aspect-square group ${
+                            isMain
+                              ? 'border-amber-500 ring-2 ring-amber-400/50'
+                              : 'border-slate-200 dark:border-slate-700'
+                          }`}
+                        >
+                          <img
+                            src={pic}
+                            alt={`Media ${idx + 1}`}
+                            referrerPolicy="no-referrer"
+                            className="w-full h-full object-contain p-0.5"
+                          />
+                          {isMain ? (
+                            <span className="absolute top-0.5 left-0.5 px-1 py-0.2 bg-amber-500 text-slate-950 font-black text-[8px] rounded">
+                              MAIN
+                            </span>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setFormImageUrl(pic);
+                                setFormPictures((prev) => [pic, ...prev.filter((u) => u !== pic)]);
+                              }}
+                              className="absolute bottom-0.5 left-0.5 px-1 py-0.5 bg-slate-900/85 text-white font-bold text-[8px] rounded opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer"
+                            >
+                              Set Main
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const next = formPictures.filter((_, i) => i !== idx);
+                              setFormPictures(next);
+                              if (formImageUrl === pic) setFormImageUrl(next[0] || '');
+                            }}
+                            className="absolute top-0.5 right-0.5 p-0.5 bg-red-600 text-white rounded opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer"
+                            title="Remove photo"
+                          >
+                            <X className="w-2.5 h-2.5" />
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+
+                <div className="flex flex-col sm:flex-row gap-2">
+                  <input
+                    type="url"
+                    value={formExtraPictureUrl}
+                    onChange={(e) => setFormExtraPictureUrl(e.target.value)}
+                    placeholder="Paste photo URL to download & add to product gallery..."
+                    className="flex-1 px-2.5 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white font-mono text-[11px]"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => void handleAddAndCacheFormPicture()}
+                    disabled={formCachePictureLoading || !formExtraPictureUrl.trim()}
+                    className="px-3 py-1.5 rounded-lg bg-slate-900 dark:bg-amber-500 text-white dark:text-slate-950 font-bold text-[11px] cursor-pointer disabled:opacity-50 shrink-0"
+                  >
+                    {formCachePictureLoading ? 'Downloading...' : '+ Download & Add Photo'}
+                  </button>
+                </div>
+                {formCachePictureError && (
+                  <p className="text-[10px] text-red-500 font-medium">{formCachePictureError}</p>
+                )}
+
+                <div className="space-y-1">
+                  <label className="text-[10px] font-bold text-slate-500 dark:text-slate-400 block">
+                    Main Image URL (تصویر کا مرکزی لنک)
+                  </label>
+                  <input
+                    type="text"
+                    value={formImageUrl}
+                    onChange={(e) => setFormImageUrl(e.target.value)}
+                    placeholder="/api/media/imported/... or https://..."
+                    className="w-full px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white font-mono text-[11px]"
+                  />
+                </div>
+              </div>
+
+              {/* Variants Editor with Separate Details + Media Picker from Imported Link */}
+              <div className="p-3 rounded-xl bg-slate-50 dark:bg-slate-850 border border-slate-200 dark:border-slate-800 space-y-2.5">
+                <div className="flex items-center justify-between">
+                  <label className="font-bold text-slate-800 dark:text-slate-200 flex items-center gap-1.5">
+                    <Layers className="w-3.5 h-3.5 text-amber-500" />
+                    <span>Product Variants &amp; Separate Details ({formVariations.length})</span>
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const nextIdx = formVariations.length;
+                      setFormVariations((prev) => [
+                        ...prev,
+                        {
+                          id: `var_${Date.now()}_${nextIdx}`,
+                          sku: `${formSku || 'SKU'}-V${nextIdx + 1}`,
+                          title: '',
+                          size: '',
+                          color: '',
+                          attributes: {},
+                          originalPrice: parseFloat(formMarketPrice) || 0,
+                          salePrice: parseFloat(formOurPrice) || 0,
+                          stockQty: Math.max(0, parseInt(formStockQty, 10) || 10),
+                          details: '',
+                        },
+                      ]);
+                    }}
+                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-[10px] cursor-pointer"
+                  >
+                    <Plus className="w-3 h-3" />
+                    <span>Add Variant</span>
+                  </button>
+                </div>
+
+                {formVariations.length > 0 && (
+                  <div className="space-y-2 max-h-64 overflow-y-auto pr-1">
+                    {formVariations.map((v, vIdx) => (
+                      <div
+                        key={v.id || vIdx}
+                        className="p-2.5 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 space-y-2"
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <div className="flex items-center gap-2 min-w-0 flex-1">
+                            {v.image ? (
+                              <img
+                                src={v.image}
+                                alt={v.title || v.sku}
+                                referrerPolicy="no-referrer"
+                                className="w-10 h-10 rounded-lg object-contain border border-slate-200 dark:border-slate-700 bg-white shrink-0"
+                              />
+                            ) : (
+                              <div className="w-10 h-10 rounded-lg border border-dashed border-slate-300 dark:border-slate-700 flex items-center justify-center text-slate-400 shrink-0">
+                                <ImageIcon className="w-4 h-4" />
+                              </div>
+                            )}
+                            <input
+                              type="text"
+                              value={v.title || ''}
+                              onChange={(e) => {
+                                const next = [...formVariations];
+                                next[vIdx] = { ...next[vIdx], title: e.target.value };
+                                setFormVariations(next);
+                              }}
+                              placeholder={`Variant #${vIdx + 1} Title (e.g. Black · Large)`}
+                              className="flex-1 min-w-0 px-2 py-1 rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white font-bold text-[11px]"
+                            />
+                          </div>
+
+                          <div className="flex items-center gap-1 shrink-0">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setEditVarMediaPickerIdx(editVarMediaPickerIdx === vIdx ? null : vIdx)
+                              }
+                              className="px-2 py-1 rounded bg-slate-100 dark:bg-slate-800 hover:bg-amber-100 text-slate-700 dark:text-slate-200 font-bold text-[10px] cursor-pointer"
+                            >
+                              {editVarMediaPickerIdx === vIdx
+                                ? 'Close Media'
+                                : `Pick Media (${formPictures.length})`}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setFormVariations((prev) => prev.filter((_, i) => i !== vIdx));
+                                if (editVarMediaPickerIdx === vIdx) setEditVarMediaPickerIdx(null);
+                              }}
+                              className="p-1 text-red-500 hover:bg-red-50 dark:hover:bg-red-950/40 rounded cursor-pointer"
+                              title="Remove variant"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        </div>
+
+                        {editVarMediaPickerIdx === vIdx && (
+                          <div className="p-2 rounded-lg bg-amber-50/70 dark:bg-amber-950/20 border border-amber-200 dark:border-amber-800 space-y-1.5">
+                            <div className="flex items-center justify-between">
+                              <span className="text-[10px] font-bold text-amber-900 dark:text-amber-200">
+                                Select Photo from Product Media Gallery:
+                              </span>
+                              <label className="text-[10px] font-bold text-blue-600 dark:text-blue-400 hover:underline cursor-pointer">
+                                Upload New
+                                <input
+                                  type="file"
+                                  accept="image/*"
+                                  className="hidden"
+                                  onChange={(e) => {
+                                    handleUploadFormPictureFile(e.target.files?.[0], vIdx);
+                                    e.target.value = '';
+                                  }}
+                                />
+                              </label>
+                            </div>
+                            {formPictures.length > 0 ? (
+                              <div className="grid grid-cols-5 sm:grid-cols-7 gap-1.5">
+                                {formPictures.map((pic, pIdx) => (
+                                  <button
+                                    key={pIdx}
+                                    type="button"
+                                    onClick={() => {
+                                      setFormVariations((prev) =>
+                                        prev.map((item, idx) =>
+                                          idx === vIdx ? { ...item, image: pic } : item
+                                        )
+                                      );
+                                      setEditVarMediaPickerIdx(null);
+                                    }}
+                                    className={`aspect-square rounded border overflow-hidden bg-white cursor-pointer ${
+                                      v.image === pic
+                                        ? 'border-amber-500 ring-2 ring-amber-400'
+                                        : 'border-slate-200 hover:border-amber-400'
+                                    }`}
+                                  >
+                                    <img
+                                      src={pic}
+                                      alt={`Pick ${pIdx + 1}`}
+                                      referrerPolicy="no-referrer"
+                                      className="w-full h-full object-contain"
+                                    />
+                                  </button>
+                                ))}
+                              </div>
+                            ) : (
+                              <p className="text-[10px] text-slate-500">
+                                No photos in gallery yet — download or upload a photo above first.
+                              </p>
+                            )}
+                          </div>
+                        )}
+
+                        <div className="grid grid-cols-2 sm:grid-cols-6 gap-1.5">
+                          <input
+                            type="text"
+                            value={v.size || ''}
+                            onChange={(e) => {
+                              const next = [...formVariations];
+                              next[vIdx] = { ...next[vIdx], size: e.target.value };
+                              setFormVariations(next);
+                            }}
+                            placeholder="Size"
+                            className="px-2 py-1 rounded border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-[10px]"
+                          />
+                          <input
+                            type="text"
+                            value={v.color || ''}
+                            onChange={(e) => {
+                              const next = [...formVariations];
+                              next[vIdx] = { ...next[vIdx], color: e.target.value };
+                              setFormVariations(next);
+                            }}
+                            placeholder="Color"
+                            className="px-2 py-1 rounded border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-[10px]"
+                          />
+                          <input
+                            type="text"
+                            value={v.sku || ''}
+                            onChange={(e) => {
+                              const next = [...formVariations];
+                              next[vIdx] = { ...next[vIdx], sku: e.target.value };
+                              setFormVariations(next);
+                            }}
+                            placeholder="SKU"
+                            className="px-2 py-1 rounded border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-[10px] font-mono"
+                          />
+                          <input
+                            type="number"
+                            value={v.originalPrice || ''}
+                            onChange={(e) => {
+                              const next = [...formVariations];
+                              next[vIdx] = { ...next[vIdx], originalPrice: parseFloat(e.target.value) || 0 };
+                              setFormVariations(next);
+                            }}
+                            placeholder="Orig Rs."
+                            className="px-2 py-1 rounded border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-[10px] font-mono"
+                          />
+                          <input
+                            type="number"
+                            value={v.salePrice || ''}
+                            onChange={(e) => {
+                              const next = [...formVariations];
+                              next[vIdx] = { ...next[vIdx], salePrice: parseFloat(e.target.value) || 0 };
+                              setFormVariations(next);
+                            }}
+                            placeholder="Sale Rs."
+                            className="px-2 py-1 rounded border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-[10px] font-mono font-bold"
+                          />
+                          <input
+                            type="number"
+                            value={v.stockQty ?? 0}
+                            onChange={(e) => {
+                              const next = [...formVariations];
+                              next[vIdx] = { ...next[vIdx], stockQty: parseInt(e.target.value, 10) || 0 };
+                              setFormVariations(next);
+                            }}
+                            placeholder="Qty"
+                            className="px-2 py-1 rounded border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-[10px] font-mono"
+                          />
+                        </div>
+
+                        <textarea
+                          rows={2}
+                          value={v.details || ''}
+                          onChange={(e) => {
+                            const next = [...formVariations];
+                            next[vIdx] = { ...next[vIdx], details: e.target.value };
+                            setFormVariations(next);
+                          }}
+                          placeholder="Separate variant details, weight, dimensions, capacity, packaging or notes for this option..."
+                          className="w-full px-2 py-1 rounded border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-[10px] text-slate-800 dark:text-slate-200"
+                        />
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
 
               {/* Website Link (User requirement: keep website link to see more details) */}
@@ -1149,6 +1665,42 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
                   setArrivalChildCatId(sel.childSubcategoryId);
                 }}
               />
+
+              {/* Delivery Speed Category Selection upon Arrival */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  onClick={() => setArrivalDeliveryType('express')}
+                  className={`p-2.5 rounded-xl border text-left cursor-pointer transition-all ${
+                    arrivalDeliveryType === 'express'
+                      ? 'border-emerald-500 bg-emerald-50 dark:bg-emerald-950/40 ring-2 ring-emerald-400'
+                      : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800'
+                  }`}
+                >
+                  <span className="font-extrabold text-emerald-800 dark:text-emerald-300 flex items-center gap-1">
+                    <Zap className="w-3.5 h-3.5" /> Express Delivery (Instant)
+                  </span>
+                  <span className="text-[10px] text-slate-500 block mt-0.5">
+                    Available for instant delivery once live
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setArrivalDeliveryType('standard')}
+                  className={`p-2.5 rounded-xl border text-left cursor-pointer transition-all ${
+                    arrivalDeliveryType === 'standard'
+                      ? 'border-amber-500 bg-amber-50 dark:bg-amber-950/40 ring-2 ring-amber-400'
+                      : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800'
+                  }`}
+                >
+                  <span className="font-extrabold text-amber-800 dark:text-amber-300 flex items-center gap-1">
+                    <Truck className="w-3.5 h-3.5" /> Standard Logistics (3–6 Days)
+                  </span>
+                  <span className="text-[10px] text-slate-500 block mt-0.5">
+                    3 to 6 working days depending on logistics
+                  </span>
+                </button>
+              </div>
 
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 bg-slate-50 dark:bg-slate-850 p-3 rounded-xl border border-slate-200 dark:border-slate-800">
                 <div>

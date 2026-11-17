@@ -403,3 +403,130 @@ export function resolveDeliveryCharge(
   };
 }
 
+export interface ProductDeliveryMeta {
+  deliveryType: 'express' | 'standard';
+  isExpress: boolean;
+  badgeLabel: string;
+  etaText: string;
+  etaShort: string;
+  urduLabel: string;
+}
+
+export function getProductDeliveryMeta(product?: Partial<ProductItem> | null): ProductDeliveryMeta {
+  const isExpress = product?.deliveryType === 'express';
+  if (isExpress) {
+    return {
+      deliveryType: 'express',
+      isExpress: true,
+      badgeLabel: 'Express Delivery',
+      etaText: 'Instant Delivery Available (Manually Unlocked Cities & Sub-Cities)',
+      etaShort: 'Express',
+      urduLabel: 'ایکسپریس فوری ڈیلیوری (منتخب شہروں میں)',
+    };
+  }
+  return {
+    deliveryType: 'standard',
+    isExpress: false,
+    badgeLabel: 'Standard Logistics',
+    etaText: 'Delivery in 3 to 6 working days depending on logistics',
+    etaShort: '3–6 Working Days',
+    urduLabel: '3 سے 6 ورکنگ ڈیز (تمام شہروں میں دستیاب)',
+  };
+}
+
+export interface ExpressDeliveryAvailability {
+  mode: 'express_locked' | 'all_open';
+  allowed: boolean;
+  cityUnlocked: boolean;
+  areaUnlocked: boolean;
+  reason?: string;
+}
+
+export function resolveExpressAreaAvailability(
+  cities: DeliveryCityConfig[],
+  cityName?: string,
+  areaName?: string,
+  hasExpressItem = false
+): ExpressDeliveryAvailability {
+  if (!hasExpressItem) {
+    return {
+      mode: 'all_open',
+      allowed: Boolean((cityName || '').trim()),
+      cityUnlocked: true,
+      areaUnlocked: true,
+      reason: !(cityName || '').trim() ? 'Please select a delivery city.' : undefined,
+    };
+  }
+
+  const normalizedCity = normalizeTextKey(cityName);
+  const cityObj = (cities || []).find((c) => normalizeTextKey(c.name) === normalizedCity);
+  const cityUnlocked = Boolean(cityObj && (isMuzaffarabadCity(cityObj.name) ? true : cityObj.allowed));
+
+  if (!cityObj || !cityUnlocked) {
+    return {
+      mode: 'express_locked',
+      allowed: false,
+      cityUnlocked: false,
+      areaUnlocked: false,
+      reason: `Express delivery is locked in "${cityName || 'Selected City'}". Express items deliver only to manually unlocked cities & sub-cities.`,
+    };
+  }
+
+  const areas = cityObj.areas || [];
+  if (areas.length === 0) {
+    return {
+      mode: 'express_locked',
+      allowed: true,
+      cityUnlocked: true,
+      areaUnlocked: true,
+    };
+  }
+
+  const normalizedArea = normalizeTextKey(areaName);
+  const areaObj = normalizedArea
+    ? areas.find((a) => normalizeTextKey(a.name) === normalizedArea)
+    : undefined;
+
+  if (!areaObj) {
+    return {
+      mode: 'express_locked',
+      allowed: false,
+      cityUnlocked: true,
+      areaUnlocked: false,
+      reason: `Please choose an unlocked sub-city / area inside ${cityObj.name} for Express delivery (other areas are locked).`,
+    };
+  }
+
+  if (!areaObj.allowed) {
+    return {
+      mode: 'express_locked',
+      allowed: false,
+      cityUnlocked: true,
+      areaUnlocked: false,
+      reason: `Sub-city "${areaObj.name}" (${cityObj.name}) is currently locked for Express delivery. Choose a manually enabled sub-city or unlock it in Cities Setup.`,
+    };
+  }
+
+  return {
+    mode: 'express_locked',
+    allowed: true,
+    cityUnlocked: true,
+    areaUnlocked: true,
+  };
+}
+
+export function findFirstUnlockedExpressCityAndArea(cities: DeliveryCityConfig[]): {
+  city: string;
+  area: string;
+} {
+  const unlockedCities = (cities || []).filter((c) => isMuzaffarabadCity(c.name) || c.allowed);
+  const mzd = unlockedCities.find((c) => isMuzaffarabadCity(c.name));
+  const pickedCity = mzd || unlockedCities[0] || cities[0];
+  if (!pickedCity) return { city: 'Muzaffarabad', area: 'City Center' };
+  const unlockedArea = (pickedCity.areas || []).find((a) => a.allowed);
+  return {
+    city: pickedCity.name,
+    area: unlockedArea?.name || (isMuzaffarabadCity(pickedCity.name) ? 'City Center' : ''),
+  };
+}
+

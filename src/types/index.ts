@@ -90,15 +90,19 @@ export interface Transaction {
 
 export interface ProductVariation {
   id: string;
+  title?: string; // Display name for variant e.g. "Rose Gold · Standard"
   sku?: string;
   attributes: Record<string, string>; // e.g. { "Size": "Medium", "Color": "Black" }
   size?: string;
   color?: string;
+  details?: string; // Separate specifications, weight, or notes for this variant
   image?: string;
   originalPrice?: number;
   salePrice?: number;
   stockQty: number;
 }
+
+export type DeliverySpeedCategory = 'express' | 'standard';
 
 export interface ProductItem {
   id: string;
@@ -108,6 +112,7 @@ export interface ProductItem {
   parentCategoryId?: string;
   subcategoryId?: string;
   childSubcategoryId?: string;
+  deliveryType?: DeliverySpeedCategory; // 'express' = Instant delivery available; 'standard' (default) = 3 to 6 working days depending on logistics
   isUpcoming?: boolean; // When true: informational / viral product, purchasing disabled ("Coming Soon" badge)
   upcomingStatus?: 'coming_soon' | 'available';
   expectedArrivalDate?: string;
@@ -129,7 +134,7 @@ export interface ProductItem {
   pictures?: string[]; // Multiple high-res images / gallery
   sizes?: string[]; // Available sizes or dimensions (e.g. Standard, Small, Medium, Large)
   selectedSize?: string;
-  variations?: ProductVariation[]; // Extracted & editable variations (size, color, SKU, price, stock, image)
+  variations?: ProductVariation[]; // Extracted & editable variations (size, color, SKU, price, stock, image, details)
   shortDescription?: string;
   brand?: string;
   tags?: string[];

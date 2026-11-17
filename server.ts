@@ -55,9 +55,23 @@ import {
   upsertCustomerRow,
   upsertProductRow,
 } from './src/server/db';
-import { scrapeProductFromUrl } from './src/server/productScraper';
+import {
+  downloadAndCacheExternalImage,
+  IMPORTED_MEDIA_DIR,
+  scrapeProductFromUrl,
+} from './src/server/productScraper';
 
-const PORT = Number(process.env.PORT || 3000);
+function readCliArg(flag: string): string | undefined {
+  const idx = process.argv.indexOf(flag);
+  if (idx !== -1 && idx + 1 < process.argv.length) {
+    return process.argv[idx + 1];
+  }
+  const eq = process.argv.find((a) => a.startsWith(`${flag}=`));
+  return eq ? eq.slice(flag.length + 1) : undefined;
+}
+
+const PORT = Number(readCliArg('--port') || process.env.PORT || 3000);
+const HOST = readCliArg('--host') || process.env.HOST || '0.0.0.0';
 const SESSION_SECRET = process.env.SESSION_SECRET || crypto.createHash('sha256').update(`100dagar_${process.cwd()}`).digest('hex');
 
 interface SessionClaims {
@@ -185,8 +199,15 @@ async function startServer() {
   const app = express();
   app.use(express.json({ limit: '25mb' }));
 
-  // Disable caching on all API routes so all devices always see fresh state
-  app.use('/api', (_req, res, next) => {
+  // Serve downloaded & verified imported product images cleanly from local server storage
+  app.use('/api/media/imported', express.static(IMPORTED_MEDIA_DIR, { maxAge: '30d' }));
+
+  // Disable caching on all JSON API routes so all devices always see fresh state
+  app.use('/api', (req, res, next) => {
+    if (req.path.startsWith('/media/imported')) {
+      next();
+      return;
+    }
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     res.setHeader('Pragma', 'no-cache');
     res.setHeader('Expires', '0');
@@ -429,6 +450,7 @@ async function startServer() {
       variations,
       details,
       badgeText,
+      deliveryType,
     } = (req.body || {}) as {
       parentCategoryId?: string;
       subcategoryId?: string;
@@ -440,6 +462,7 @@ async function startServer() {
       variations?: ProductItem['variations'];
       details?: string;
       badgeText?: string;
+      deliveryType?: 'express' | 'standard';
     };
 
     const allCats = getAllCategoriesFromDb(db);
@@ -476,6 +499,7 @@ async function startServer() {
       stockQty: finalStock,
       variations: Array.isArray(variations) ? variations : existing.variations,
       details: typeof details === 'string' ? details : existing.details,
+      deliveryType: deliveryType === 'express' ? 'express' : deliveryType === 'standard' ? 'standard' : (existing.deliveryType || 'standard'),
       badgeText: badgeText !== undefined ? badgeText : existing.badgeText === 'COMING SOON' ? 'NEW ARRIVAL' : existing.badgeText,
       isUpcoming: false,
       upcomingStatus: 'available',
@@ -541,6 +565,32 @@ async function startServer() {
       const message =
         err instanceof Error ? err.message : 'Unable to fetch or parse product page.';
       res.status(422).json({ error: message });
+    }
+  });
+
+  // 5B-2. CACHE EXTERNAL IMAGE LOCALLY ON SERVER
+  app.post('/api/media/cache', async (req, res) => {
+    try {
+      const actor = resolveActor(req);
+      if (
+        actor.role !== 'super_admin' &&
+        actor.role !== 'admin' &&
+        actor.role !== 'manager'
+      ) {
+        res.status(403).json({ error: 'Only admins or managers can download external media.' });
+        return;
+      }
+      const { url, referer } = (req.body || {}) as { url?: string; referer?: string };
+      if (!url || typeof url !== 'string' || !url.trim()) {
+        res.status(400).json({ error: 'Image URL is required.' });
+        return;
+      }
+      const cached = await downloadAndCacheExternalImage(url.trim(), referer);
+      res.json({ ok: true, localUrl: cached.localUrl, downloaded: cached.downloaded });
+    } catch (err) {
+      res.status(422).json({
+        error: err instanceof Error ? err.message : 'Unable to download external image.',
+      });
     }
   });
 
@@ -1316,11 +1366,15 @@ async function startServer() {
 
   // Frontend middleware / static dist serving
   if (process.env.NODE_ENV !== 'production') {
-    const vite = await createViteServer({
+    const vitePromise = createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
     });
-    app.use(vite.middlewares);
+    app.use((req, res, next) => {
+      vitePromise
+        .then((vite) => vite.middlewares(req, res, next))
+        .catch(next);
+    });
   } else {
     const distDir = path.resolve(process.cwd(), 'dist');
     if (fs.existsSync(distDir)) {
@@ -1331,8 +1385,8 @@ async function startServer() {
     }
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`100DAGAR Full-Stack Server running on http://0.0.0.0:${PORT}`);
+  app.listen(PORT, HOST, () => {
+    console.log(`100DAGAR Full-Stack Server running on http://${HOST}:${PORT}`);
   });
 }
 

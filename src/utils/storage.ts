@@ -505,6 +505,7 @@ export async function apiActivateProductArrival(
     variations?: ProductVariation[];
     details?: string;
     badgeText?: string;
+    deliveryType?: 'express' | 'standard';
   }
 ): Promise<{ ok: boolean; product?: ProductItem; error?: string }> {
   try {
@@ -536,6 +537,7 @@ export async function apiScrapeProductUrl(
     currencyDetected: string;
     originalPriceText?: string;
     imagesFound: number;
+    imagesDownloaded?: number;
     specsFound: number;
     featuresFound: number;
     variantsFound: number;
@@ -558,6 +560,7 @@ export async function apiScrapeProductUrl(
         currencyDetected: string;
         originalPriceText?: string;
         imagesFound: number;
+        imagesDownloaded?: number;
         specsFound: number;
         featuresFound: number;
         variantsFound: number;
@@ -575,6 +578,48 @@ export async function apiScrapeProductUrl(
     return { ok: true, product: data.product, diagnostics: data.diagnostics };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : 'Network error during URL scrape' };
+  }
+}
+
+export async function apiCacheExternalImage(
+  url: string,
+  referer?: string
+): Promise<{ ok: boolean; localUrl: string; downloaded: boolean; error?: string }> {
+  const trimmed = (url || '').trim();
+  if (!trimmed) return { ok: false, localUrl: '', downloaded: false, error: 'Image URL is required.' };
+  try {
+    const res = await fetch('/api/media/cache', {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      cache: 'no-store',
+      body: JSON.stringify({ url: trimmed, referer }),
+    });
+    const parsed = await safeParseJsonResponse<{
+      ok?: boolean;
+      localUrl?: string;
+      downloaded?: boolean;
+      error?: string;
+    }>(res);
+    if (!parsed.ok || !parsed.data?.localUrl) {
+      return {
+        ok: false,
+        localUrl: trimmed,
+        downloaded: false,
+        error: parsed.data?.error || parsed.error || 'Could not download external image.',
+      };
+    }
+    return {
+      ok: true,
+      localUrl: parsed.data.localUrl,
+      downloaded: Boolean(parsed.data.downloaded),
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      localUrl: trimmed,
+      downloaded: false,
+      error: err instanceof Error ? err.message : 'Network error while caching image.',
+    };
   }
 }
 
