@@ -383,7 +383,7 @@ export function resolvePublicProductImageUrl(imageUrl?: string): string {
 
 export function buildProductPageUrl(productId: string): string {
   if (typeof window === 'undefined') {
-    return `/?product=${encodeURIComponent(productId)}`;
+    return `https://madinamarket.pk/?product=${encodeURIComponent(productId)}`;
   }
   try {
     const url = new URL(window.location.href);
@@ -494,9 +494,6 @@ export function buildProfessionalCustomerProductShareMessage(
   const savingsPct = market > 0 ? Math.round((savings / market) * 100) : 0;
   const qty = options?.quantity && options.quantity > 1 ? options.quantity : 1;
   const productUrl = options?.productUrl || buildProductPageUrl(product.id);
-  const imageUrl = resolvePublicProductImageUrl(
-    options?.imageUrl || product.imageUrl || product.pictures?.[0]
-  );
   const currency = profile.currencySymbol || 'Rs.';
   const lastName = extractCustomerLastName(options?.customerName);
   const greeting = lastName ? `Dear *Mr./Ms. ${lastName}*,` : 'Dear *Valued Customer*,';
@@ -525,7 +522,7 @@ export function buildProfessionalCustomerProductShareMessage(
 
   lines.push(``);
   lines.push(`*PRICE & VALUE SUMMARY*`);
-  lines.push(`• *Our Wholesale Price:* ${currency}${price.toLocaleString('en-PK')}`);
+  lines.push(`• *Our Super Best Price:* ${currency}${price.toLocaleString('en-PK')}`);
   if (market > price) {
     lines.push(`• *Market Retail Price:* ~${currency}${market.toLocaleString('en-PK')}~`);
     lines.push(`• *Your Instant Savings:* ${currency}${savings.toLocaleString('en-PK')} (${savingsPct}% OFF)`);
@@ -539,20 +536,9 @@ export function buildProfessionalCustomerProductShareMessage(
     lines.push(`• *Availability:* ${product.stockQty > 0 ? `In Stock (${product.stockQty} units ready)` : 'Confirming latest stock'}`);
   }
 
-  if (imageUrl) {
-    lines.push(``);
-    lines.push(`*Product Photo & Price Preview:*`);
-    lines.push(imageUrl);
-  }
-
   lines.push(``);
-  lines.push(`*View Full Product Details:*`);
+  lines.push(`*Product Link:*`);
   lines.push(productUrl);
-
-  if (product.videoUrl) {
-    lines.push(``);
-    lines.push(`*Product Video:* ${product.videoUrl}`);
-  }
 
   lines.push(`━━━━━━━━━━━━━━━━━━━━━━`);
   lines.push(`Please let me know your preferred quantity or delivery city so I can assist you right away.`);
@@ -574,9 +560,6 @@ export function buildDirectProductWhatsAppMessage(
   const savingsPct = market > 0 ? Math.round((savings / market) * 100) : 0;
   const qty = options?.quantity && options.quantity > 0 ? options.quantity : 1;
   const productUrl = options?.productUrl || buildProductPageUrl(product.id);
-  const imageUrl = resolvePublicProductImageUrl(
-    options?.imageUrl || product.imageUrl || product.pictures?.[0]
-  );
   const currency = profile.currencySymbol || 'Rs.';
   const lastName = extractCustomerLastName(options?.customerName);
   const isUpcoming = product.isUpcoming || product.upcomingStatus === 'coming_soon';
@@ -608,16 +591,10 @@ export function buildDirectProductWhatsAppMessage(
 
   lines.push(``);
   lines.push(`*PRICE DETAILS*`);
-  lines.push(`• *Our Price:* ${currency}${(price * qty).toLocaleString('en-PK')}${qty > 1 ? ` (${currency}${price.toLocaleString('en-PK')}/unit)` : ''}`);
+  lines.push(`• *Our Super Best Price:* ${currency}${(price * qty).toLocaleString('en-PK')}${qty > 1 ? ` (${currency}${price.toLocaleString('en-PK')}/unit)` : ''}`);
   if (market > price) {
     lines.push(`• *Market Price:* ~${currency}${(market * qty).toLocaleString('en-PK')}~`);
     lines.push(`• *Savings:* ${currency}${(savings * qty).toLocaleString('en-PK')} (${savingsPct}% OFF)`);
-  }
-
-  if (imageUrl) {
-    lines.push(``);
-    lines.push(`*Product Image:*`);
-    lines.push(imageUrl);
   }
 
   lines.push(``);
@@ -803,8 +780,8 @@ export async function generateProductPriceCardFile(
     ctx.font = '600 22px system-ui, -apple-system, sans-serif';
     ctx.fillText(
       lastName
-        ? `Prepared for Mr./Ms. ${lastName}  ·  Official Price Quote`
-        : 'Official Wholesale Price & Product Card',
+        ? `Prepared for Mr./Ms. ${lastName}  ·  Official Super Best Price Quote`
+        : 'Official Super Best Price & Product Card',
       54,
       110
     );

@@ -50,7 +50,7 @@ export const ProductBroadcastModal: React.FC<ProductBroadcastModalProps> = ({
   const [urduProductName, setUrduProductName] = useState('');
   const [description, setDescription] = useState('');
   const [price, setPrice] = useState('');
-  const [productLink, setProductLink] = useState('https://100dagar.pk/new-arrival');
+  const [productLink, setProductLink] = useState('https://madinamarket.pk/new-arrival');
   const [copied, setCopied] = useState(false);
 
   // Segmentation Filters (Area-wise, Age-wise, Gender-wise, Group-wise)
@@ -106,7 +106,7 @@ export const ProductBroadcastModal: React.FC<ProductBroadcastModalProps> = ({
     id: `prod_${Date.now()}`,
     productName: productName || '5-in-1 Hot Air Styler & Hair Dryer Brush',
     urduName: urduProductName || 'فائیو ان ون ہاٹ ایئر ہیئر اسٹائلر',
-    description: description || 'High-demand wholesale item with 50% discount savings.',
+    description: description || 'High-demand Super Best Price item with 50% discount savings.',
     price: parseFloat(price) || 3490,
     productLink: productLink.trim(),
     targetArea: filterArea,
@@ -227,7 +227,7 @@ export const ProductBroadcastModal: React.FC<ProductBroadcastModalProps> = ({
             <div className="grid grid-cols-2 gap-2">
               <div>
                 <label className="block font-bold text-slate-700 dark:text-slate-300 mb-1">
-                  Wholesale Price ({profile.currencySymbol})
+                  Super Best Price ({profile.currencySymbol})
                 </label>
                 <input
                   type="number"
@@ -264,7 +264,7 @@ export const ProductBroadcastModal: React.FC<ProductBroadcastModalProps> = ({
               <input
                 type="url"
                 required
-                placeholder="https://100dagar.pk/products/item-link"
+                placeholder="https://madinamarket.pk/products/item-link"
                 value={productLink}
                 onChange={(e) => setProductLink(e.target.value)}
                 className="w-full px-3 py-1.5 font-mono text-[11px] rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white"

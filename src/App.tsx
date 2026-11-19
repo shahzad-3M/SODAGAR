@@ -77,10 +77,14 @@ import {
   subscribeToServerSync,
   setSessionToken,
   apiSubmitCheckoutOrder,
+  apiUpdateCODOrderStatus,
+  apiAuditAndRepairOrders,
+  getCartItems,
+  saveCartItems,
   getMonthlyExpenses,
   saveMonthlyExpenses,
 } from './utils/storage';
-import { isProductPurchaseBlocked } from './utils/locationCategoryHelpers';
+import { isProductPurchaseBlocked, normalizeTextKey } from './utils/locationCategoryHelpers';
 import {
   buildCustomerPaymentReminderMessage,
   buildSaleInvoiceMessage,
@@ -171,6 +175,13 @@ export default function App() {
       return null;
     }
   });
+  const [initialAddToCartParam, setInitialAddToCartParam] = useState<string | null>(() => {
+    try {
+      return new URLSearchParams(window.location.search).get('add_to_cart');
+    } catch {
+      return null;
+    }
+  });
   const [activeRole, setActiveRole] = useState<UserRole>(getActiveRole);
   const [currentUser, setCurrentUser] = useState<AppUser>(getCurrentUser);
   const [isRoleModalOpen, setIsRoleModalOpen] = useState(false);
@@ -179,9 +190,13 @@ export default function App() {
     setIsRoleModalOpen(true);
   };
 
-  // POS / Sale Cart State
-  const [cart, setCart] = useState<CartItem[]>([]);
+  // POS / Sale Cart State (persisted per browser session so reloads / external redirects never drop items)
+  const [cart, setCart] = useState<CartItem[]>(getCartItems);
   const [isCheckoutOpen, setIsCheckoutOpen] = useState(false);
+
+  useEffect(() => {
+    saveCartItems(cart);
+  }, [cart]);
 
   // Navigation & Filter States
   const [currentTab, setCurrentTab] = useState<string>('store'); // Default to Store & POS Catalog matching screenshot!
@@ -425,7 +440,7 @@ export default function App() {
   };
 
   // CART HANDLERS
-  const handleAddToCart = (product: ProductItem, qty: number = 1, selectedSize?: string) => {
+  const handleAddToCart = useCallback((product: ProductItem, qty: number = 1, selectedSize?: string) => {
     if (isProductPurchaseBlocked(product)) {
       pushToast(
         `"${product.name}" is in Upcoming Viral Products | Coming Soon and cannot be added to cart until physical arrival is confirmed.`,
@@ -433,67 +448,124 @@ export default function App() {
       );
       return;
     }
+    const availableStock = Number(product.stockQty ?? 0);
+    if (availableStock <= 0) {
+      pushToast(`"${product.name}" is currently out of stock and cannot be added to cart.`, 'error');
+      return;
+    }
+    const unitPrice = Number(product.ourPrice ?? 0);
+    if (!Number.isFinite(unitPrice) || unitPrice <= 0) {
+      pushToast(`"${product.name}" does not have a valid selling price configured.`, 'error');
+      return;
+    }
+    const resolvedQty = Math.max(1, Math.min(availableStock, Math.round(qty || 1)));
     const resolvedSize = selectedSize || product.selectedSize || '';
     const productWithSize = resolvedSize ? { ...product, selectedSize: resolvedSize } : product;
-    const existing = cart.find(
-      (it) =>
-        it.product.id === product.id &&
-        (it.product.selectedSize || '') === resolvedSize &&
-        it.unitPrice === product.ourPrice
-    );
-    const unitSavings = Math.max(0, product.marketPrice - product.ourPrice);
+    const unitSavings = Math.max(0, Number(product.marketPrice || unitPrice) - unitPrice);
 
-    if (existing) {
-      const updatedQty = existing.quantity + qty;
-      const updated = cart.map((it) =>
-        it.product.id === product.id &&
-        (it.product.selectedSize || '') === resolvedSize &&
-        it.unitPrice === product.ourPrice
-          ? {
-              ...it,
-              quantity: updatedQty,
-              totalAmount: it.unitPrice * updatedQty,
-              totalSavings: unitSavings * updatedQty,
-            }
-          : it
+    setCart((prevCart) => {
+      const existing = prevCart.find(
+        (it) =>
+          it.product.id === product.id &&
+          (it.product.selectedSize || '') === resolvedSize &&
+          it.unitPrice === unitPrice
       );
-      setCart(updated);
-    } else {
+      if (existing) {
+        const updatedQty = Math.min(availableStock, existing.quantity + resolvedQty);
+        return prevCart.map((it) =>
+          it.product.id === product.id &&
+          (it.product.selectedSize || '') === resolvedSize &&
+          it.unitPrice === unitPrice
+            ? {
+                ...it,
+                quantity: updatedQty,
+                totalAmount: it.unitPrice * updatedQty,
+                totalSavings: unitSavings * updatedQty,
+              }
+            : it
+        );
+      }
       const newItem: CartItem = {
         product: productWithSize,
-        quantity: qty,
-        unitPrice: product.ourPrice,
-        marketPrice: product.marketPrice,
+        quantity: resolvedQty,
+        unitPrice,
+        marketPrice: Math.max(unitPrice, Number(product.marketPrice || unitPrice)),
         unitSavings,
-        totalAmount: product.ourPrice * qty,
-        totalSavings: unitSavings * qty,
+        totalAmount: unitPrice * resolvedQty,
+        totalSavings: unitSavings * resolvedQty,
       };
-      setCart([...cart, newItem]);
-    }
-  };
+      return [...prevCart, newItem];
+    });
+    pushToast(
+      `Added "${product.name}"${resolvedSize ? ` (${resolvedSize})` : ''} to cart.`,
+      'success'
+    );
+  }, [pushToast]);
 
-  const handleUpdateCartQty = (productId: string, qty: number) => {
-    const targetIdx = cart.findIndex((it) => it.product.id === productId);
+  // Support deep-link ?add_to_cart=<id|sku|slug> from website links (e.g. www.madinamarket.pk)
+  useEffect(() => {
+    if (!initialAddToCartParam || products.length === 0) return;
+    const key = normalizeTextKey(initialAddToCartParam);
+    const matched = products.find((p) => {
+      if (p.id === initialAddToCartParam || normalizeTextKey(p.id) === key) return true;
+      if (p.sku && normalizeTextKey(p.sku) === key) return true;
+      const slugMatch = (p.websiteUrl || p.sourceUrl || '').toLowerCase().includes(initialAddToCartParam.toLowerCase());
+      return Boolean(slugMatch);
+    });
+    setInitialAddToCartParam(null);
+    try {
+      const url = new URL(window.location.href);
+      if (url.searchParams.has('add_to_cart')) {
+        url.searchParams.delete('add_to_cart');
+        window.history.replaceState({}, '', url.pathname + url.search + url.hash);
+      }
+    } catch {
+      // ignore history errors
+    }
+    if (matched) {
+      handleAddToCart(matched, 1);
+      setIsCheckoutOpen(true);
+    } else {
+      pushToast(`Product "${initialAddToCartParam}" was not found in the local catalog.`, 'warning');
+    }
+  }, [initialAddToCartParam, products, handleAddToCart, pushToast]);
+
+  const handleUpdateCartQty = (productId: string, qty: number, selectedSize?: string) => {
+    const targetIdx = cart.findIndex(
+      (it) =>
+        it.product.id === productId &&
+        (selectedSize === undefined || (it.product.selectedSize || '') === (selectedSize || ''))
+    );
     if (targetIdx === -1) return;
     if (qty <= 0) {
       setCart(cart.filter((_, idx) => idx !== targetIdx));
       return;
     }
+    const maxStock = Number(cart[targetIdx].product.stockQty ?? 0);
+    const cappedQty = maxStock > 0 ? Math.min(maxStock, qty) : qty;
     const updated = cart.map((it, idx) =>
       idx === targetIdx
         ? {
             ...it,
-            quantity: qty,
-            totalAmount: it.unitPrice * qty,
-            totalSavings: it.unitSavings * qty,
+            quantity: cappedQty,
+            totalAmount: it.unitPrice * cappedQty,
+            totalSavings: it.unitSavings * cappedQty,
           }
         : it
     );
     setCart(updated);
   };
 
-  const handleRemoveFromCart = (productId: string) => {
-    setCart(cart.filter((it) => it.product.id !== productId));
+  const handleRemoveFromCart = (productId: string, selectedSize?: string) => {
+    if (selectedSize === undefined) {
+      setCart(cart.filter((it) => it.product.id !== productId));
+    } else {
+      setCart(
+        cart.filter(
+          (it) => !(it.product.id === productId && (it.product.selectedSize || '') === (selectedSize || ''))
+        )
+      );
+    }
   };
 
   const handleClearCart = () => {
@@ -501,13 +573,19 @@ export default function App() {
   };
 
   // COMPLETE SALE (Full Payment or Cash on Delivery with Basic Checkout Form)
-  const handleCompleteSale = async (saleData: CheckoutSalePayload) => {
+  const handleCompleteSale = async (
+    saleData: CheckoutSalePayload
+  ): Promise<{ ok: boolean; error?: string }> => {
+    if (cart.length === 0) {
+      const msg = 'Cart is empty. Please add at least one product before placing an order.';
+      pushToast(msg, 'error');
+      return { ok: false, error: msg };
+    }
     if (cart.some((it) => isProductPurchaseBlocked(it.product))) {
-      pushToast(
-        'Checkout blocked: Upcoming / Coming Soon items cannot be ordered until physical arrival is confirmed.',
-        'error'
-      );
-      return;
+      const msg =
+        'Checkout blocked: Upcoming / Coming Soon items cannot be ordered until physical arrival is confirmed.';
+      pushToast(msg, 'error');
+      return { ok: false, error: msg };
     }
 
     const cleanPhone = saleData.buyerDetails.phone.replace(/\D/g, '');
@@ -702,8 +780,9 @@ export default function App() {
     });
 
     if (!checkoutResult.ok) {
-      pushToast(checkoutResult.error || 'Checkout validation failed.', 'error');
-      return;
+      const errMsg = checkoutResult.error || 'Checkout validation failed.';
+      pushToast(errMsg, 'error');
+      return { ok: false, error: errMsg };
     }
 
     handleRefreshAllData();
@@ -742,14 +821,24 @@ export default function App() {
       `کامیابی سے بل #${invoiceNumber} بنام ${customer?.name || 'کسٹمر'} درج کر لیا گیا! Customer savings: ${profile.currencySymbol}${totalSavings.toLocaleString('en-PK')}. Stock updated.`,
       'success'
     );
+    return { ok: true };
   };
 
   // COD ORDERS LOGISTICS HANDLERS
-  const handleUpdateCODStatus = (
+  const handleUpdateCODStatus = async (
     orderId: string,
     newStatus: CODOrderStatus,
-    details?: { courierPartner?: any; trackingNumber?: string }
+    details?: { courierPartner?: CODOrder['courierPartner']; trackingNumber?: string }
   ) => {
+    const serverRes = await apiUpdateCODOrderStatus(orderId, newStatus, details);
+    if (serverRes.ok) {
+      handleRefreshAllData();
+      return;
+    }
+    if (serverRes.error && !serverRes.error.toLowerCase().includes('network')) {
+      pushToast(serverRes.error, 'error');
+    }
+
     let updatedProducts = [...products];
     let updatedTxs = [...transactions];
     let updatedResellers = [...resellers];
@@ -769,8 +858,6 @@ export default function App() {
           returnedAt: newStatus === 'returned' ? new Date().toISOString() : ord.returnedAt,
         };
 
-        // Auto-calculation on status = delivered:
-        // Record payment in ledger and calculate net cash
         if (newStatus === 'delivered' && wasNotDelivered) {
           const netCash = ord.totalAmount - ord.deliveryFee;
           const cleanOrdPhone = (ord.phone || '').replace(/\D/g, '');
@@ -786,12 +873,12 @@ export default function App() {
             amount: ord.totalAmount,
             date: todayStr,
             paymentMode: 'cod',
+            invoiceNumber: ord.orderNumber,
             notes: `COD Settlement #${ord.orderNumber} (${ord.courierPartner}) - Net Cash Rs. ${netCash.toLocaleString('en-PK')}`,
             createdAt: new Date().toISOString(),
           };
           updatedTxs = [debitTx, ...updatedTxs];
 
-          // Trigger reseller commission strictly on PAID amount (Rs. 30 per Rs. 1000)
           if (ord.resellerCode) {
             const earned = Math.floor(ord.subtotal / 1000) * 30;
             updatedResellers = updatedResellers.map((r) =>
@@ -808,11 +895,9 @@ export default function App() {
           }
         }
 
-        // Auto-calculation on status = returned:
-        // Restore inventory stock automatically!
         if (newStatus === 'returned' && wasNotReturned) {
           updatedProducts = updatedProducts.map((p) => {
-            const ordItem = ord.items.find((it) => it.productId === p.id);
+            const ordItem = (ord.items || []).find((it) => it.productId === p.id);
             if (ordItem) {
               return {
                 ...p,
@@ -846,14 +931,93 @@ export default function App() {
     }
   };
 
+  const handleAuditRepairOrders = async () => {
+    const res = await apiAuditAndRepairOrders();
+    if (!res.ok) {
+      pushToast(res.error || 'Failed to audit and repair backend order history.', 'error');
+      return;
+    }
+    handleRefreshAllData();
+    pushToast(res.summary || 'Backend order history audited & cleaned.', 'success');
+  };
+
   const handleAddNewCODOrder = (order: CODOrder) => {
-    const updated = [order, ...codOrders];
+    const cleanPhone = (order.phone || '').replace(/\D/g, '');
+    let activeCustomers = [...customers];
+    let matchedCustomer =
+      (order.customerId && activeCustomers.find((c) => c.id === order.customerId)) ||
+      (cleanPhone && activeCustomers.find((c) => c.phone.replace(/\D/g, '') === cleanPhone)) ||
+      undefined;
+
+    if (!matchedCustomer && order.customerName) {
+      matchedCustomer = {
+        id: `cust_ord_${Date.now()}`,
+        name: order.customerName,
+        phone: order.phone,
+        city: order.city || 'Muzaffarabad',
+        area: order.area,
+        mohalla: order.mohalla,
+        landmark: order.landmark,
+        address: order.address || order.city || 'Pakistan',
+        customerType: 'individual',
+        balance: order.totalAmount,
+        totalPurchases: order.totalAmount,
+        creditLimit: 5000,
+        paymentTermsDays: 7,
+        status: 'active',
+        pin: getDefaultPinForPhone(order.phone || '03000000000'),
+        createdAt: todayStr,
+      };
+      activeCustomers = [matchedCustomer, ...activeCustomers];
+      setCustomers(activeCustomers);
+      saveCustomers(activeCustomers);
+    }
+
+    const linkedOrder: CODOrder = {
+      ...order,
+      customerId: matchedCustomer?.id || order.customerId,
+    };
+
+    const updated = [linkedOrder, ...codOrders];
     setCODOrders(updated);
     saveCODOrders(updated);
 
+    const linkedTx: Transaction = {
+      id: `tx_link_${linkedOrder.id}`,
+      customerId: matchedCustomer?.id || '',
+      type: 'credit',
+      amount: linkedOrder.totalAmount,
+      paidAmount: 0,
+      dueBalance: linkedOrder.totalAmount,
+      saleType: 'cod',
+      date: todayStr,
+      dueDate: todayStr,
+      paymentTermsDays: 0,
+      invoiceNumber: linkedOrder.orderNumber,
+      notes: `COD Order #${linkedOrder.orderNumber} (${linkedOrder.city})`,
+      paymentMode: 'cod',
+      items: linkedOrder.items,
+      totalSavings: (linkedOrder.items || []).reduce((acc, it) => acc + Number(it.customerSavings || 0), 0),
+      status: 'pending',
+      responsibleStaff: currentUser?.name || 'Admin / Logistics',
+      auditTrail: [
+        {
+          id: `aud_cod_${Date.now()}`,
+          timestamp: new Date().toISOString(),
+          action: 'created',
+          newStatus: 'pending',
+          newAmount: linkedOrder.totalAmount,
+          changedBy: currentUser?.name || 'Admin / Logistics',
+          notes: `COD parcel #${linkedOrder.orderNumber} created via logistics desk`,
+        },
+      ],
+      createdAt: linkedOrder.createdAt,
+    };
+    syncTransactionsAndBalances([linkedTx, ...transactions], activeCustomers);
+
     // Decrement stock for the items
     const updatedProducts = products.map((p) => {
-      const it = order.items.find((item) => item.productId === p.id);
+      const it = (linkedOrder.items || []).find((item) => item.productId === p.id);
       if (it) {
         return { ...p, stockQty: Math.max(0, p.stockQty - it.quantity) };
       }
@@ -1728,6 +1892,8 @@ export default function App() {
             products={products}
             customers={customers}
             profile={profile}
+            userRole={activeRole}
+            onAuditRepairOrders={handleAuditRepairOrders}
             onUpdateOrderStatus={handleUpdateCODStatus}
             onAddNewCODOrder={handleAddNewCODOrder}
           />
@@ -1957,7 +2123,7 @@ export default function App() {
               const product: ProductBroadcast = {
                 id: `prod_resend_${Date.now()}`,
                 productName: camp.productName,
-                productLink: camp.productLink || 'https://100dagar.pk',
+                productLink: camp.productLink || 'https://madinamarket.pk',
                 description: camp.messageText,
                 createdAt: new Date().toISOString().split('T')[0],
               };
@@ -2063,6 +2229,7 @@ export default function App() {
             currentUser={currentUser}
             onOpenInvoiceModal={openInvoiceModal}
             onUpdateTransactionStatus={handleUpdateTransactionStatus}
+            onAuditRepairOrders={handleAuditRepairOrders}
           />
         )}
 
@@ -2124,23 +2291,24 @@ export default function App() {
       </footer>
 
       {/* POS CHECKOUT MODAL (Credit Sale strictly gated by Seller Role Authorization) */}
-      {cart.length > 0 && (
-        <CheckoutModal
-          isOpen={isCheckoutOpen}
-          onClose={() => setIsCheckoutOpen(false)}
-          cart={cart}
-          customers={customers}
-          profile={profile}
-          isCustomerView={viewMode === 'customer' || activeRole === 'customer'}
-          isAdmin={activeRole === 'admin' || activeRole === 'super_admin'}
-          currentUser={currentUser}
-          onCompleteSale={handleCompleteSale}
-          onSaveProfile={(updated) => {
-            setProfile(updated);
-            saveBusinessProfile(updated);
-          }}
-        />
-      )}
+      <CheckoutModal
+        isOpen={isCheckoutOpen}
+        onClose={() => setIsCheckoutOpen(false)}
+        cart={cart}
+        customers={customers}
+        profile={profile}
+        isCustomerView={viewMode === 'customer' || activeRole === 'customer'}
+        isAdmin={activeRole === 'admin' || activeRole === 'super_admin'}
+        currentUser={currentUser}
+        onCompleteSale={handleCompleteSale}
+        onUpdateCartQty={handleUpdateCartQty}
+        onRemoveFromCart={handleRemoveFromCart}
+        onClearCart={handleClearCart}
+        onSaveProfile={(updated) => {
+          setProfile(updated);
+          saveBusinessProfile(updated);
+        }}
+      />
 
       {/* LOGIN & USER ROLE SWITCHER MODAL */}
       <LoginRoleModal

@@ -494,6 +494,97 @@ export function resolveDeliveryCharge(
   };
 }
 
+export interface ResolvedProductOrCartDelivery {
+  charge: number;
+  source: 'free' | 'product_custom' | 'area' | 'city' | 'city_center_default' | 'standard_default';
+  label: string;
+  isFree: boolean;
+}
+
+export function resolveProductOrCartDeliveryCharge(
+  cities: DeliveryCityConfig[],
+  productOrCart: Partial<ProductItem> | Array<{ product: Partial<ProductItem>; quantity?: number }> | null | undefined,
+  cityName?: string,
+  areaName?: string,
+  cityCenterDefault = DEFAULT_CITY_CENTER_DELIVERY_CHARGE
+): ResolvedProductOrCartDelivery {
+  const base = resolveDeliveryCharge(cities, cityName, areaName, cityCenterDefault);
+
+  if (!productOrCart) {
+    return { ...base, isFree: base.charge === 0 };
+  }
+
+  if (Array.isArray(productOrCart)) {
+    if (productOrCart.length === 0) {
+      return { ...base, isFree: base.charge === 0 };
+    }
+    const entries = productOrCart.map((it) => it.product || {});
+    const allFree = entries.every((p) => p.deliveryFeeType === 'free');
+    if (allFree) {
+      return {
+        charge: 0,
+        source: 'free',
+        label: 'Free Delivery Included',
+        isFree: true,
+      };
+    }
+    const customCharges = entries
+      .filter((p) => p.deliveryFeeType === 'custom')
+      .map((p) => parseValidDeliveryCharge(p.customDeliveryCharge))
+      .filter((n): n is number => n !== undefined);
+    const hasDefaultItems = entries.some(
+      (p) => !p.deliveryFeeType || p.deliveryFeeType === 'default'
+    );
+
+    if (customCharges.length > 0) {
+      const maxCustom = Math.max(...customCharges);
+      if (!hasDefaultItems) {
+        return {
+          charge: maxCustom,
+          source: maxCustom === 0 ? 'free' : 'product_custom',
+          label:
+            maxCustom === 0
+              ? 'Free Delivery Included'
+              : `Product Delivery Rate (${cityName || 'Nationwide'})`,
+          isFree: maxCustom === 0,
+        };
+      }
+      if (maxCustom > base.charge) {
+        return {
+          charge: maxCustom,
+          source: 'product_custom',
+          label: `${base.label} (Product Rate)`,
+          isFree: false,
+        };
+      }
+    }
+    return { ...base, isFree: base.charge === 0 };
+  }
+
+  if (productOrCart.deliveryFeeType === 'free') {
+    return {
+      charge: 0,
+      source: 'free',
+      label: 'Free Delivery (Product Offer)',
+      isFree: true,
+    };
+  }
+
+  if (productOrCart.deliveryFeeType === 'custom') {
+    const custom = parseValidDeliveryCharge(productOrCart.customDeliveryCharge);
+    if (custom !== undefined) {
+      return {
+        charge: custom,
+        source: custom === 0 ? 'free' : 'product_custom',
+        label: custom === 0 ? 'Free Delivery' : `Fixed Product Delivery (${cityName || 'Nationwide'})`,
+        isFree: custom === 0,
+      };
+    }
+  }
+
+  return { ...base, isFree: base.charge === 0 };
+}
+
 export interface ProductDeliveryMeta {
   deliveryType: 'express' | 'standard';
   isExpress: boolean;
@@ -518,10 +609,10 @@ export function getProductDeliveryMeta(product?: Partial<ProductItem> | null): P
   return {
     deliveryType: 'standard',
     isExpress: false,
-    badgeLabel: 'Dropship · 3–6 Days Promised',
-    etaText: 'Dropship 3 to 6 working days promised delivery across all provinces, Kashmir, cities, sub-cities & villages',
+    badgeLabel: 'Standard · 3–6 Days Promised',
+    etaText: 'Standard delivery in 3 to 6 working days across all provinces, Kashmir, cities, sub-cities & villages',
     etaShort: '3–6 Days Promised',
-    urduLabel: 'ڈراپ شپ 3 سے 6 ورکنگ ڈیز یقینی ڈیلیوری (تمام صوبے، کشمیر و دیہات)',
+    urduLabel: 'معیاری 3 سے 6 ورکنگ ڈیز یقینی ڈیلیوری (تمام صوبے، کشمیر و دیہات)',
   };
 }
 

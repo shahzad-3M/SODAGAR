@@ -103,6 +103,7 @@ export interface ProductVariation {
 }
 
 export type DeliverySpeedCategory = 'express' | 'standard';
+export type ProductDeliveryFeeType = 'default' | 'free' | 'custom';
 
 export interface ProductItem {
   id: string;
@@ -113,6 +114,8 @@ export interface ProductItem {
   subcategoryId?: string;
   childSubcategoryId?: string;
   deliveryType?: DeliverySpeedCategory; // 'express' = Instant delivery available; 'standard' (default) = 3 to 6 working days depending on logistics
+  deliveryFeeType?: ProductDeliveryFeeType; // 'default' = city/area delivery fee; 'free' = Rs. 0 free delivery; 'custom' = fixed per-product delivery charge
+  customDeliveryCharge?: number; // Applied when deliveryFeeType === 'custom'
   isUpcoming?: boolean; // When true: informational / viral product, purchasing disabled ("Coming Soon" badge)
   upcomingStatus?: 'coming_soon' | 'available';
   expectedArrivalDate?: string;
@@ -295,6 +298,7 @@ export interface BusinessProfile {
   tagline: string;
   phone: string;
   email: string;
+  website?: string;
   address: string;
   ntnNumber: string;
   paymentChannels: PakistaniPaymentChannels;

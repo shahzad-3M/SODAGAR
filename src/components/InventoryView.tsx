@@ -28,7 +28,7 @@ import {
   Image as ImageIcon,
   Upload,
 } from 'lucide-react';
-import { AppUser, BusinessProfile, CategoryRecord, DeliverySpeedCategory, Investor, ProductItem, ProductVariation } from '../types';
+import { AppUser, BusinessProfile, CategoryRecord, DeliverySpeedCategory, Investor, ProductDeliveryFeeType, ProductItem, ProductVariation } from '../types';
 import {
   getCategories,
   addCategory,
@@ -97,6 +97,8 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
   const [formIsUpcoming, setFormIsUpcoming] = useState(false);
   const [formExpectedArrivalDate, setFormExpectedArrivalDate] = useState('');
   const [formDeliveryType, setFormDeliveryType] = useState<DeliverySpeedCategory>('standard');
+  const [formDeliveryFeeType, setFormDeliveryFeeType] = useState<ProductDeliveryFeeType>('default');
+  const [formCustomDeliveryCharge, setFormCustomDeliveryCharge] = useState('');
   const [formDetails, setFormDetails] = useState('');
   const [formSku, setFormSku] = useState('');
   const [formCostPrice, setFormCostPrice] = useState('');
@@ -134,6 +136,8 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
   const [arrivalSubCatId, setArrivalSubCatId] = useState<string | undefined>(undefined);
   const [arrivalChildCatId, setArrivalChildCatId] = useState<string | undefined>(undefined);
   const [arrivalDeliveryType, setArrivalDeliveryType] = useState<DeliverySpeedCategory>('standard');
+  const [arrivalDeliveryFeeType, setArrivalDeliveryFeeType] = useState<ProductDeliveryFeeType>('default');
+  const [arrivalCustomDeliveryCharge, setArrivalCustomDeliveryCharge] = useState('');
   const [arrivalOurPrice, setArrivalOurPrice] = useState('');
   const [arrivalMarketPrice, setArrivalMarketPrice] = useState('');
   const [arrivalCostPrice, setArrivalCostPrice] = useState('');
@@ -231,6 +235,10 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
       setFormIsUpcoming(isProductPurchaseBlocked(prod));
       setFormExpectedArrivalDate(prod.expectedArrivalDate || '');
       setFormDeliveryType(prod.deliveryType === 'express' ? 'express' : 'standard');
+      setFormDeliveryFeeType(prod.deliveryFeeType || 'default');
+      setFormCustomDeliveryCharge(
+        typeof prod.customDeliveryCharge === 'number' ? String(prod.customDeliveryCharge) : ''
+      );
       setFormDetails(prod.details || prod.description || '');
       setFormSku(prod.sku);
       setFormCostPrice(String(prod.costPrice));
@@ -274,6 +282,8 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
       setFormIsUpcoming(false);
       setFormExpectedArrivalDate('');
       setFormDeliveryType('standard');
+      setFormDeliveryFeeType('default');
+      setFormCustomDeliveryCharge('');
       setFormDetails('');
       setFormSku(`SKU-${Math.floor(1000 + Math.random() * 9000)}`);
       setFormCostPrice('');
@@ -309,6 +319,10 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
     setArrivalSubCatId(undefined);
     setArrivalChildCatId(undefined);
     setArrivalDeliveryType(prod.deliveryType === 'express' ? 'express' : 'standard');
+    setArrivalDeliveryFeeType(prod.deliveryFeeType || 'default');
+    setArrivalCustomDeliveryCharge(
+      typeof prod.customDeliveryCharge === 'number' ? String(prod.customDeliveryCharge) : ''
+    );
     setArrivalOurPrice(String(prod.ourPrice || ''));
     setArrivalMarketPrice(String(prod.marketPrice || ''));
     setArrivalCostPrice(String(prod.costPrice || ''));
@@ -346,6 +360,11 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
       subcategoryId: arrivalSubCatId,
       childSubcategoryId: arrivalChildCatId,
       deliveryType: arrivalDeliveryType,
+      deliveryFeeType: arrivalDeliveryFeeType,
+      customDeliveryCharge:
+        arrivalDeliveryFeeType === 'custom'
+          ? Math.max(0, Math.round(parseFloat(arrivalCustomDeliveryCharge) || 0))
+          : undefined,
       ourPrice: ourP,
       marketPrice: parseFloat(arrivalMarketPrice) || ourP,
       costPrice: parseFloat(arrivalCostPrice) || 0,
@@ -466,6 +485,11 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
       subcategoryId: isUpcomingItem ? undefined : formSubCatId || undefined,
       childSubcategoryId: isUpcomingItem ? undefined : formChildCatId || undefined,
       deliveryType: formDeliveryType,
+      deliveryFeeType: formDeliveryFeeType,
+      customDeliveryCharge:
+        formDeliveryFeeType === 'custom'
+          ? Math.max(0, Math.round(parseFloat(formCustomDeliveryCharge) || 0))
+          : undefined,
       sku: formSku.trim() || `SKU-${Date.now()}`,
       costPrice: cost,
       marketPrice: market,
@@ -1173,6 +1197,66 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
                     </p>
                   </button>
                 </div>
+
+                {/* Product Delivery Charge Policy: Standard City/Area Fee vs Free Delivery vs Custom Rs. */}
+                <div className="pt-2.5 border-t border-slate-200 dark:border-slate-700 space-y-2">
+                  <span className="text-[11px] font-bold text-slate-700 dark:text-slate-300 block">
+                    Product Delivery Charges (اس پروڈکٹ کے ڈیلیوری چارجز)
+                  </span>
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setFormDeliveryFeeType('default')}
+                      className={`p-2 rounded-lg border text-left text-[11px] cursor-pointer transition-all ${
+                        formDeliveryFeeType === 'default'
+                          ? 'border-amber-500 bg-amber-50 dark:bg-amber-950/40 font-bold text-slate-900 dark:text-white'
+                          : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-600 dark:text-slate-300'
+                      }`}
+                    >
+                      City / Area Rate
+                      <span className="block text-[9px] font-normal text-slate-500">Uses customer city/area fee</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setFormDeliveryFeeType('free')}
+                      className={`p-2 rounded-lg border text-left text-[11px] cursor-pointer transition-all ${
+                        formDeliveryFeeType === 'free'
+                          ? 'border-emerald-500 bg-emerald-50 dark:bg-emerald-950/40 font-bold text-emerald-800 dark:text-emerald-200'
+                          : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-600 dark:text-slate-300'
+                      }`}
+                    >
+                      Free Delivery (Rs. 0)
+                      <span className="block text-[9px] font-normal text-slate-500">Customer pays no delivery fee</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setFormDeliveryFeeType('custom')}
+                      className={`p-2 rounded-lg border text-left text-[11px] cursor-pointer transition-all ${
+                        formDeliveryFeeType === 'custom'
+                          ? 'border-blue-500 bg-blue-50 dark:bg-blue-950/40 font-bold text-blue-800 dark:text-blue-200'
+                          : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-600 dark:text-slate-300'
+                      }`}
+                    >
+                      Custom Charge (Rs.)
+                      <span className="block text-[9px] font-normal text-slate-500">Fixed delivery rate for item</span>
+                    </button>
+                  </div>
+                  {formDeliveryFeeType === 'custom' && (
+                    <div className="flex items-center gap-2 pt-1">
+                      <span className="text-[11px] font-bold text-slate-600 dark:text-slate-300">
+                        Delivery Charge ({profile.currencySymbol}):
+                      </span>
+                      <input
+                        type="number"
+                        min={0}
+                        value={formCustomDeliveryCharge}
+                        onChange={(e) => setFormCustomDeliveryCharge(e.target.value)}
+                        placeholder="e.g. 200"
+                        className="w-32 px-2.5 py-1 rounded-lg border border-blue-400 dark:border-blue-700 bg-white dark:bg-slate-900 font-mono font-bold text-slate-900 dark:text-white"
+                      />
+                    </div>
+                  )}
+                </div>
               </div>
 
               {/* Product Media Gallery & Cached Images */}
@@ -1534,7 +1618,7 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
                   type="url"
                   value={formWebsiteUrl}
                   onChange={(e) => setFormWebsiteUrl(e.target.value)}
-                  placeholder="https://100dagar.pk/products/5-in-1-hot-air-styler"
+                  placeholder="https://madinamarket.pk/products/5-in-1-hot-air-styler"
                   className="w-full px-3 py-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white font-mono focus:ring-2 focus:ring-blue-400 focus:outline-hidden"
                 />
               </div>
@@ -1700,6 +1784,58 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
                     3 to 6 working days depending on logistics
                   </span>
                 </button>
+              </div>
+
+              {/* Product Delivery Charges Option upon Arrival */}
+              <div className="p-2.5 rounded-xl bg-slate-50 dark:bg-slate-850 border border-slate-200 dark:border-slate-800 space-y-2">
+                <span className="font-bold text-slate-700 dark:text-slate-300 block">
+                  Product Delivery Charges (Free Delivery or Custom Fee)
+                </span>
+                <div className="grid grid-cols-3 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setArrivalDeliveryFeeType('default')}
+                    className={`px-2 py-1.5 rounded-lg border text-[11px] font-semibold cursor-pointer ${
+                      arrivalDeliveryFeeType === 'default'
+                        ? 'border-amber-500 bg-amber-50 dark:bg-amber-950/40 text-slate-900 dark:text-white'
+                        : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-300'
+                    }`}
+                  >
+                    City / Area Rate
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setArrivalDeliveryFeeType('free')}
+                    className={`px-2 py-1.5 rounded-lg border text-[11px] font-semibold cursor-pointer ${
+                      arrivalDeliveryFeeType === 'free'
+                        ? 'border-emerald-500 bg-emerald-50 dark:bg-emerald-950/40 text-emerald-800 dark:text-emerald-200'
+                        : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-300'
+                    }`}
+                  >
+                    Free Delivery (Rs. 0)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setArrivalDeliveryFeeType('custom')}
+                    className={`px-2 py-1.5 rounded-lg border text-[11px] font-semibold cursor-pointer ${
+                      arrivalDeliveryFeeType === 'custom'
+                        ? 'border-blue-500 bg-blue-50 dark:bg-blue-950/40 text-blue-800 dark:text-blue-200'
+                        : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-300'
+                    }`}
+                  >
+                    Custom Rs. Charge
+                  </button>
+                </div>
+                {arrivalDeliveryFeeType === 'custom' && (
+                  <input
+                    type="number"
+                    min={0}
+                    value={arrivalCustomDeliveryCharge}
+                    onChange={(e) => setArrivalCustomDeliveryCharge(e.target.value)}
+                    placeholder="Enter fixed delivery charge Rs."
+                    className="w-48 px-2.5 py-1 rounded-lg border border-blue-400 dark:border-blue-700 bg-white dark:bg-slate-800 font-mono"
+                  />
+                )}
               </div>
 
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 bg-slate-50 dark:bg-slate-850 p-3 rounded-xl border border-slate-200 dark:border-slate-800">

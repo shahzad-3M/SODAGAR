@@ -605,10 +605,10 @@ export const CustomerPortalView: React.FC<CustomerPortalViewProps> = ({
         <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-5 sm:p-6 space-y-5 shadow-xs">
           <div>
             <h3 className="text-sm font-black text-slate-900 dark:text-white uppercase tracking-wider">
-              Personal Wholesale Savings Report (ذاتی بچت کا خلاصہ)
+              Personal Savings Report (ذاتی بچت کا خلاصہ)
             </h3>
             <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-              Comparison between regular retail market prices and your wholesale rates on 100DAGAR.
+              Comparison between regular retail market prices and your Super Best rates on Madina Market.
             </p>
           </div>
 

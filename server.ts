@@ -24,6 +24,7 @@ import {
   computeCategoryLevel,
   getCategoryBreadcrumb,
   getCategoryDescendantIds,
+  getProductDeliveryMeta,
   inferProvinceForCity,
   isMuzaffarabadCity,
   isProductPurchaseBlocked,
@@ -31,11 +32,13 @@ import {
   isUserAuthorizedForStockTransfer,
   normalizeTextKey,
   normalizeUpcomingCategoryRecord,
+  resolveExpressAreaAvailability,
   slugifyId,
   UPCOMING_CATEGORY_ID,
   UPCOMING_CATEGORY_NAME,
 } from './src/utils/locationCategoryHelpers';
 import {
+  auditAndRepairOrderHistory,
   createVerifiedBackup,
   getAllCategoriesFromDb,
   getAllCitiesFromDb,
@@ -458,6 +461,8 @@ async function startServer() {
       details,
       badgeText,
       deliveryType,
+      deliveryFeeType,
+      customDeliveryCharge,
     } = (req.body || {}) as {
       parentCategoryId?: string;
       subcategoryId?: string;
@@ -470,6 +475,8 @@ async function startServer() {
       details?: string;
       badgeText?: string;
       deliveryType?: 'express' | 'standard';
+      deliveryFeeType?: 'default' | 'free' | 'custom';
+      customDeliveryCharge?: number;
     };
 
     const allCats = getAllCategoriesFromDb(db);
@@ -494,6 +501,7 @@ async function startServer() {
     const categoryBreadcrumb = getCategoryBreadcrumb(allCats, parentCategoryId, subcategoryId, childSubcategoryId);
     const now = new Date().toISOString();
 
+    const resolvedFeeType = deliveryFeeType || existing.deliveryFeeType || 'default';
     const activatedProduct: ProductItem = {
       ...existing,
       category: categoryBreadcrumb,
@@ -507,6 +515,11 @@ async function startServer() {
       variations: Array.isArray(variations) ? variations : existing.variations,
       details: typeof details === 'string' ? details : existing.details,
       deliveryType: deliveryType === 'express' ? 'express' : deliveryType === 'standard' ? 'standard' : (existing.deliveryType || 'standard'),
+      deliveryFeeType: resolvedFeeType,
+      customDeliveryCharge:
+        resolvedFeeType === 'custom'
+          ? customDeliveryCharge ?? existing.customDeliveryCharge ?? 0
+          : undefined,
       badgeText: badgeText !== undefined ? badgeText : existing.badgeText === 'COMING SOON' ? 'NEW ARRIVAL' : existing.badgeText,
       isUpcoming: false,
       upcomingStatus: 'available',
@@ -1012,6 +1025,31 @@ async function startServer() {
     res.json({ ok: true, cities: profile.deliveryCities, syncVersion: getSyncVersion() });
   });
 
+  app.delete('/api/cities/:id', (req, res) => {
+    const actor = resolveActor(req);
+    if (actor.role !== 'super_admin' && actor.role !== 'admin' && actor.role !== 'manager') {
+      res.status(403).json({ error: 'Unauthorized to remove cities.' });
+      return;
+    }
+    const db = getDb();
+    const id = req.params.id;
+    const cities = getAllCitiesFromDb(db);
+    const target = cities.find((c) => c.id === id || normalizeTextKey(c.name) === normalizeTextKey(id));
+    if (!target || !target.id) {
+      res.status(404).json({ error: 'City not found.' });
+      return;
+    }
+    if (isMuzaffarabadCity(target.name)) {
+      res.status(400).json({ error: 'Muzaffarabad is the default active delivery city and cannot be removed.' });
+      return;
+    }
+    db.prepare('DELETE FROM city_areas WHERE city_id = ?').run(target.id);
+    db.prepare('DELETE FROM cities WHERE id = ?').run(target.id);
+    const profile = syncDeliveryCitiesIntoBusinessProfile(db);
+    broadcastSyncEvent('locations', req.header('x-client-id'));
+    res.json({ ok: true, cities: profile.deliveryCities, syncVersion: getSyncVersion() });
+  });
+
   app.post('/api/cities/:cityId/areas', (req, res) => {
     const actor = resolveActor(req);
     if (actor.role !== 'super_admin' && actor.role !== 'admin' && actor.role !== 'manager') {
@@ -1153,7 +1191,7 @@ async function startServer() {
     res.json({ ok: true, customer: saved, syncVersion: getSyncVersion() });
   });
 
-  // 9. AUTHORITATIVE ORDER CHECKOUT WITH UPCOMING PURCHASE BLOCK
+  // 9. AUTHORITATIVE ORDER CHECKOUT WITH UPCOMING & EXPRESS-ONLY DELIVERY VALIDATION
   app.post('/api/orders/checkout', (req, res) => {
     const db = getDb();
     const {
@@ -1171,24 +1209,47 @@ async function startServer() {
     };
 
     const allProducts = getAllProductsFromDb(db);
-    const requestedItems = items || (transaction?.items || []).map((i) => ({ productId: i.productId || '', quantity: i.quantity }));
+    const requestedItems = (
+      items ||
+      (transaction?.items || []).map((i) => ({ productId: i.productId || '', quantity: i.quantity }))
+    ).filter((it) => it && Number(it.quantity) > 0);
 
+    if (requestedItems.length === 0) {
+      res.status(400).json({ error: 'Cart cannot be empty. Please add at least one product before placing an order.' });
+      return;
+    }
+
+    let hasExpressItem = false;
     for (const item of requestedItems) {
       const prod = allProducts.find((p) => p.id === item.productId);
-      if (prod && isProductPurchaseBlocked(prod)) {
-        res.status(400).json({
-          error: `"${prod.name}" is in "${UPCOMING_CATEGORY_NAME}" (Coming Soon) and cannot be purchased or ordered until an authorized Admin/Stock Manager confirms physical arrival.`,
-        });
-        return;
+      if (prod) {
+        if (isProductPurchaseBlocked(prod)) {
+          res.status(400).json({
+            error: `"${prod.name}" is in "${UPCOMING_CATEGORY_NAME}" (Coming Soon) and cannot be purchased or ordered until an authorized Admin/Stock Manager confirms physical arrival.`,
+          });
+          return;
+        }
+        if (getProductDeliveryMeta(prod).isExpress) {
+          hasExpressItem = true;
+        }
       }
     }
 
-    if (codOrder?.city) {
+    // Standard (3–6 working days) items are open nationwide across all provinces & Azad Kashmir.
+    // Enforce city/sub-city unlock restriction ONLY when the order contains Express items.
+    if (codOrder?.city && hasExpressItem) {
       const cities = getAllCitiesFromDb(db);
-      const matchedCity = cities.find((c) => normalizeTextKey(c.name) === normalizeTextKey(codOrder.city));
-      if (matchedCity && !matchedCity.allowed) {
+      const expressAvail = resolveExpressAreaAvailability(
+        cities,
+        codOrder.city,
+        codOrder.area,
+        true
+      );
+      if (!expressAvail.allowed) {
         res.status(400).json({
-          error: `Delivery to "${codOrder.city}" is currently disabled in delivery settings.`,
+          error:
+            expressAvail.reason ||
+            `Express delivery to "${codOrder.city}${codOrder.area ? ` (${codOrder.area})` : ''}" is currently locked. Please choose an unlocked Express city & sub-city or order Standard items.`,
         });
         return;
       }
@@ -1196,16 +1257,39 @@ async function startServer() {
 
     db.exec('BEGIN IMMEDIATE;');
     try {
+      let savedCustomer: Customer | undefined;
       if (customer) {
-        upsertCustomerRow(db, customer);
+        savedCustomer = upsertCustomerRow(db, {
+          ...customer,
+          balance: Number.isFinite(Number(customer.balance)) ? Number(customer.balance) : 0,
+          totalPurchases: Number.isFinite(Number(customer.totalPurchases)) ? Number(customer.totalPurchases) : 0,
+        });
       }
       if (transaction) {
+        const cleanTx: Transaction = {
+          ...transaction,
+          customerId: transaction.customerId || savedCustomer?.id || '',
+          amount: Math.max(0, Number(transaction.amount || 0)),
+          paidAmount: Math.max(0, Number(transaction.paidAmount || 0)),
+          dueBalance: Math.max(0, Number(transaction.dueBalance ?? 0)),
+          auditTrail: Array.isArray(transaction.auditTrail) ? transaction.auditTrail : [],
+        };
         const currentTxs = getCollectionValue<Transaction[]>(db, 'transactions', []);
-        saveCollectionValue(db, 'transactions', [transaction, ...currentTxs.filter((t) => t.id !== transaction.id)]);
+        saveCollectionValue(db, 'transactions', [cleanTx, ...currentTxs.filter((t) => t.id !== cleanTx.id)]);
       }
       if (codOrder) {
+        const safeItems = Array.isArray(codOrder.items) ? codOrder.items : [];
+        const cleanOrder: CODOrder = {
+          ...codOrder,
+          customerId: codOrder.customerId || savedCustomer?.id || transaction?.customerId,
+          items: safeItems,
+          subtotal: Math.max(0, Number(codOrder.subtotal || 0)),
+          deliveryFee: Math.max(0, Number(codOrder.deliveryFee || 0)),
+          totalAmount: Math.max(0, Number(codOrder.totalAmount || 0)),
+          createdAt: codOrder.createdAt || new Date().toISOString(),
+        };
         const currentOrders = getCollectionValue<CODOrder[]>(db, 'cod_orders', []);
-        saveCollectionValue(db, 'cod_orders', [codOrder, ...currentOrders.filter((o) => o.id !== codOrder.id)]);
+        saveCollectionValue(db, 'cod_orders', [cleanOrder, ...currentOrders.filter((o) => o.id !== cleanOrder.id)]);
       }
       for (const item of requestedItems) {
         const prod = allProducts.find((p) => p.id === item.productId);
@@ -1245,6 +1329,263 @@ async function startServer() {
 
     broadcastSyncEvent('orders', req.header('x-client-id'));
     res.json({ ok: true, syncVersion: getSyncVersion() });
+  });
+
+  // 9B. COD ORDER STATUS TRANSITION (DISPATCH / DELIVER / RETURN) WITH ATOMIC LEDGER & STOCK SYNC
+  app.post('/api/orders/:orderId/status', (req, res) => {
+    const actor = resolveActor(req);
+    if (
+      actor.role !== 'super_admin' &&
+      actor.role !== 'admin' &&
+      actor.role !== 'manager' &&
+      actor.role !== 'staff'
+    ) {
+      res.status(403).json({ error: 'Only store staff or administrators can update COD order statuses.' });
+      return;
+    }
+
+    const orderId = req.params.orderId;
+    const { status, courierPartner, trackingNumber } = (req.body || {}) as {
+      status?: CODOrder['status'];
+      courierPartner?: CODOrder['courierPartner'];
+      trackingNumber?: string;
+    };
+    if (!status || !['pending', 'dispatched', 'delivered', 'returned'].includes(status)) {
+      res.status(400).json({ error: 'Valid order status is required (pending, dispatched, delivered, returned).' });
+      return;
+    }
+
+    const db = getDb();
+    const orders = getCollectionValue<CODOrder[]>(db, 'cod_orders', []);
+    const existingOrder = orders.find((o) => o.id === orderId);
+    if (!existingOrder) {
+      res.status(404).json({ error: 'COD order not found.' });
+      return;
+    }
+
+    const now = new Date().toISOString();
+    const todayStr = now.split('T')[0];
+    const normalizeDigits = (v?: string) => (v || '').replace(/\D/g, '');
+    let updatedOrder: CODOrder = existingOrder;
+
+    db.exec('BEGIN IMMEDIATE;');
+    try {
+      const wasDelivered = existingOrder.status === 'delivered';
+      const wasReturned = existingOrder.status === 'returned';
+
+      updatedOrder = {
+        ...existingOrder,
+        status,
+        courierPartner: courierPartner || existingOrder.courierPartner,
+        trackingNumber: trackingNumber !== undefined ? trackingNumber : existingOrder.trackingNumber,
+        dispatchedAt: status === 'dispatched' ? existingOrder.dispatchedAt || now : existingOrder.dispatchedAt,
+        deliveredAt: status === 'delivered' ? existingOrder.deliveredAt || now : existingOrder.deliveredAt,
+        returnedAt: status === 'returned' ? existingOrder.returnedAt || now : existingOrder.returnedAt,
+      };
+
+      const nextOrders = orders.map((o) => (o.id === orderId ? updatedOrder : o));
+      saveCollectionValue(db, 'cod_orders', nextOrders);
+
+      if (status === 'returned' && !wasReturned) {
+        const allProds = getAllProductsFromDb(db);
+        for (const item of existingOrder.items || []) {
+          const prod = allProds.find((p) => p.id === item.productId);
+          if (prod) {
+            upsertProductRow(db, {
+              ...prod,
+              stockQty: prod.stockQty + Math.max(0, Number(item.quantity || 0)),
+            });
+          }
+        }
+      }
+
+      if (status === 'delivered' && !wasDelivered) {
+        const allCustomers = getAllCustomersFromDb(db);
+        const ordDigits = normalizeDigits(existingOrder.phone);
+        let cust =
+          (existingOrder.customerId && allCustomers.find((c) => c.id === existingOrder.customerId)) ||
+          (ordDigits ? allCustomers.find((c) => normalizeDigits(c.phone) === ordDigits) : undefined);
+
+        if (!cust) {
+          const digits = ordDigits || '03000000000';
+          cust = {
+            id: `cust_ord_${existingOrder.id.replace(/[^a-zA-Z0-9]/g, '')}`,
+            name: existingOrder.customerName || 'COD Customer',
+            phone: existingOrder.phone || digits,
+            city: existingOrder.city || 'Muzaffarabad',
+            area: existingOrder.area,
+            mohalla: existingOrder.mohalla,
+            landmark: existingOrder.landmark,
+            address: existingOrder.address || existingOrder.city || 'Pakistan',
+            customerType: 'individual',
+            balance: 0,
+            totalPurchases: 0,
+            creditLimit: 5000,
+            paymentTermsDays: 7,
+            status: 'active',
+            pin: digits.length >= 6 ? digits.slice(-6) : '123456',
+            createdAt: (existingOrder.createdAt || now).split('T')[0],
+          };
+          upsertCustomerRow(db, cust);
+        }
+
+        if (!updatedOrder.customerId) {
+          updatedOrder = { ...updatedOrder, customerId: cust.id };
+          saveCollectionValue(
+            db,
+            'cod_orders',
+            nextOrders.map((o) => (o.id === orderId ? updatedOrder : o))
+          );
+        }
+
+        const currentTxs = getCollectionValue<Transaction[]>(db, 'transactions', []);
+        const orderNum = existingOrder.orderNumber;
+        const hasCreditTx = currentTxs.some(
+          (t) =>
+            t.type === 'credit' &&
+            ((t.invoiceNumber && t.invoiceNumber === orderNum) || (t.notes && t.notes.includes(orderNum)))
+        );
+
+        let workingTxs = [...currentTxs];
+        if (!hasCreditTx) {
+          const linkedCreditTx: Transaction = {
+            id: `tx_link_${existingOrder.id}`,
+            customerId: cust.id,
+            type: 'credit',
+            amount: existingOrder.totalAmount,
+            paidAmount: 0,
+            dueBalance: existingOrder.totalAmount,
+            saleType: 'cod',
+            date: (existingOrder.createdAt || now).split('T')[0],
+            dueDate: todayStr,
+            paymentTermsDays: 0,
+            invoiceNumber: orderNum,
+            notes: `COD Order #${orderNum} (${existingOrder.city})`,
+            paymentMode: 'cod',
+            items: existingOrder.items || [],
+            totalSavings: (existingOrder.items || []).reduce((acc, it) => acc + Number(it.customerSavings || 0), 0),
+            status: 'pending',
+            responsibleStaff: actor.name || 'Order Desk',
+            auditTrail: [
+              {
+                id: `aud_link_${Date.now()}`,
+                timestamp: now,
+                action: 'created',
+                newStatus: 'pending',
+                newAmount: existingOrder.totalAmount,
+                changedBy: actor.name || 'Order Desk',
+                notes: `Auto-linked COD order #${orderNum} before delivery settlement`,
+              },
+            ],
+            createdAt: existingOrder.createdAt || now,
+          };
+          workingTxs = [linkedCreditTx, ...workingTxs];
+        }
+
+        const netCash = existingOrder.totalAmount - existingOrder.deliveryFee;
+        const debitTx: Transaction = {
+          id: `tx_cod_deliv_${existingOrder.id}_${Date.now()}`,
+          customerId: cust.id,
+          type: 'debit',
+          amount: existingOrder.totalAmount,
+          paidAmount: existingOrder.totalAmount,
+          dueBalance: 0,
+          date: todayStr,
+          paymentMode: 'cod',
+          invoiceNumber: orderNum,
+          notes: `COD Settlement #${orderNum} (${updatedOrder.courierPartner}) - Net Cash Rs. ${netCash.toLocaleString('en-PK')}`,
+          status: 'completed',
+          responsibleStaff: actor.name || 'Order Desk',
+          auditTrail: [
+            {
+              id: `aud_deliv_${Date.now()}`,
+              timestamp: now,
+              action: 'status_updated',
+              previousStatus: 'pending',
+              newStatus: 'completed',
+              changedBy: actor.name || 'Order Desk',
+              notes: `COD parcel delivered via ${updatedOrder.courierPartner}`,
+            },
+          ],
+          createdAt: now,
+        };
+        workingTxs = [debitTx, ...workingTxs.map((t) =>
+          t.type === 'credit' &&
+          ((t.invoiceNumber && t.invoiceNumber === orderNum) || (t.notes && t.notes.includes(orderNum)))
+            ? {
+                ...t,
+                paidAmount: t.amount,
+                dueBalance: 0,
+                status: 'completed' as const,
+              }
+            : t
+        )];
+        saveCollectionValue(db, 'transactions', workingTxs);
+
+        if (existingOrder.resellerCode) {
+          const earned = Math.floor(existingOrder.subtotal / 1000) * 30;
+          const resellers = getCollectionValue<Reseller[]>(db, 'resellers', []);
+          const nextResellers = resellers.map((r) =>
+            r.referralCode === existingOrder.resellerCode
+              ? {
+                  ...r,
+                  totalReferredOrders: r.totalReferredOrders + 1,
+                  totalSales: r.totalSales + existingOrder.subtotal,
+                  totalPaidSales: r.totalPaidSales + existingOrder.subtotal,
+                  earnedCommission: r.earnedCommission + earned,
+                }
+              : r
+          );
+          saveCollectionValue(db, 'resellers', nextResellers);
+        }
+      }
+
+      db.exec('COMMIT;');
+    } catch (err) {
+      db.exec('ROLLBACK;');
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to update order status.' });
+      return;
+    }
+
+    broadcastSyncEvent('orders', req.header('x-client-id'));
+    res.json({ ok: true, order: updatedOrder, syncVersion: getSyncVersion() });
+  });
+
+  // 9C. BACKEND ORDER HISTORY AUDIT & REPAIR ENDPOINT (ADMIN / MANAGER)
+  app.post('/api/orders/audit-repair', (req, res) => {
+    const actor = resolveActor(req);
+    if (
+      actor.role !== 'super_admin' &&
+      actor.role !== 'admin' &&
+      actor.role !== 'manager'
+    ) {
+      res.status(403).json({ error: 'Only administrators or store managers can audit and repair backend order history.' });
+      return;
+    }
+    try {
+      const db = getDb();
+      const result = auditAndRepairOrderHistory(db);
+      insertAdminAuditLog(db, {
+        action: 'audit_repair_order_history',
+        entityType: 'orders',
+        entityId: 'backend_order_history',
+        actorId: actor.id,
+        actorName: actor.name,
+        actorRole: actor.role,
+        details: {
+          repairedOrders: result.repairedOrders,
+          linkedCustomersCreated: result.linkedCustomersCreated,
+          repairedTransactions: result.repairedTransactions,
+          migratedUrlsCount: result.migratedUrlsCount,
+        },
+      });
+      broadcastSyncEvent('all', req.header('x-client-id'));
+      res.json({ ok: true, ...result, syncVersion: getSyncVersion() });
+    } catch (err) {
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Backend order audit & repair failed.',
+      });
+    }
   });
 
   // 10. CENTRAL COLLECTION SYNC ROUTE (KEEPS ALL EXISTING MODULES MULTI-DEVICE SYNCHRONIZED)

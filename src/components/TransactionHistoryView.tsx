@@ -37,6 +37,7 @@ interface TransactionHistoryViewProps {
     notes?: string,
     responsibleStaff?: string
   ) => void;
+  onAuditRepairOrders?: () => Promise<void> | void;
 }
 
 export const TransactionHistoryView: React.FC<TransactionHistoryViewProps> = ({
@@ -47,9 +48,11 @@ export const TransactionHistoryView: React.FC<TransactionHistoryViewProps> = ({
   currentUser,
   onOpenInvoiceModal,
   onUpdateTransactionStatus,
+  onAuditRepairOrders,
 }) => {
   const isCustomer = userRole === 'customer';
   const isAdmin = userRole === 'admin' || userRole === 'super_admin';
+  const canAuditOrders = isAdmin || userRole === 'manager';
 
   // Find active customer if in customer role (strict boundary: never fall back to another customer)
   const matchedCustomer = useMemo(() => {
@@ -66,8 +69,9 @@ export const TransactionHistoryView: React.FC<TransactionHistoryViewProps> = ({
     return isCustomer ? null : customers[0] || null;
   }, [customers, currentUser, isCustomer]);
 
-  // Date filters
-  const [dateFilter, setDateFilter] = useState<'all' | 'today' | 'this_week' | 'this_month' | 'last_month' | 'custom'>('this_month');
+  // Date filters (default 'all' so full backend order history is immediately visible)
+  const [dateFilter, setDateFilter] = useState<'all' | 'today' | 'this_week' | 'this_month' | 'last_month' | 'custom'>('all');
+  const [isAuditing, setIsAuditing] = useState(false);
   const [customStartDate, setCustomStartDate] = useState('');
   const [customEndDate, setCustomEndDate] = useState('');
 
@@ -133,7 +137,7 @@ export const TransactionHistoryView: React.FC<TransactionHistoryViewProps> = ({
         }
 
         // Date filter
-        const txDate = tx.date;
+        const txDate = tx.date || (tx.createdAt ? tx.createdAt.split('T')[0] : todayStr);
         if (dateFilter === 'today') {
           if (txDate !== todayStr) return false;
         } else if (dateFilter === 'this_week') {
@@ -159,7 +163,7 @@ export const TransactionHistoryView: React.FC<TransactionHistoryViewProps> = ({
           const custPhone = cust ? cust.phone : '';
           const invNum = (tx.invoiceNumber || '').toLowerCase();
           const notes = (tx.notes || '').toLowerCase();
-          const itemMatch = tx.items?.some((it) => it.description.toLowerCase().includes(q)) || false;
+          const itemMatch = tx.items?.some((it) => (it.description || '').toLowerCase().includes(q)) || false;
 
           if (!custName.includes(q) && !custPhone.includes(q) && !invNum.includes(q) && !notes.includes(q) && !itemMatch) {
             return false;
@@ -169,8 +173,8 @@ export const TransactionHistoryView: React.FC<TransactionHistoryViewProps> = ({
         return true;
       })
       .sort((a, b) => {
-        const timeA = new Date(a.createdAt || a.date).getTime();
-        const timeB = new Date(b.createdAt || b.date).getTime();
+        const timeA = new Date(a.createdAt || a.date || 0).getTime() || 0;
+        const timeB = new Date(b.createdAt || b.date || 0).getTime() || 0;
         return sortOrder === 'desc' ? timeB - timeA : timeA - timeB;
       });
   }, [
@@ -277,7 +281,27 @@ export const TransactionHistoryView: React.FC<TransactionHistoryViewProps> = ({
           </div>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          {canAuditOrders && onAuditRepairOrders && (
+            <button
+              type="button"
+              disabled={isAuditing}
+              onClick={async () => {
+                setIsAuditing(true);
+                try {
+                  await onAuditRepairOrders();
+                } finally {
+                  setIsAuditing(false);
+                }
+              }}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold rounded-lg border border-emerald-200 dark:border-emerald-800 bg-emerald-50 dark:bg-emerald-950/50 text-emerald-800 dark:text-emerald-200 hover:bg-emerald-100 cursor-pointer transition-colors shadow-2xs disabled:opacity-60"
+              title="Audit backend orders, repair orphaned ledger links & update legacy URLs"
+            >
+              <ShieldCheck className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
+              <span>{isAuditing ? 'Auditing...' : 'Audit & Clean Orders'}</span>
+            </button>
+          )}
+
           <button
             onClick={() => window.print()}
             className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 hover:bg-slate-50 cursor-pointer transition-colors shadow-2xs"

@@ -49,8 +49,8 @@ import {
   isMuzaffarabadCity,
   isProductPurchaseBlocked,
   normalizeTextKey,
-  resolveDeliveryCharge,
   resolveExpressAreaAvailability,
+  resolveProductOrCartDeliveryCharge,
 } from '../utils/locationCategoryHelpers';
 
 interface ProductDetailsModalProps {
@@ -187,6 +187,7 @@ export const ProductDetailsModal: React.FC<ProductDetailsModalProps> = ({
   const savingsPercent = activeMarketPrice > 0 ? Math.round((savings / activeMarketPrice) * 100) : 50;
 
   const handleAdd = () => {
+    if (Number(product.stockQty ?? 0) <= 0) return;
     const productWithVariant: ProductItem = {
       ...product,
       ourPrice: activePrice,
@@ -224,8 +225,9 @@ export const ProductDetailsModal: React.FC<ProductDetailsModalProps> = ({
     estimateArea,
     isExpressProduct
   );
-  const resolvedEstimateDelivery = resolveDeliveryCharge(
+  const resolvedEstimateDelivery = resolveProductOrCartDeliveryCharge(
     cityConfigs,
+    product,
     selectedEstimateCityObj?.name || estimateCity,
     estimateArea,
     profile.defaultCityCenterDeliveryCharge ?? DEFAULT_CITY_CENTER_DELIVERY_CHARGE
@@ -804,7 +806,11 @@ export const ProductDetailsModal: React.FC<ProductDetailsModalProps> = ({
                         </span>
                         <button
                           type="button"
-                          onClick={() => setQuantity(quantity + 1)}
+                          onClick={() =>
+                            setQuantity(
+                              product.stockQty > 0 ? Math.min(product.stockQty, quantity + 1) : quantity + 1
+                            )
+                          }
                           className="px-3 py-1.5 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 font-bold cursor-pointer"
                         >
                           +
@@ -814,10 +820,13 @@ export const ProductDetailsModal: React.FC<ProductDetailsModalProps> = ({
                       {/* Option 1: Add to Cart */}
                       <button
                         type="button"
+                        disabled={Number(product.stockQty ?? 0) <= 0}
                         onClick={handleAdd}
-                        className="flex-1 py-2.5 px-4 bg-[#FFD200] hover:bg-amber-400 text-slate-950 font-extrabold text-xs rounded-xl shadow-xs transition-all flex items-center justify-center gap-2 cursor-pointer"
+                        className="flex-1 py-2.5 px-4 bg-[#FFD200] hover:bg-amber-400 disabled:bg-slate-200 disabled:text-slate-500 disabled:cursor-not-allowed dark:disabled:bg-slate-800 text-slate-950 font-extrabold text-xs rounded-xl shadow-xs transition-all flex items-center justify-center gap-2 cursor-pointer"
                       >
-                        {addedAnimation ? (
+                        {Number(product.stockQty ?? 0) <= 0 ? (
+                          <span>Out of Stock · Confirm via WhatsApp</span>
+                        ) : addedAnimation ? (
                           <>
                             <Check className="w-4 h-4 stroke-[3]" />
                             <span>Added to Cart!</span>
@@ -972,7 +981,7 @@ export const ProductDetailsModal: React.FC<ProductDetailsModalProps> = ({
                     <div>
                       <div className="flex items-center justify-between gap-2 mb-1">
                         <label className="block text-[10px] font-semibold text-slate-500 dark:text-slate-400">
-                          Sub-City / Child City / Village
+                          Sub-City / Child City / Village {!isExpressProduct ? '(Optional)' : ''}
                         </label>
                         {!isExpressProduct && estimateCityAreas.length > 0 && (
                           <button
@@ -998,6 +1007,9 @@ export const ProductDetailsModal: React.FC<ProductDetailsModalProps> = ({
                           onChange={(e) => setEstimateArea(e.target.value)}
                           className="w-full px-2.5 py-1.5 text-xs rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-amber-400"
                         >
+                          {!isExpressProduct && (
+                            <option value="">-- Optional: Select Sub-City / Village --</option>
+                          )}
                           {estimateCityAreas.map((a) => {
                             const lockedForExpress = isExpressProduct && !a.allowed;
                             return (
@@ -1024,9 +1036,15 @@ export const ProductDetailsModal: React.FC<ProductDetailsModalProps> = ({
                 <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-slate-200/80 dark:border-slate-700/80 text-xs">
                   <div className="text-slate-600 dark:text-slate-300">
                     <span>Shipping ({resolvedEstimateDelivery.label}): </span>
-                    <span className="font-mono tabular-nums font-bold text-slate-900 dark:text-white">
-                      {profile.currencySymbol}{resolvedEstimateDelivery.charge.toLocaleString('en-PK')}
-                    </span>
+                    {resolvedEstimateDelivery.isFree ? (
+                      <span className="font-mono font-extrabold text-emerald-600 dark:text-emerald-400">
+                        FREE (Rs. 0)
+                      </span>
+                    ) : (
+                      <span className="font-mono tabular-nums font-bold text-slate-900 dark:text-white">
+                        {profile.currencySymbol}{resolvedEstimateDelivery.charge.toLocaleString('en-PK')}
+                      </span>
+                    )}
                   </div>
                   {!isProductPurchaseBlocked(product) && (
                     <div className="text-slate-700 dark:text-slate-200 font-semibold">
@@ -1082,7 +1100,7 @@ export const ProductDetailsModal: React.FC<ProductDetailsModalProps> = ({
                       </div>
                       <div className="space-y-0.5">
                         <p className="text-xs font-bold text-slate-900 dark:text-white leading-snug">
-                          Dropship · 3 to 6 Working Days Promised Delivery
+                          Standard · 3 to 6 Working Days Promised Delivery
                         </p>
                         <p className="text-[11px] text-slate-500 dark:text-slate-400 leading-snug">
                           Open across all Provinces &amp; Kashmir (Cities, Sub-Cities, Child Cities &amp; Villages)

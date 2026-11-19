@@ -17,6 +17,8 @@ import {
   Settings2,
   Zap,
   Lock,
+  Trash2,
+  Minus,
 } from 'lucide-react';
 import { AppUser, BusinessProfile, CartItem, Customer, DeliveryCityConfig, PaymentMode, SalePaymentType } from '../types';
 import { defaultDeliveryCities } from '../utils/defaultData';
@@ -29,11 +31,11 @@ import {
   inferProvinceForCity,
   isMuzaffarabadCity,
   PAKISTAN_PROVINCES,
-  resolveDeliveryCharge,
   resolveExpressAreaAvailability,
+  resolveProductOrCartDeliveryCharge,
   slugifyId,
 } from '../utils/locationCategoryHelpers';
-import { apiAddCity, apiToggleOtherCities, apiUpdateCity } from '../utils/storage';
+import { apiAddCity, apiDeleteCity, apiToggleOtherCities, apiUpdateCity } from '../utils/storage';
 import { AddressFieldsGroup } from './AddressFieldsGroup';
 
 export interface CheckoutSalePayload {
@@ -69,7 +71,12 @@ interface CheckoutModalProps {
   isAdmin?: boolean;
   currentUser?: AppUser;
   onSaveProfile?: (profile: BusinessProfile) => void;
-  onCompleteSale: (saleData: CheckoutSalePayload) => void;
+  onUpdateCartQty?: (productId: string, qty: number, selectedSize?: string) => void;
+  onRemoveFromCart?: (productId: string, selectedSize?: string) => void;
+  onClearCart?: () => void;
+  onCompleteSale: (
+    saleData: CheckoutSalePayload
+  ) => Promise<{ ok: boolean; error?: string } | void> | void;
 }
 
 export const CheckoutModal: React.FC<CheckoutModalProps> = ({
@@ -82,6 +89,9 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
   isAdmin = false,
   currentUser,
   onSaveProfile,
+  onUpdateCartQty,
+  onRemoveFromCart,
+  onClearCart,
   onCompleteSale,
 }) => {
   const cityConfigs: DeliveryCityConfig[] = ensureCityAreasShape(
@@ -187,6 +197,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
     return d.toISOString().split('T')[0];
   });
   const [formError, setFormError] = useState<string>('');
+  const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
 
   // Sync POS selection into basic checkout form
   useEffect(() => {
@@ -269,6 +280,48 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
 
   if (!isOpen) return null;
 
+  if (cart.length === 0) {
+    return (
+      <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/70 backdrop-blur-xs p-3 sm:p-4 overflow-y-auto">
+        <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl w-full max-w-md overflow-hidden shadow-2xl">
+          <div className="bg-[#FFD200] px-4 py-3 flex items-center justify-between text-slate-900">
+            <div className="flex items-center gap-2">
+              <ShoppingBag className="w-5 h-5" />
+              <h2 className="text-base font-extrabold tracking-tight">Shopping Cart</h2>
+            </div>
+            <button
+              type="button"
+              onClick={onClose}
+              className="p-1 text-slate-800 hover:text-black rounded-lg hover:bg-amber-400/50 cursor-pointer"
+            >
+              <X className="w-5 h-5" />
+            </button>
+          </div>
+          <div className="p-8 text-center space-y-4">
+            <div className="w-14 h-14 mx-auto rounded-2xl bg-amber-50 dark:bg-amber-950/50 border border-amber-200 dark:border-amber-800 flex items-center justify-center text-amber-600 dark:text-amber-400">
+              <ShoppingBag className="w-7 h-7" />
+            </div>
+            <div>
+              <h3 className="text-base font-extrabold text-slate-900 dark:text-white">
+                Your Cart is Empty
+              </h3>
+              <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
+                آپ کی ٹوکری خالی ہے — Add products from the store catalog to place a Cash on Delivery or online order.
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={onClose}
+              className="px-5 py-2.5 bg-amber-500 hover:bg-amber-400 text-slate-950 font-extrabold text-xs rounded-xl shadow-xs cursor-pointer"
+            >
+              Browse Store Catalog
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   // Cart totals & dynamic city/area delivery fee
   const totalMarketPrice = cart.reduce((acc, it) => acc + it.marketPrice * it.quantity, 0);
   const totalOurPrice = cart.reduce((acc, it) => acc + it.unitPrice * it.quantity, 0);
@@ -286,8 +339,9 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
     buyerArea,
     hasExpressInCart
   );
-  const resolvedDelivery = resolveDeliveryCharge(
+  const resolvedDelivery = resolveProductOrCartDeliveryCharge(
     cityConfigs,
+    cart,
     activeBuyerCity,
     buyerArea,
     profile.defaultCityCenterDeliveryCharge ?? DEFAULT_CITY_CENTER_DELIVERY_CHARGE
@@ -316,10 +370,14 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
   const handleToggleCityAllowed = (cityName: string) => {
     if (!onSaveProfile) return;
     if (isMuzaffarabadCity(cityName)) return; // Muzaffarabad stays active
+    const target = cityConfigs.find((c) => c.name === cityName);
     const updatedCities = cityConfigs.map((c) =>
       c.name === cityName ? { ...c, allowed: !c.allowed } : c
     );
     onSaveProfile({ ...profile, deliveryCities: updatedCities });
+    if (target) {
+      void apiUpdateCity(target.id || target.name, { allowed: !target.allowed });
+    }
     const nextAllowed = updatedCities.filter((c) => c.allowed);
     if (!nextAllowed.some((c) => c.name === buyerCity)) {
       const nextCity =
@@ -327,6 +385,19 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
       setBuyerCity(nextCity);
       setBuyerArea(isMuzaffarabadCity(nextCity) ? 'City Center' : '');
     }
+  };
+
+  const handleDeleteCityInCheckout = async (city: DeliveryCityConfig) => {
+    if (!onSaveProfile || isMuzaffarabadCity(city.name)) return;
+    const updatedCities = cityConfigs.filter(
+      (c) => (c.id || c.name) !== (city.id || city.name)
+    );
+    onSaveProfile({ ...profile, deliveryCities: updatedCities });
+    if (buyerCity.toLowerCase() === city.name.toLowerCase()) {
+      setBuyerCity(defaultActiveCity);
+      setBuyerArea(defaultActiveArea);
+    }
+    await apiDeleteCity(city.id || city.name);
   };
 
   const handleToggleOtherCitiesInCheckout = async (allowOther: boolean) => {
@@ -427,9 +498,15 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
     }
   };
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isSubmitting) return;
     setFormError('');
+
+    if (cart.length === 0) {
+      setFormError('Your cart is empty. Please add at least one product before placing an order.');
+      return;
+    }
 
     if (!buyerName.trim() || !buyerPhone.trim()) {
       setFormError('Please enter Full Name and Mobile Number to proceed with checkout.');
@@ -463,30 +540,43 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
     const effectiveSaleType: SalePaymentType =
       saleType === 'time_credit' && isCreditAuthorizedSeller ? 'time_credit' : saleType === 'cod' ? 'cod' : 'full';
 
-    onCompleteSale({
-      customerId: selectedCustomerId,
-      buyerDetails: {
-        name: buyerName.trim(),
-        phone: buyerPhone.trim(),
-        city: buyerCity.trim() || defaultActiveCity,
-        area: buyerArea.trim() || undefined,
-        mohalla: buyerMohalla.trim() || undefined,
-        landmark: buyerLandmark.trim() || undefined,
-        address: buyerAddress.trim() || 'Counter Pickup / Direct Delivery',
-      },
-      saleType: effectiveSaleType,
-      paidAmount: effectiveSaleType === 'full' ? grandTotal : 0,
-      dueBalance: effectiveSaleType === 'time_credit' ? totalOurPrice : 0,
-      deliveryFee,
-      paymentMode: effectiveSaleType === 'cod' ? 'cod' : effectiveSaleType === 'time_credit' ? 'other' : paymentMode,
-      paymentTermsDays: effectiveSaleType === 'time_credit' ? creditTermsDays : 0,
-      dueDate: effectiveSaleType === 'time_credit' ? creditDueDate : todayStr,
-      notes:
-        notes.trim() ||
-        `Order: ${cart.map((c) => `${c.product.name} (${c.quantity}x)`).join(', ')}`,
-      sendWhatsApp,
-      resellerCode: resellerCode.trim() || undefined,
-    });
+    setIsSubmitting(true);
+    try {
+      const result = await onCompleteSale({
+        customerId: selectedCustomerId,
+        buyerDetails: {
+          name: buyerName.trim(),
+          phone: buyerPhone.trim(),
+          city: buyerCity.trim() || defaultActiveCity,
+          area: buyerArea.trim() || undefined,
+          mohalla: buyerMohalla.trim() || undefined,
+          landmark: buyerLandmark.trim() || undefined,
+          address: buyerAddress.trim() || 'Counter Pickup / Direct Delivery',
+        },
+        saleType: effectiveSaleType,
+        paidAmount: effectiveSaleType === 'full' ? grandTotal : 0,
+        dueBalance: effectiveSaleType === 'time_credit' ? totalOurPrice : 0,
+        deliveryFee,
+        paymentMode: effectiveSaleType === 'cod' ? 'cod' : effectiveSaleType === 'time_credit' ? 'other' : paymentMode,
+        paymentTermsDays: effectiveSaleType === 'time_credit' ? creditTermsDays : 0,
+        dueDate: effectiveSaleType === 'time_credit' ? creditDueDate : todayStr,
+        notes:
+          notes.trim() ||
+          `Order: ${cart.map((c) => `${c.product.name} (${c.quantity}x)`).join(', ')}`,
+        sendWhatsApp,
+        resellerCode: resellerCode.trim() || undefined,
+      });
+
+      if (result && result.ok === false) {
+        setFormError(result.error || 'Order could not be placed. Please check your details and try again.');
+      }
+    } catch (err) {
+      setFormError(
+        err instanceof Error ? err.message : 'Unexpected error while submitting your order.'
+      );
+    } finally {
+      setIsSubmitting(false);
+    }
   };
 
   return (
@@ -599,7 +689,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                   </span>
                 ) : (
                   <span className="text-[10px] text-slate-600 dark:text-slate-400 font-semibold">
-                    Open across all Provinces &amp; Kashmir ({cityConfigs.length} cities, sub-cities &amp; villages) · Dropship 3–6 working days promised
+                    Open across all Provinces &amp; Kashmir ({cityConfigs.length} cities, sub-cities &amp; villages) · Standard 3–6 working days promised
                   </span>
                 )}
                 {canManageCities && (
@@ -652,9 +742,15 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                         Delivery Charges for <b>{resolvedDelivery.label}</b>:
                       </span>
                     </div>
-                    <span className="font-mono font-black text-xs text-slate-900 dark:text-white bg-white dark:bg-slate-900 px-2 py-0.5 rounded border border-amber-300 dark:border-amber-700">
-                      {profile.currencySymbol}{resolvedDelivery.charge.toLocaleString('en-PK')}
-                    </span>
+                    {resolvedDelivery.isFree ? (
+                      <span className="font-mono font-black text-xs text-emerald-700 dark:text-emerald-300 bg-emerald-100 dark:bg-emerald-950/60 px-2 py-0.5 rounded border border-emerald-300 dark:border-emerald-700">
+                        FREE (Rs. 0)
+                      </span>
+                    ) : (
+                      <span className="font-mono font-black text-xs text-slate-900 dark:text-white bg-white dark:bg-slate-900 px-2 py-0.5 rounded border border-amber-300 dark:border-amber-700">
+                        {profile.currencySymbol}{resolvedDelivery.charge.toLocaleString('en-PK')}
+                      </span>
+                    )}
                   </div>
 
                   {!isCustomerView && saleType === 'full' && (
@@ -687,7 +783,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                       Express Delivery Cities &amp; Fees (Unlock Cities / Enter Rs. Fee)
                     </span>
                     <span className="text-[10px] text-slate-500">
-                      Unchecked cities &amp; sub-cities remain locked 🔒 for Express items. Dropship (3–6 working days promised) stays open across all provinces, Kashmir, cities &amp; villages.
+                      Locked cities &amp; sub-cities stay restricted 🔒 for Express items. Standard delivery (3–6 working days promised) stays open across all provinces, Kashmir, cities &amp; villages.
                     </span>
                   </div>
                   <div className="flex items-center gap-1.5">
@@ -781,6 +877,24 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                             </div>
                           </label>
                           <div className="flex items-center gap-1 shrink-0">
+                            {!isMzd ? (
+                              <button
+                                type="button"
+                                onClick={() => handleToggleCityAllowed(c.name)}
+                                className={`px-1.5 py-0.5 rounded text-[9px] font-bold cursor-pointer ${
+                                  c.allowed
+                                    ? 'bg-emerald-600 text-white'
+                                    : 'bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-300'
+                                }`}
+                                title={c.allowed ? 'Click to Lock city' : 'Click to Allow city'}
+                              >
+                                {c.allowed ? 'Allowed' : 'Locked'}
+                              </button>
+                            ) : (
+                              <span className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-emerald-600 text-white">
+                                Default ON
+                              </span>
+                            )}
                             <span className="text-[10px] text-slate-500">Rs.</span>
                             <input
                               type="number"
@@ -788,8 +902,18 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                               value={c.deliveryCharge ?? ''}
                               placeholder={isMzd ? '50' : '250'}
                               onChange={(e) => handleQuickCityChargeChange(c.name, e.target.value)}
-                              className="w-14 px-1 py-0.5 text-[10px] font-mono rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-900 dark:text-white"
+                              className="w-12 px-1 py-0.5 text-[10px] font-mono rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-900 dark:text-white"
                             />
+                            {!isMzd && (
+                              <button
+                                type="button"
+                                onClick={() => void handleDeleteCityInCheckout(c)}
+                                className="p-0.5 text-slate-400 hover:text-red-600 cursor-pointer"
+                                title="Remove city"
+                              >
+                                <Trash2 className="w-3 h-3" />
+                              </button>
+                            )}
                           </div>
                         </div>
                       );
@@ -855,23 +979,35 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
           {/* 3. Cart Summary & Customer Savings Banner */}
           <div className="bg-slate-50 dark:bg-slate-850 p-4 rounded-xl border border-slate-200 dark:border-slate-800 space-y-2">
             <div className="flex items-center justify-between font-bold text-slate-900 dark:text-white text-xs pb-2 border-b border-slate-200 dark:border-slate-700">
-              <span>{cart.length} Products Ordered</span>
-              <span className="font-mono">
-                {profile.currencySymbol}{totalOurPrice.toLocaleString('en-PK')}
-              </span>
+              <span>{cart.length} Products in Cart</span>
+              <div className="flex items-center gap-2">
+                {onClearCart && (
+                  <button
+                    type="button"
+                    onClick={onClearCart}
+                    className="text-[10px] font-semibold text-red-600 dark:text-red-400 hover:underline cursor-pointer"
+                  >
+                    Clear All
+                  </button>
+                )}
+                <span className="font-mono">
+                  {profile.currencySymbol}{totalOurPrice.toLocaleString('en-PK')}
+                </span>
+              </div>
             </div>
 
-            <div className="max-h-28 overflow-y-auto space-y-1 pr-1 text-[11px]">
+            <div className="max-h-36 overflow-y-auto space-y-1.5 pr-1 text-[11px]">
               {cart.map((it, idx) => {
                 const itemDelivery = getProductDeliveryMeta(it.product);
                 return (
                   <div
                     key={`${it.product.id}-${it.product.selectedSize || idx}`}
-                    className="flex items-center justify-between text-slate-600 dark:text-slate-300 gap-2"
+                    className="flex items-center justify-between text-slate-600 dark:text-slate-300 gap-2 py-0.5"
                   >
                     <div className="flex items-center gap-1.5 min-w-0">
-                      <span className="truncate max-w-[210px]">
-                        {it.product.name} ({it.quantity}x)
+                      <span className="truncate max-w-[180px] font-medium text-slate-800 dark:text-slate-100">
+                        {it.product.name}
+                        {it.product.selectedSize ? ` (${it.product.selectedSize})` : ''}
                       </span>
                       {itemDelivery.isExpress && (
                         <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[9px] font-extrabold shrink-0 bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300 border border-emerald-300/60 dark:border-emerald-800">
@@ -880,15 +1016,54 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                         </span>
                       )}
                     </div>
-                    <div className="flex items-center gap-2 font-mono tabular-nums shrink-0">
-                      <span className="text-slate-400 line-through">
-                        {profile.currencySymbol}
-                        {(it.marketPrice * it.quantity).toLocaleString('en-PK')}
-                      </span>
-                      <span className="font-bold text-slate-900 dark:text-white">
-                        {profile.currencySymbol}
-                        {(it.unitPrice * it.quantity).toLocaleString('en-PK')}
-                      </span>
+                    <div className="flex items-center gap-2 shrink-0">
+                      {onUpdateCartQty && (
+                        <div className="inline-flex items-center border border-slate-300 dark:border-slate-700 rounded bg-white dark:bg-slate-800">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              onUpdateCartQty(it.product.id, it.quantity - 1, it.product.selectedSize)
+                            }
+                            className="px-1.5 py-0.5 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 cursor-pointer"
+                            title="Decrease quantity"
+                          >
+                            <Minus className="w-2.5 h-2.5" />
+                          </button>
+                          <span className="px-1.5 font-mono font-bold text-[10px] text-slate-900 dark:text-white">
+                            {it.quantity}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              onUpdateCartQty(it.product.id, it.quantity + 1, it.product.selectedSize)
+                            }
+                            className="px-1.5 py-0.5 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 cursor-pointer"
+                            title="Increase quantity"
+                          >
+                            <Plus className="w-2.5 h-2.5" />
+                          </button>
+                        </div>
+                      )}
+                      <div className="flex items-center gap-1.5 font-mono tabular-nums">
+                        <span className="text-slate-400 line-through">
+                          {profile.currencySymbol}
+                          {(it.marketPrice * it.quantity).toLocaleString('en-PK')}
+                        </span>
+                        <span className="font-bold text-slate-900 dark:text-white">
+                          {profile.currencySymbol}
+                          {(it.unitPrice * it.quantity).toLocaleString('en-PK')}
+                        </span>
+                      </div>
+                      {onRemoveFromCart && (
+                        <button
+                          type="button"
+                          onClick={() => onRemoveFromCart(it.product.id, it.product.selectedSize)}
+                          className="p-0.5 text-slate-400 hover:text-red-600 cursor-pointer"
+                          title="Remove from cart"
+                        >
+                          <Trash2 className="w-3 h-3" />
+                        </button>
+                      )}
                     </div>
                   </div>
                 );
@@ -911,7 +1086,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                 return (
                   <div className="px-2.5 py-1.5 rounded-lg bg-white/80 dark:bg-slate-900/60 border border-slate-200 dark:border-slate-700 text-[11px] text-slate-700 dark:text-slate-300 font-medium">
                     <span>
-                      Dropship 3 to 6 working days promised delivery · Open across all provinces, Kashmir, cities, sub-cities &amp; villages
+                      Standard 3 to 6 working days promised delivery · Open across all provinces, Kashmir, cities, sub-cities &amp; villages
                     </span>
                   </div>
                 );
@@ -920,18 +1095,24 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                 <div className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800 text-[11px] text-amber-950 dark:text-amber-200 font-semibold">
                   <Zap className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
                   <span>
-                    Mixed Cart: {expressCount} ⚡ Express item(s) (unlocked cities &amp; sub-cities only) · {standardCount} Dropship item(s) (3–6 working days promised delivery)
+                    Mixed Cart: {expressCount} ⚡ Express item(s) (unlocked cities &amp; sub-cities only) · {standardCount} Standard item(s) (3–6 working days promised delivery)
                   </span>
                 </div>
               );
             })()}
 
-            {deliveryFee > 0 && (
+            {(resolvedDelivery.isFree || deliveryFee > 0) && (
               <div className="flex items-center justify-between text-[11px] text-slate-700 dark:text-slate-200 pt-1">
                 <span>Delivery Charges ({resolvedDelivery.label}):</span>
-                <span className="font-mono font-bold text-amber-700 dark:text-amber-300">
-                  +{profile.currencySymbol}{deliveryFee.toLocaleString('en-PK')}
-                </span>
+                {resolvedDelivery.isFree ? (
+                  <span className="font-mono font-bold text-emerald-600 dark:text-emerald-400">
+                    FREE (Rs. 0)
+                  </span>
+                ) : (
+                  <span className="font-mono font-bold text-amber-700 dark:text-amber-300">
+                    +{profile.currencySymbol}{deliveryFee.toLocaleString('en-PK')}
+                  </span>
+                )}
               </div>
             )}
 
@@ -1217,10 +1398,15 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
             </button>
             <button
               type="submit"
-              className="inline-flex items-center gap-2 px-6 py-2.5 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold rounded-xl shadow-md transition-colors cursor-pointer"
+              disabled={isSubmitting}
+              className="inline-flex items-center gap-2 px-6 py-2.5 bg-amber-500 hover:bg-amber-400 disabled:opacity-60 disabled:cursor-not-allowed text-slate-950 font-bold rounded-xl shadow-md transition-colors cursor-pointer"
             >
               <Check className="w-4 h-4 stroke-[2.5]" />
-              <span>Place Order ({profile.currencySymbol}{grandTotal.toLocaleString('en-PK')})</span>
+              <span>
+                {isSubmitting
+                  ? 'Placing Order...'
+                  : `Place Order (${profile.currencySymbol}${grandTotal.toLocaleString('en-PK')})`}
+              </span>
             </button>
           </div>
         </form>

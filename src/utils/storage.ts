@@ -5,8 +5,10 @@ import {
   Branch,
   BroadcastContact,
   BusinessProfile,
+  CartItem,
   CategoryRecord,
   CODOrder,
+  CODOrderStatus,
   CommissionRecord,
   Customer,
   DeliveryCityConfig,
@@ -110,6 +112,7 @@ const STORAGE_KEYS = {
   IMPORT_LOGS: '100dagar_import_logs_v5',
   WASAL_SETTLEMENTS: '100dagar_wasal_settlements_v5',
   MONTHLY_EXPENSES: '100dagar_monthly_expenses_v5',
+  CART: '100dagar_cart_v5',
 };
 
 const MIGRATION_FLAG_KEY = '100dagar_server_migrated_v1';
@@ -506,6 +509,8 @@ export async function apiActivateProductArrival(
     details?: string;
     badgeText?: string;
     deliveryType?: 'express' | 'standard';
+    deliveryFeeType?: 'default' | 'free' | 'custom';
+    customDeliveryCharge?: number;
   }
 ): Promise<{ ok: boolean; product?: ProductItem; error?: string }> {
   try {
@@ -711,6 +716,24 @@ export async function apiUpdateCity(
   }
 }
 
+export async function apiDeleteCity(
+  idOrName: string
+): Promise<{ ok: boolean; cities?: DeliveryCityConfig[]; error?: string }> {
+  try {
+    const res = await fetch(`/api/cities/${encodeURIComponent(idOrName)}`, {
+      method: 'DELETE',
+      headers: getAuthHeaders(),
+      cache: 'no-store',
+    });
+    const parsed = await safeParseJsonResponse<{ ok?: boolean; cities?: DeliveryCityConfig[]; error?: string }>(res);
+    if (!parsed.ok) return { ok: false, error: parsed.data?.error || parsed.error || 'Failed to remove city.' };
+    await refreshSyncState();
+    return { ok: true, cities: parsed.data?.cities };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
 export async function apiToggleOtherCities(
   allowOtherCities: boolean
 ): Promise<{ ok: boolean; cities?: DeliveryCityConfig[]; error?: string }> {
@@ -808,6 +831,75 @@ export async function apiSubmitCheckoutOrder(payload: {
     if (!parsed.ok) return { ok: false, error: parsed.data?.error || parsed.error || 'Checkout blocked by server validation.' };
     await refreshSyncState();
     return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
+export async function apiUpdateCODOrderStatus(
+  orderId: string,
+  status: CODOrderStatus,
+  details?: { courierPartner?: CODOrder['courierPartner']; trackingNumber?: string }
+): Promise<{ ok: boolean; order?: CODOrder; error?: string }> {
+  try {
+    const res = await fetch(`/api/orders/${encodeURIComponent(orderId)}/status`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      cache: 'no-store',
+      body: JSON.stringify({
+        status,
+        courierPartner: details?.courierPartner,
+        trackingNumber: details?.trackingNumber,
+      }),
+    });
+    const parsed = await safeParseJsonResponse<{ ok?: boolean; order?: CODOrder; error?: string }>(res);
+    if (!parsed.ok) {
+      return { ok: false, error: parsed.data?.error || parsed.error || 'Failed to update COD order status.' };
+    }
+    await refreshSyncState();
+    return { ok: true, order: parsed.data?.order };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
+export async function apiAuditAndRepairOrders(): Promise<{
+  ok: boolean;
+  repairedOrders?: number;
+  linkedCustomersCreated?: number;
+  repairedTransactions?: number;
+  migratedUrlsCount?: number;
+  summary?: string;
+  error?: string;
+}> {
+  try {
+    const res = await fetch('/api/orders/audit-repair', {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      cache: 'no-store',
+      body: JSON.stringify({}),
+    });
+    const parsed = await safeParseJsonResponse<{
+      ok?: boolean;
+      repairedOrders?: number;
+      linkedCustomersCreated?: number;
+      repairedTransactions?: number;
+      migratedUrlsCount?: number;
+      summary?: string;
+      error?: string;
+    }>(res);
+    if (!parsed.ok || !parsed.data) {
+      return { ok: false, error: parsed.data?.error || parsed.error || 'Order history audit & repair failed.' };
+    }
+    await refreshSyncState();
+    return {
+      ok: true,
+      repairedOrders: parsed.data.repairedOrders,
+      linkedCustomersCreated: parsed.data.linkedCustomersCreated,
+      repairedTransactions: parsed.data.repairedTransactions,
+      migratedUrlsCount: parsed.data.migratedUrlsCount,
+      summary: parsed.data.summary,
+    };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
   }
@@ -1150,6 +1242,16 @@ export function getMonthlyExpenses(): MonthlyExpense[] {
 
 export function saveMonthlyExpenses(expenses: MonthlyExpense[]): void {
   saveToStorage(STORAGE_KEYS.MONTHLY_EXPENSES, expenses);
+}
+
+// Persistent Cart Session (local browser cache)
+export function getCartItems(): CartItem[] {
+  const items = loadFromStorage<CartItem[]>(STORAGE_KEYS.CART, []);
+  return Array.isArray(items) ? items.filter((it) => it && it.product && it.quantity > 0) : [];
+}
+
+export function saveCartItems(cart: CartItem[]): void {
+  saveToStorage(STORAGE_KEYS.CART, cart, true);
 }
 
 // HR Employees

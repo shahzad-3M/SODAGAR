@@ -39,6 +39,10 @@ const ENTITY_MAP: Record<string, string> = {
   rdquo: '"',
   ldquo: '"',
   bull: '•',
+  raquo: '»',
+  laquo: '«',
+  times: '×',
+  hellip: '...',
   copy: '©',
   reg: '®',
   trade: '™',
@@ -364,9 +368,9 @@ function pickBestSrcFromSrcset(srcset: string, baseUrl: string): string | null {
 
 function matchCategoryRecord(
   candidates: string[],
-  categories: CategoryRecord[]
+  categories: CategoryRecord[] = []
 ): CategoryRecord | undefined {
-  const active = categories.filter((c) => c.id !== UPCOMING_CATEGORY_ID && !c.isUpcoming && c.isActive !== false);
+  const active = (categories || []).filter((c) => c.id !== UPCOMING_CATEGORY_ID && !c.isUpcoming && c.isActive !== false);
   for (const cand of candidates) {
     const cleanCand = normalizeTextKey(cand);
     if (!cleanCand) continue;
@@ -879,7 +883,7 @@ function matchBestGalleryImageForVariant(
 
 export async function scrapeProductFromUrl(
   rawUrl: string,
-  categories: CategoryRecord[],
+  categories: CategoryRecord[] = [],
   htmlOverride?: string
 ): Promise<ScrapeProductResult> {
   const parsedUrl = normalizeScrapeUrl(rawUrl);
@@ -1464,6 +1468,12 @@ export async function scrapeProductFromUrl(
     specifications['Original Listed Price'] = `${currencyDetected} ${salePriceRaw} (~Rs. ${ourPrice.toLocaleString('en-PK')} PKR)`;
   }
   specifications['Source Host'] = domain;
+
+  if (name) {
+    name = decodeHtmlEntities(name)
+      .replace(/\s*[»|–—-]\s*(?:3M\s+)?Madina Market\s*$/i, '')
+      .trim();
+  }
 
   if (!name) {
     const slug = parsedUrl.pathname.split('/').filter(Boolean).pop() || domain;

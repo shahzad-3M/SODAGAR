@@ -57,9 +57,9 @@ interface StoreCatalogViewProps {
   initialProductId?: string | null;
   onClearInitialProduct?: () => void;
   onUpdateProduct?: (updatedProduct: ProductItem) => void;
-  onAddToCart: (product: ProductItem, qty?: number) => void;
-  onUpdateCartQty: (productId: string, qty: number) => void;
-  onRemoveFromCart: (productId: string) => void;
+  onAddToCart: (product: ProductItem, qty?: number, selectedSize?: string) => void;
+  onUpdateCartQty: (productId: string, qty: number, selectedSize?: string) => void;
+  onRemoveFromCart: (productId: string, selectedSize?: string) => void;
   onClearCart: () => void;
   onOpenCheckout: () => void;
   searchQuery: string;
@@ -114,10 +114,17 @@ export const StoreCatalogView: React.FC<StoreCatalogViewProps> = ({
     [investors]
   );
 
-  // Open product modal automatically if ?product=<id> deep-link is active
+  // Open product modal automatically if ?product=<id|sku|slug> deep-link is active
   useEffect(() => {
     if (!initialProductId) return;
-    const target = products.find((p) => p.id === initialProductId);
+    const norm = normalizeTextKey(initialProductId);
+    const target = products.find((p) => {
+      if (p.id === initialProductId || normalizeTextKey(p.id) === norm) return true;
+      if (p.sku && normalizeTextKey(p.sku) === norm) return true;
+      return Boolean(
+        (p.websiteUrl || p.sourceUrl || '').toLowerCase().includes(initialProductId.toLowerCase())
+      );
+    });
     if (target) {
       setSelectedDetailProduct(target);
       onClearInitialProduct?.();
@@ -277,8 +284,11 @@ export const StoreCatalogView: React.FC<StoreCatalogViewProps> = ({
   const renderProductCard = (product: ProductItem) => {
     const savings = product.marketPrice - product.ourPrice;
     const savingsPercent = product.marketPrice > 0 ? Math.round((savings / product.marketPrice) * 100) : 0;
-    const inCart = cart.find((it) => it.product.id === product.id);
+    const matchingCartItems = cart.filter((it) => it.product.id === product.id);
+    const inCart = matchingCartItems[0];
+    const totalQtyInCart = matchingCartItems.reduce((sum, it) => sum + it.quantity, 0);
     const isUpcomingBlocked = isProductPurchaseBlocked(product);
+    const isOutOfStock = !isUpcomingBlocked && Number(product.stockQty ?? 0) <= 0;
     const dMeta = getProductDeliveryMeta(product);
     const isExpress = !isUpcomingBlocked && dMeta.isExpress;
 
@@ -418,6 +428,19 @@ export const StoreCatalogView: React.FC<StoreCatalogViewProps> = ({
               </span>
             </div>
 
+            {!isUpcomingBlocked && product.deliveryFeeType === 'free' && (
+              <div className="mt-1 text-[9px] sm:text-[10px] font-bold text-emerald-700 dark:text-emerald-400">
+                Free Delivery
+              </div>
+            )}
+            {!isUpcomingBlocked &&
+              product.deliveryFeeType === 'custom' &&
+              typeof product.customDeliveryCharge === 'number' && (
+                <div className="mt-1 text-[9px] sm:text-[10px] font-semibold text-slate-500 dark:text-slate-400">
+                  Delivery: {profile.currencySymbol}{product.customDeliveryCharge.toLocaleString('en-PK')}
+                </div>
+              )}
+
             {!isCustomerView && !hideCostPrice && (
               <div className="mt-1 flex items-center justify-between text-[9px] text-slate-400">
                 <span>Cost: {profile.currencySymbol}{product.costPrice.toLocaleString('en-PK')}</span>
@@ -521,23 +544,46 @@ export const StoreCatalogView: React.FC<StoreCatalogViewProps> = ({
                   {inCart ? (
                     <div className="flex-1 flex items-center justify-between bg-amber-50 dark:bg-amber-950/40 border border-amber-300 dark:border-amber-700 rounded-lg p-0.5">
                       <button
-                        onClick={() => onUpdateCartQty(product.id, inCart.quantity - 1)}
+                        type="button"
+                        onClick={() =>
+                          onUpdateCartQty(
+                            product.id,
+                            inCart.quantity - 1,
+                            inCart.product.selectedSize
+                          )
+                        }
                         className="w-6 h-6 flex items-center justify-center bg-white dark:bg-slate-800 text-slate-800 dark:text-white rounded shadow-2xs hover:bg-slate-100 cursor-pointer"
                       >
                         <Minus className="w-3 h-3" />
                       </button>
                       <span className="font-mono font-bold text-[10px] sm:text-xs text-amber-900 dark:text-amber-200">
-                        {inCart.quantity} in cart
+                        {totalQtyInCart} in cart
                       </span>
                       <button
-                        onClick={() => onUpdateCartQty(product.id, inCart.quantity + 1)}
+                        type="button"
+                        onClick={() =>
+                          onUpdateCartQty(
+                            product.id,
+                            inCart.quantity + 1,
+                            inCart.product.selectedSize
+                          )
+                        }
                         className="w-6 h-6 flex items-center justify-center bg-amber-500 text-slate-950 rounded shadow-2xs hover:bg-amber-400 cursor-pointer"
                       >
                         <Plus className="w-3 h-3" />
                       </button>
                     </div>
+                  ) : isOutOfStock ? (
+                    <button
+                      type="button"
+                      disabled
+                      className="flex-1 py-1.5 sm:py-2 px-2 bg-slate-200 dark:bg-slate-800 text-slate-500 dark:text-slate-400 text-[10px] sm:text-[11px] font-bold rounded-lg cursor-not-allowed truncate"
+                    >
+                      Out of Stock
+                    </button>
                   ) : (
                     <button
+                      type="button"
                       onClick={() => onAddToCart(product, 1)}
                       className="flex-1 inline-flex items-center justify-center gap-1 py-1.5 sm:py-2 px-2 bg-slate-900 hover:bg-slate-800 dark:bg-amber-500 dark:text-slate-950 dark:hover:bg-amber-400 text-white text-[10px] sm:text-[11px] font-bold rounded-lg shadow-2xs transition-colors cursor-pointer truncate"
                     >
@@ -962,7 +1008,7 @@ export const StoreCatalogView: React.FC<StoreCatalogViewProps> = ({
                   : 'bg-slate-100 dark:bg-slate-800 text-slate-800 dark:text-slate-200 hover:bg-slate-200'
               }`}
             >
-              <span>Dropship · 3–6 Days Promised ({standardProductCount})</span>
+              <span>Standard · 3–6 Days Promised ({standardProductCount})</span>
             </button>
           </div>
 
@@ -1042,7 +1088,7 @@ export const StoreCatalogView: React.FC<StoreCatalogViewProps> = ({
                     All Catalog Products ({standardGroupProducts.length})
                   </span>
                   <span className="text-[11px] text-slate-500 dark:text-slate-400">
-                    Open across all Provinces &amp; Kashmir (Cities, Sub-Cities, Child Cities &amp; Villages) · Dropship 3 to 6 days promised delivery
+                    Open across all Provinces &amp; Kashmir (Cities, Sub-Cities, Child Cities &amp; Villages) · Standard 3 to 6 days promised delivery
                   </span>
                 </div>
               )}

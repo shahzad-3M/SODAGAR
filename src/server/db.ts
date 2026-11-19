@@ -126,7 +126,21 @@ export function getDb(): DatabaseSync {
     ensureDirectories();
     const hadExistingDb = fs.existsSync(DB_PATH) && fs.statSync(DB_PATH).size > 0;
     dbInstance = new DatabaseSync(DB_PATH);
-    dbInstance.exec('PRAGMA journal_mode = WAL;');
+    dbInstance.exec('PRAGMA busy_timeout = 5000;');
+    try {
+      dbInstance.exec('PRAGMA journal_mode = WAL;');
+    } catch (walErr) {
+      console.warn('SQLite WAL mode unavailable, falling back to TRUNCATE/DELETE journal mode:', walErr);
+      try {
+        dbInstance.exec('PRAGMA journal_mode = TRUNCATE;');
+      } catch {
+        try {
+          dbInstance.exec('PRAGMA journal_mode = DELETE;');
+        } catch {
+          // ignore if journal mode cannot be switched
+        }
+      }
+    }
     dbInstance.exec('PRAGMA foreign_keys = ON;');
     dbInstance.exec('PRAGMA synchronous = NORMAL;');
     runMigrations(dbInstance, hadExistingDb);
@@ -250,7 +264,10 @@ function runMigrations(db: DatabaseSync, hadExistingDb: boolean) {
     !hasMigration('002_seed_defaults_if_empty') ||
     !hasMigration('003_upgrade_upcoming_categories_locations') ||
     !hasMigration('004_delivery_charges_city_areas') ||
-    !hasMigration('005_all_provinces_kashmir_subcities_villages');
+    !hasMigration('005_all_provinces_kashmir_subcities_villages') ||
+    !hasMigration('006_product_delivery_fees_and_templates') ||
+    !hasMigration('007_fix_broadcast_templates_key') ||
+    !hasMigration('008_audit_clean_order_history_and_links');
 
   if (hadExistingDb && pendingMigrations) {
     createVerifiedBackup('pre_migration');
@@ -709,7 +726,140 @@ function runMigrations(db: DatabaseSync, hadExistingDb: boolean) {
     syncDeliveryCitiesIntoBusinessProfile(db);
     recordMigration(
       '005_all_provinces_kashmir_subcities_villages',
-      'Non-destructively added all Pakistan provinces & Azad Kashmir cities, sub-cities, child cities & villages while keeping Dropship open nationwide'
+      'Non-destructively added all Pakistan provinces & Azad Kashmir cities, sub-cities, child cities & villages while keeping Standard delivery open nationwide'
+    );
+  }
+
+  // MIGRATION 006: Add per-product delivery_fee_type & custom_delivery_charge columns + update default broadcast Super Best Price & madinamarket.pk URLs
+  if (!hasMigration('006_product_delivery_fees_and_templates')) {
+    if (hadExistingDb) {
+      createVerifiedBackup('pre_migration_006_delivery_fees');
+    }
+    const now = new Date().toISOString();
+
+    const prodCols = db.prepare('PRAGMA table_info(products)').all() as Array<{ name: string }>;
+    if (!prodCols.some((c) => c.name === 'delivery_fee_type')) {
+      db.exec("ALTER TABLE products ADD COLUMN delivery_fee_type TEXT NOT NULL DEFAULT 'default';");
+    }
+    if (!prodCols.some((c) => c.name === 'custom_delivery_charge')) {
+      db.exec('ALTER TABLE products ADD COLUMN custom_delivery_charge REAL;');
+    }
+
+    // Non-destructively upgrade tpl_product_broadcast in templates if it still contains "Wholesale Price" / "Wholesale Deal"
+    try {
+      const tplRow = db
+        .prepare("SELECT data_json FROM app_collections WHERE collection_key = 'templates'")
+        .get() as { data_json?: string } | undefined;
+      if (tplRow?.data_json) {
+        const templates = JSON.parse(tplRow.data_json) as Array<Record<string, unknown>>;
+        let changed = false;
+        const nextTemplates = templates.map((t) => {
+          if (t && (t.id === 'tpl_product_broadcast' || t.type === 'product_broadcast') && typeof t.content === 'string') {
+            let nextContent = t.content
+              .replace(/Wholesale Deal!/gi, 'Super Best Deal!')
+              .replace(/Wholesale Price:/gi, 'Super Best Price:');
+            if (nextContent !== t.content) {
+              changed = true;
+              return { ...t, content: nextContent };
+            }
+          }
+          return t;
+        });
+        if (changed) {
+          db.prepare('UPDATE app_collections SET data_json = ?, updated_at = ? WHERE collection_key = ?').run(
+            JSON.stringify(nextTemplates),
+            now,
+            'templates'
+          );
+        }
+      }
+    } catch {
+      // ignore JSON parse issues on custom collection
+    }
+
+    // Non-destructively replace legacy seeded 100dagar.pk/example.com dummy URLs in product_broadcasts & saved_broadcasts
+    for (const colKey of ['product_broadcasts', 'saved_broadcasts']) {
+      try {
+        const row = db
+          .prepare('SELECT data_json FROM app_collections WHERE collection_key = ?')
+          .get(colKey) as { data_json?: string } | undefined;
+        if (row?.data_json && (row.data_json.includes('100dagar.pk') || row.data_json.includes('Wholesale'))) {
+          const updatedJson = row.data_json
+            .replace(/https?:\/\/100dagar\.pk/gi, 'https://madinamarket.pk')
+            .replace(/Our Wholesale:/gi, 'Our Super Best Price:')
+            .replace(/New wholesale arrival/gi, 'New Super Best Price arrival');
+          if (updatedJson !== row.data_json) {
+            db.prepare('UPDATE app_collections SET data_json = ?, updated_at = ? WHERE collection_key = ?').run(
+              updatedJson,
+              now,
+              colKey
+            );
+          }
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    recordMigration(
+      '006_product_delivery_fees_and_templates',
+      'Added product delivery_fee_type & custom_delivery_charge columns and updated broadcast templates to Super Best Price & madinamarket.pk'
+    );
+  }
+
+  // MIGRATION 007: Upgrade templates collection under correct key ('templates') for existing DBs
+  if (!hasMigration('007_fix_broadcast_templates_key')) {
+    const now = new Date().toISOString();
+    try {
+      const tplRow = db
+        .prepare("SELECT data_json FROM app_collections WHERE collection_key = 'templates'")
+        .get() as { data_json?: string } | undefined;
+      if (tplRow?.data_json) {
+        const templates = JSON.parse(tplRow.data_json) as Array<Record<string, unknown>>;
+        let changed = false;
+        const nextTemplates = templates.map((t) => {
+          if (t && (t.id === 'tpl_product_broadcast' || t.type === 'product_broadcast') && typeof t.content === 'string') {
+            const nextContent = t.content
+              .replace(/Wholesale Deal!/gi, 'Super Best Deal!')
+              .replace(/Wholesale Price:/gi, 'Super Best Price:');
+            if (nextContent !== t.content) {
+              changed = true;
+              return { ...t, content: nextContent };
+            }
+          }
+          return t;
+        });
+        if (changed) {
+          db.prepare('UPDATE app_collections SET data_json = ?, updated_at = ? WHERE collection_key = ?').run(
+            JSON.stringify(nextTemplates),
+            now,
+            'templates'
+          );
+        }
+      }
+    } catch {
+      // ignore
+    }
+
+    recordMigration(
+      '007_fix_broadcast_templates_key',
+      'Upgraded broadcast template in app_collections.templates to Super Best Price & Super Best Deal'
+    );
+  }
+
+  // MIGRATION 008: Audit & repair backend order history (missing customer links, ledger consistency, stale dummy URLs)
+  if (!hasMigration('008_audit_clean_order_history_and_links')) {
+    if (hadExistingDb) {
+      createVerifiedBackup('pre_migration_008_order_audit');
+    }
+    try {
+      auditAndRepairOrderHistory(db);
+    } catch (err) {
+      console.warn('Migration 008 order audit warning:', err);
+    }
+    recordMigration(
+      '008_audit_clean_order_history_and_links',
+      'Audited and repaired backend COD orders, orphaned customer/transaction links, balances, and madinamarket.pk links'
     );
   }
 }
@@ -948,6 +1098,11 @@ export function getAllProductsFromDb(db = getDb()): ProductItem[] {
       expectedArrivalDate: r.expected_arrival_date
         ? String(r.expected_arrival_date)
         : parsed.expectedArrivalDate,
+      deliveryFeeType: ((r.delivery_fee_type ? String(r.delivery_fee_type) : parsed.deliveryFeeType) || 'default') as ProductItem['deliveryFeeType'],
+      customDeliveryCharge:
+        r.custom_delivery_charge !== null && r.custom_delivery_charge !== undefined
+          ? Number(r.custom_delivery_charge)
+          : parsed.customDeliveryCharge,
       status: (String(r.status || parsed.status || 'published') as 'draft' | 'published'),
       updatedAt: r.updated_at ? String(r.updated_at) : parsed.updatedAt,
     };
@@ -975,12 +1130,29 @@ export function upsertProductRow(db: DatabaseSync, product: ProductItem): Produc
       )
     : product.category || 'General Wholesale';
 
+  const normalizedDeliveryFeeType: ProductItem['deliveryFeeType'] =
+    product.deliveryFeeType === 'free'
+      ? 'free'
+      : product.deliveryFeeType === 'custom'
+      ? 'custom'
+      : 'default';
+  const normalizedCustomDeliveryCharge =
+    normalizedDeliveryFeeType === 'custom' &&
+    product.customDeliveryCharge !== undefined &&
+    product.customDeliveryCharge !== null &&
+    Number.isFinite(Number(product.customDeliveryCharge)) &&
+    Number(product.customDeliveryCharge) >= 0
+      ? Math.round(Number(product.customDeliveryCharge))
+      : undefined;
+
   const normalizedProduct: ProductItem = {
     ...product,
     category: normalizedCategory,
     parentCategoryId: resolvedIds.parentCategoryId,
     subcategoryId: resolvedIds.subcategoryId,
     childSubcategoryId: resolvedIds.childSubcategoryId,
+    deliveryFeeType: normalizedDeliveryFeeType,
+    customDeliveryCharge: normalizedCustomDeliveryCharge,
     isUpcoming: blockedUpcoming,
     upcomingStatus: blockedUpcoming ? 'coming_soon' : 'available',
     stockQty: blockedUpcoming ? 0 : Math.max(0, Number(product.stockQty || 0)),
@@ -992,8 +1164,9 @@ export function upsertProductRow(db: DatabaseSync, product: ProductItem): Produc
     INSERT INTO products (
       id, name, urdu_name, category, parent_category_id, subcategory_id, child_subcategory_id,
       sku, cost_price, market_price, our_price, stock_qty, min_stock_alert,
-      is_upcoming, upcoming_status, expected_arrival_date, status, created_at, updated_at, data_json
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      is_upcoming, upcoming_status, expected_arrival_date, delivery_fee_type, custom_delivery_charge,
+      status, created_at, updated_at, data_json
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
       name = excluded.name,
       urdu_name = excluded.urdu_name,
@@ -1010,6 +1183,8 @@ export function upsertProductRow(db: DatabaseSync, product: ProductItem): Produc
       is_upcoming = excluded.is_upcoming,
       upcoming_status = excluded.upcoming_status,
       expected_arrival_date = excluded.expected_arrival_date,
+      delivery_fee_type = excluded.delivery_fee_type,
+      custom_delivery_charge = excluded.custom_delivery_charge,
       status = excluded.status,
       updated_at = excluded.updated_at,
       data_json = excluded.data_json
@@ -1030,6 +1205,8 @@ export function upsertProductRow(db: DatabaseSync, product: ProductItem): Produc
     normalizedProduct.isUpcoming ? 1 : 0,
     normalizedProduct.upcomingStatus || 'available',
     normalizedProduct.expectedArrivalDate || null,
+    normalizedProduct.deliveryFeeType || 'default',
+    normalizedProduct.customDeliveryCharge ?? null,
     normalizedProduct.status || 'published',
     normalizedProduct.createdAt || now.split('T')[0],
     now,
@@ -1402,6 +1579,326 @@ export function mergeLocalSnapshotNonDestructively(localCollections: Record<stri
 
   touchSyncVersion();
   return { mergedCounts };
+}
+
+export interface OrderHistoryAuditResult {
+  repairedOrders: number;
+  linkedCustomersCreated: number;
+  repairedTransactions: number;
+  migratedUrlsCount: number;
+  summary: string;
+}
+
+export function auditAndRepairOrderHistory(db = getDb()): OrderHistoryAuditResult {
+  let repairedOrders = 0;
+  let linkedCustomersCreated = 0;
+  let repairedTransactions = 0;
+  let migratedUrlsCount = 0;
+  const now = new Date().toISOString();
+  const todayStr = now.split('T')[0];
+
+  const normalizeDigits = (val?: string) => (val || '').replace(/\D/g, '');
+  const replaceLegacyDomain = (val: string) =>
+    val
+      .replace(/https?:\/\/(?:www\.)?100dagar\.pk/gi, 'https://www.madinamarket.pk')
+      .replace(/https?:\/\/(?:www\.)?example\.com/gi, 'https://www.madinamarket.pk')
+      .replace(/@100dagar\.pk/gi, '@madinamarket.pk');
+
+  db.exec('BEGIN IMMEDIATE;');
+  try {
+    // 1. Clean legacy domain links in products
+    const allProds = getAllProductsFromDb(db);
+    for (const p of allProds) {
+      let dirty = false;
+      const nextProd = { ...p };
+      if (nextProd.websiteUrl && /(?:100dagar\.pk|example\.com)/i.test(nextProd.websiteUrl)) {
+        nextProd.websiteUrl = replaceLegacyDomain(nextProd.websiteUrl);
+        dirty = true;
+      }
+      if (nextProd.sourceUrl && /(?:100dagar\.pk|example\.com)/i.test(nextProd.sourceUrl)) {
+        nextProd.sourceUrl = replaceLegacyDomain(nextProd.sourceUrl);
+        dirty = true;
+      }
+      if (dirty) {
+        upsertProductRow(db, nextProd);
+        migratedUrlsCount++;
+      }
+    }
+
+    // 2. Clean business_profile, investors, user_accounts, import_logs URLs/emails (preserving internal owner alias in code)
+    const bp = getCollectionValue<BusinessProfile>(db, 'business_profile', defaultBusinessProfile);
+    let bpChanged = false;
+    const nextBp: BusinessProfile = { ...bp };
+    if (nextBp.email && /100dagar\.pk/i.test(nextBp.email)) {
+      nextBp.email = replaceLegacyDomain(nextBp.email);
+      bpChanged = true;
+    }
+    if (!nextBp.website || /(?:100dagar\.pk|example\.com)/i.test(nextBp.website)) {
+      nextBp.website = 'https://www.madinamarket.pk';
+      bpChanged = true;
+    }
+    if (bpChanged) {
+      saveCollectionValue(db, 'business_profile', nextBp);
+      migratedUrlsCount++;
+    }
+
+    for (const colKey of ['investors', 'user_accounts', 'import_logs']) {
+      const arr = getCollectionValue<Array<Record<string, unknown>>>(db, colKey, []);
+      let arrDirty = false;
+      const cleanedArr = arr.map((item) => {
+        const nextItem = { ...item };
+        for (const field of ['email', 'sourceUrl', 'websiteUrl', 'productLink']) {
+          const v = nextItem[field];
+          if (typeof v === 'string' && /(?:100dagar\.pk|example\.com)/i.test(v)) {
+            nextItem[field] = replaceLegacyDomain(v);
+            arrDirty = true;
+            migratedUrlsCount++;
+          }
+        }
+        return nextItem;
+      });
+      if (arrDirty) {
+        saveCollectionValue(db, colKey, cleanedArr);
+      }
+    }
+
+    // 3. Audit customers, cod_orders, and transactions
+    const customers = getAllCustomersFromDb(db);
+    const customerById = new Map<string, Customer>(customers.map((c) => [c.id, c]));
+    const rawOrders = getCollectionValue<CODOrder[]>(db, 'cod_orders', []);
+    const rawTxs = getCollectionValue<Transaction[]>(db, 'transactions', []);
+
+    // Deduplicate COD orders by id
+    const seenOrderIds = new Set<string>();
+    const dedupedOrders: CODOrder[] = [];
+    for (const ord of rawOrders) {
+      if (!ord || !ord.id || seenOrderIds.has(ord.id)) {
+        repairedOrders++;
+        continue;
+      }
+      seenOrderIds.add(ord.id);
+      dedupedOrders.push(ord);
+    }
+
+    // Deduplicate & sanitize transactions
+    const seenTxIds = new Set<string>();
+    const cleanTxs: Transaction[] = [];
+    for (const tx of rawTxs) {
+      if (!tx || !tx.id || seenTxIds.has(tx.id)) {
+        repairedTransactions++;
+        continue;
+      }
+      seenTxIds.add(tx.id);
+      let txDirty = false;
+      const safeAmount = Math.max(0, Number(tx.amount || 0));
+      const safePaid = Math.max(0, Number(tx.paidAmount || 0));
+      const safeDue =
+        tx.dueBalance !== undefined
+          ? Math.max(0, Number(tx.dueBalance))
+          : tx.type === 'credit'
+          ? Math.max(0, safeAmount - safePaid)
+          : 0;
+      const validCustomer =
+        tx.customerId && customerById.has(tx.customerId)
+          ? customerById.get(tx.customerId)
+          : undefined;
+      let resolvedCustomerId = tx.customerId || '';
+      if (!validCustomer) {
+        // Attempt match via notes / order reference
+        const matchedOrd = dedupedOrders.find(
+          (o) =>
+            (o.orderNumber && tx.notes?.includes(o.orderNumber)) ||
+            (o.phone && normalizeDigits(tx.notes).includes(normalizeDigits(o.phone)))
+        );
+        if (matchedOrd?.customerId && customerById.has(matchedOrd.customerId)) {
+          resolvedCustomerId = matchedOrd.customerId;
+          txDirty = true;
+        }
+      }
+      if (
+        resolvedCustomerId !== tx.customerId ||
+        safeAmount !== tx.amount ||
+        !tx.date ||
+        !Array.isArray(tx.auditTrail)
+      ) {
+        txDirty = true;
+      }
+      if (txDirty) repairedTransactions++;
+      cleanTxs.push({
+        ...tx,
+        customerId: resolvedCustomerId,
+        amount: safeAmount,
+        paidAmount: safePaid,
+        dueBalance: safeDue,
+        date: tx.date || (tx.createdAt ? tx.createdAt.split('T')[0] : todayStr),
+        auditTrail: Array.isArray(tx.auditTrail) ? tx.auditTrail : [],
+      });
+    }
+
+    // Audit every COD order -> resolve or create Customer & link pending/delivered COD transaction if missing
+    const fixedOrders: CODOrder[] = dedupedOrders.map((ord) => {
+      let ordDirty = false;
+      const cleanPhoneDigits = normalizeDigits(ord.phone);
+      let matchedCust =
+        (ord.customerId && customerById.get(ord.customerId)) ||
+        (cleanPhoneDigits
+          ? Array.from(customerById.values()).find(
+              (c) => normalizeDigits(c.phone) === cleanPhoneDigits
+            )
+          : undefined);
+
+      if (!matchedCust && ord.customerName) {
+        const digits = cleanPhoneDigits || '03000000000';
+        const defaultPin = digits.length >= 6 ? digits.slice(-6) : '123456';
+        const newCust: Customer = {
+          id: `cust_ord_${ord.id.replace(/[^a-zA-Z0-9]/g, '')}`,
+          name: ord.customerName,
+          phone: ord.phone || digits,
+          city: ord.city || 'Muzaffarabad',
+          area: ord.area,
+          mohalla: ord.mohalla,
+          landmark: ord.landmark,
+          address: ord.address || `${ord.city || 'Pakistan'}`,
+          customerType: 'individual',
+          balance: 0,
+          totalPurchases: 0,
+          creditLimit: 5000,
+          paymentTermsDays: 7,
+          status: 'active',
+          pin: defaultPin,
+          createdAt: (ord.createdAt || now).split('T')[0],
+        };
+        upsertCustomerRow(db, newCust);
+        customerById.set(newCust.id, newCust);
+        matchedCust = newCust;
+        linkedCustomersCreated++;
+        ordDirty = true;
+      }
+
+      const nextCustomerId = matchedCust?.id || ord.customerId;
+      if (nextCustomerId && nextCustomerId !== ord.customerId) {
+        ordDirty = true;
+      }
+
+      const itemsList = Array.isArray(ord.items) ? ord.items : [];
+      const computedSubtotal =
+        Number.isFinite(Number(ord.subtotal)) && Number(ord.subtotal) > 0
+          ? Number(ord.subtotal)
+          : itemsList.reduce((sum, it) => sum + Number(it.amount || 0), 0);
+      const safeDeliveryFee = Math.max(0, Number(ord.deliveryFee || 0));
+      const safeTotal =
+        Number.isFinite(Number(ord.totalAmount)) && Number(ord.totalAmount) > 0
+          ? Number(ord.totalAmount)
+          : computedSubtotal + safeDeliveryFee;
+
+      if (
+        !Array.isArray(ord.items) ||
+        safeTotal !== ord.totalAmount ||
+        safeDeliveryFee !== ord.deliveryFee ||
+        !ord.orderNumber ||
+        !ord.city
+      ) {
+        ordDirty = true;
+      }
+
+      // Ensure corresponding credit Transaction exists in ledger for order history traceability
+      const orderNum = ord.orderNumber || `COD-${ord.id}`;
+      const hasLinkedOrderTx = cleanTxs.some(
+        (t) =>
+          (t.invoiceNumber && t.invoiceNumber === orderNum) ||
+          (t.notes && t.notes.includes(orderNum))
+      );
+      if (!hasLinkedOrderTx && nextCustomerId && safeTotal > 0 && ord.status !== 'returned') {
+        const isDelivered = ord.status === 'delivered';
+        const txDate = (ord.createdAt || now).split('T')[0];
+        const linkedTx: Transaction = {
+          id: `tx_link_${ord.id}`,
+          customerId: nextCustomerId,
+          type: 'credit',
+          amount: safeTotal,
+          paidAmount: isDelivered ? safeTotal : 0,
+          dueBalance: isDelivered ? 0 : safeTotal,
+          saleType: 'cod',
+          date: txDate,
+          dueDate: txDate,
+          paymentTermsDays: 0,
+          invoiceNumber: orderNum,
+          notes: `COD Order #${orderNum} (${ord.city || 'Pakistan'}${ord.deliveryFee > 0 ? ` +Rs. ${ord.deliveryFee} delivery` : ''})`,
+          paymentMode: 'cod',
+          items: itemsList,
+          totalSavings: itemsList.reduce((acc, it) => acc + Number(it.customerSavings || 0), 0),
+          status: isDelivered ? 'completed' : 'pending',
+          responsibleStaff: 'Order Audit Sync',
+          auditTrail: [
+            {
+              id: `aud_sync_${ord.id}`,
+              timestamp: now,
+              action: 'created',
+              newStatus: isDelivered ? 'completed' : 'pending',
+              newAmount: safeTotal,
+              changedBy: 'System Order Audit',
+              notes: `Linked COD order #${orderNum} into backend transaction history`,
+            },
+          ],
+          createdAt: ord.createdAt || now,
+        };
+        cleanTxs.unshift(linkedTx);
+        repairedTransactions++;
+      }
+
+      if (ordDirty) repairedOrders++;
+      return {
+        ...ord,
+        orderNumber: orderNum,
+        customerId: nextCustomerId,
+        city: ord.city || 'Muzaffarabad',
+        items: itemsList,
+        subtotal: computedSubtotal,
+        deliveryFee: safeDeliveryFee,
+        totalAmount: safeTotal,
+      };
+    });
+
+    // 4. Recalculate customer balances & purchases cleanly from cleanTxs
+    for (const cust of customerById.values()) {
+      const custTxs = cleanTxs.filter((t) => t.customerId === cust.id && t.status !== 'cancelled');
+      const totalCredit = custTxs
+        .filter((t) => t.type === 'credit')
+        .reduce((s, t) => s + Number(t.amount || 0), 0);
+      const totalPaidDirect = custTxs
+        .filter((t) => t.type === 'credit' && t.saleType !== 'time_credit')
+        .reduce((s, t) => s + Number(t.paidAmount || 0), 0);
+      const totalDebit = custTxs
+        .filter((t) => t.type === 'debit')
+        .reduce((s, t) => s + Number(t.amount || 0), 0);
+      const ordersCount = custTxs.filter((t) => t.type === 'credit').length;
+      const computedBal = Math.max(0, totalCredit - totalPaidDirect - totalDebit);
+      upsertCustomerRow(db, {
+        ...cust,
+        balance: computedBal,
+        totalPurchases: totalCredit,
+        ordersCount,
+      });
+    }
+
+    saveCollectionValue(db, 'cod_orders', fixedOrders);
+    saveCollectionValue(db, 'transactions', cleanTxs);
+
+    db.exec('COMMIT;');
+  } catch (err) {
+    db.exec('ROLLBACK;');
+    throw err;
+  }
+
+  touchSyncVersion();
+  const summary = `Audit complete: ${repairedOrders} order fixes, ${linkedCustomersCreated} linked customer records created, ${repairedTransactions} ledger transactions synced, ${migratedUrlsCount} legacy URLs updated to madinamarket.pk.`;
+  return {
+    repairedOrders,
+    linkedCustomersCreated,
+    repairedTransactions,
+    migratedUrlsCount,
+    summary,
+  };
 }
 
 export function getDatabaseHealthSummary() {

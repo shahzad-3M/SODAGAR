@@ -53,6 +53,7 @@ import {
   saveResellers,
   apiAddCity,
   apiUpdateCity,
+  apiDeleteCity,
   apiToggleOtherCities,
   apiAddCityArea,
   apiUpdateCityArea,
@@ -129,6 +130,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [areaChargeEdits, setAreaChargeEdits] = useState<Record<string, string>>({});
   const [editingCityId, setEditingCityId] = useState<string | null>(null);
   const [editingCityName, setEditingCityName] = useState('');
+  const [editingCityProvince, setEditingCityProvince] = useState<string>('Azad Kashmir (AJK)');
   const [editingAreaId, setEditingAreaId] = useState<string | null>(null);
   const [editingAreaName, setEditingAreaName] = useState('');
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
@@ -369,16 +371,44 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       pushToast(`City "${clean}" already exists.`, 'error');
       return;
     }
-    const res = await apiUpdateCity(city.id || city.name, { name: clean });
+    const nextProv = editingCityProvince || inferProvinceForCity(clean, city.province);
+    const res = await apiUpdateCity(city.id || city.name, { name: clean, province: nextProv });
     if (res.ok && res.cities) {
       const nextProf = { ...formData, deliveryCities: res.cities };
       setFormData(nextProf);
       onSaveProfile(nextProf);
       setEditingCityId(null);
-      pushToast(`City renamed to "${clean}".`, 'success');
+      pushToast(`City updated to "${clean}" (${nextProv}).`, 'success');
     } else {
-      pushToast(res.error || 'Could not rename city.', 'error');
+      pushToast(res.error || 'Could not update city.', 'error');
     }
+  };
+
+  const handleDeleteSettingsCity = (city: DeliveryCityConfig) => {
+    if (isMuzaffarabadCity(city.name)) {
+      pushToast('Muzaffarabad is the default active city and cannot be removed.', 'info');
+      return;
+    }
+    setConfirmDialog({
+      title: 'Remove Delivery City',
+      message: `Remove "${city.name}" and its ${(city.areas || []).length} area(s) from the delivery cities list?`,
+      confirmLabel: 'Remove City',
+      danger: true,
+      onConfirm: async () => {
+        const res = await apiDeleteCity(city.id || city.name);
+        if (res.ok && res.cities) {
+          const nextProf = { ...formData, deliveryCities: res.cities };
+          setFormData(nextProf);
+          onSaveProfile(nextProf);
+          if (expandedCityId === (city.id || city.name)) {
+            setExpandedCityId(null);
+          }
+          pushToast(`Removed "${city.name}" from delivery cities.`, 'info');
+        } else {
+          pushToast(res.error || 'Could not remove city.', 'error');
+        }
+      },
+    });
   };
 
   const handleAddAreasToCity = async (city: DeliveryCityConfig) => {
@@ -1312,7 +1342,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     Provinces, Kashmir, Cities, Sub-Cities, Villages &amp; Charges
                   </h4>
                   <p className="text-xs text-slate-500 dark:text-slate-400">
-                    All provinces &amp; Azad Kashmir (<b>{deliveryCities.length}</b> districts/cities, sub-cities, child cities &amp; villages) are <b>OPEN for Dropship (3–6 working days promised delivery)</b>. Default City Center: <b>Muzaffarabad Rs. {cityCenterDefaultFee}</b>.
+                    All provinces &amp; Azad Kashmir (<b>{deliveryCities.length}</b> districts/cities, sub-cities, child cities &amp; villages) are <b>OPEN for Standard Delivery (3–6 working days promised delivery)</b>. Default City Center: <b>Muzaffarabad Rs. {cityCenterDefaultFee}</b>.
                   </p>
                 </div>
               </div>
@@ -1371,7 +1401,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     Express Delivery — Other Cities Except Muzaffarabad ({activeOtherCitiesCount}/{otherCities.length} Unlocked)
                   </span>
                   <span className="text-[11px] text-slate-500 dark:text-slate-400">
-                    Unchecked cities &amp; sub-cities remain locked 🔒 for Express items. Dropship items (3–6 working days promised delivery) stay OPEN across all provinces, Kashmir, cities &amp; villages.
+                    Locked cities &amp; sub-cities stay restricted 🔒 for Express items. Standard items (3–6 working days promised delivery) stay OPEN across all provinces, Kashmir, cities &amp; villages.
                   </span>
                 </div>
                 <div className="inline-flex rounded-lg border border-slate-300 dark:border-slate-600 overflow-hidden bg-white dark:bg-slate-900">
@@ -1558,26 +1588,42 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
                         {isMzd ? (
                           <span className="px-2 py-0.5 text-[10px] font-bold rounded bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300">
-                            ⚡ Express Default Unlocked
-                          </span>
-                        ) : c.allowed ? (
-                          <span className="px-2 py-0.5 text-[10px] font-bold rounded bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300">
-                            ⚡ Express Unlocked
+                            ⚡ Express Default Allowed
                           </span>
                         ) : (
-                          <span className="px-2 py-0.5 text-[10px] font-bold rounded bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400">
-                            🔒 Express Locked
-                          </span>
+                          <button
+                            type="button"
+                            onClick={() => void handleToggleSettingsCity(c)}
+                            title={c.allowed ? 'Click to Lock this city for Express' : 'Click to Allow/Unlock this city'}
+                            className={`px-2 py-0.5 text-[10px] font-bold rounded cursor-pointer transition-colors ${
+                              c.allowed
+                                ? 'bg-emerald-100 hover:bg-emerald-200 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300'
+                                : 'bg-slate-100 hover:bg-emerald-50 text-slate-600 dark:bg-slate-800 dark:text-slate-400'
+                            }`}
+                          >
+                            {c.allowed ? '🔓 Express Allowed' : '🔒 Locked (Allow)'}
+                          </button>
                         )}
 
                         {editingCityId === cityKey && (
-                          <div className="flex items-center gap-1.5">
+                          <div className="flex flex-wrap items-center gap-1.5">
                             <input
                               type="text"
                               value={editingCityName}
                               onChange={(e) => setEditingCityName(e.target.value)}
                               className="px-2 py-1 text-xs border border-amber-400 rounded bg-white dark:bg-slate-800 text-slate-900 dark:text-white"
                             />
+                            <select
+                              value={editingCityProvince}
+                              onChange={(e) => setEditingCityProvince(e.target.value)}
+                              className="px-2 py-1 text-xs border border-amber-400 rounded bg-white dark:bg-slate-800 text-slate-900 dark:text-white"
+                            >
+                              {PAKISTAN_PROVINCES.map((prov) => (
+                                <option key={prov} value={prov}>
+                                  {prov}
+                                </option>
+                              ))}
+                            </select>
                             <button
                               type="button"
                               onClick={() => void handleSaveCityRename(c)}
@@ -1637,18 +1683,29 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                           onClick={() => {
                             setEditingCityId(cityKey);
                             setEditingCityName(c.name);
+                            setEditingCityProvince(cityProvince);
                           }}
                           className="p-1 text-slate-400 hover:text-amber-600 cursor-pointer"
-                          title="Edit city name"
+                          title="Edit city name & province"
                         >
                           <Pencil className="w-3.5 h-3.5" />
                         </button>
+                        {!isMzd && (
+                          <button
+                            type="button"
+                            onClick={() => handleDeleteSettingsCity(c)}
+                            className="p-1 text-slate-400 hover:text-red-600 cursor-pointer"
+                            title="Remove delivery city"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        )}
                         <button
                           type="button"
                           onClick={() => setExpandedCityId(isExpanded ? null : cityKey)}
                           className="px-2 py-1 text-[11px] font-bold bg-slate-100 dark:bg-slate-800 hover:bg-amber-100 dark:hover:bg-amber-950/50 text-slate-700 dark:text-slate-300 rounded cursor-pointer"
                         >
-                          {isExpanded ? 'Hide Areas' : 'Manage Areas'}
+                          {isExpanded ? 'Hide Areas' : 'Areas (Optional)'}
                         </button>
                       </div>
                     </div>
@@ -1753,6 +1810,20 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                                     </div>
 
                                     <div className="flex items-center gap-1 shrink-0">
+                                      <button
+                                        type="button"
+                                        onClick={() =>
+                                          void handleToggleCityArea(c, area.id, area.allowed)
+                                        }
+                                        className={`px-1.5 py-0.5 text-[9px] font-bold rounded cursor-pointer ${
+                                          area.allowed
+                                            ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300'
+                                            : 'bg-slate-200 text-slate-600 dark:bg-slate-700 dark:text-slate-300'
+                                        }`}
+                                        title={area.allowed ? 'Click to Lock area' : 'Click to Allow area'}
+                                      >
+                                        {area.allowed ? 'Allowed' : 'Locked'}
+                                      </button>
                                       <button
                                         type="button"
                                         onClick={() => {

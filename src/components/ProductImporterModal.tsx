@@ -162,7 +162,7 @@ export const ProductImporterModal: React.FC<ProductImporterModalProps> = ({
 
   const handleStartImport = async (urlToFetch: string, overrideHtml?: string) => {
     const normalizedUrl = overrideHtml
-      ? normalizeInputUrl(urlToFetch) || 'https://supplier.example.com/product'
+      ? normalizeInputUrl(urlToFetch) || 'https://madinamarket.pk/products/imported-item'
       : normalizeInputUrl(urlToFetch);
 
     if (!normalizedUrl) {
@@ -530,6 +530,11 @@ export const ProductImporterModal: React.FC<ProductImporterModalProps> = ({
       subcategoryId: finalSubId,
       childSubcategoryId: finalChildId,
       deliveryType: extractedProduct.deliveryType === 'express' ? 'express' : 'standard',
+      deliveryFeeType: extractedProduct.deliveryFeeType || 'default',
+      customDeliveryCharge:
+        extractedProduct.deliveryFeeType === 'custom'
+          ? Math.max(0, Math.round(Number(extractedProduct.customDeliveryCharge) || 0))
+          : undefined,
       isUpcoming: isUpcomingItem,
       upcomingStatus: isUpcomingItem ? 'coming_soon' : 'available',
       expectedArrivalDate: isUpcomingItem ? (upcomingArrivalDate.trim() || extractedProduct.expectedArrivalDate) : undefined,
@@ -731,7 +736,7 @@ export const ProductImporterModal: React.FC<ProductImporterModalProps> = ({
                       <button
                         type="button"
                         disabled={isLoading || !htmlFallbackSource.trim()}
-                        onClick={() => handleStartImport(importUrl || 'https://supplier.example.com/product', htmlFallbackSource)}
+                        onClick={() => handleStartImport(importUrl || 'https://madinamarket.pk/products/imported-item', htmlFallbackSource)}
                         className="px-4 py-1.5 bg-slate-900 dark:bg-amber-500 text-white dark:text-slate-950 font-bold text-xs rounded-lg cursor-pointer disabled:opacity-50"
                       >
                         Extract from Pasted HTML
@@ -937,7 +942,7 @@ export const ProductImporterModal: React.FC<ProductImporterModalProps> = ({
                     </div>
                     <div>
                       <label className="text-[11px] font-bold text-slate-600 dark:text-slate-400 block">
-                        Our Wholesale Price (Rs.)
+                        Our Super Best Price (Rs.)
                       </label>
                       <input
                         type="number"
@@ -1177,6 +1182,85 @@ export const ProductImporterModal: React.FC<ProductImporterModalProps> = ({
                             </span>
                           </div>
                         </button>
+                      </div>
+
+                      {/* Product Delivery Charges: Default vs Free vs Custom Charge */}
+                      <div className="pt-2 border-t border-slate-200 dark:border-slate-800 space-y-2">
+                        <span className="text-xs font-bold text-slate-800 dark:text-slate-200 block">
+                          Product Delivery Charges (Free Delivery or Custom Delivery Charge)
+                        </span>
+                        <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setExtractedProduct({
+                                ...extractedProduct,
+                                deliveryFeeType: 'default',
+                                customDeliveryCharge: undefined,
+                              })
+                            }
+                            className={`p-2 rounded-lg border text-left text-xs cursor-pointer ${
+                              (extractedProduct.deliveryFeeType || 'default') === 'default'
+                                ? 'border-amber-500 bg-amber-50 dark:bg-amber-950/40 font-bold text-slate-900 dark:text-white'
+                                : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-600 dark:text-slate-300'
+                            }`}
+                          >
+                            City / Area Fee (Default)
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setExtractedProduct({
+                                ...extractedProduct,
+                                deliveryFeeType: 'free',
+                                customDeliveryCharge: 0,
+                              })
+                            }
+                            className={`p-2 rounded-lg border text-left text-xs cursor-pointer ${
+                              extractedProduct.deliveryFeeType === 'free'
+                                ? 'border-emerald-500 bg-emerald-50 dark:bg-emerald-950/40 font-bold text-emerald-800 dark:text-emerald-200'
+                                : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-600 dark:text-slate-300'
+                            }`}
+                          >
+                            Free Delivery (Rs. 0)
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setExtractedProduct({
+                                ...extractedProduct,
+                                deliveryFeeType: 'custom',
+                                customDeliveryCharge: extractedProduct.customDeliveryCharge ?? 200,
+                              })
+                            }
+                            className={`p-2 rounded-lg border text-left text-xs cursor-pointer ${
+                              extractedProduct.deliveryFeeType === 'custom'
+                                ? 'border-blue-500 bg-blue-50 dark:bg-blue-950/40 font-bold text-blue-800 dark:text-blue-200'
+                                : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-600 dark:text-slate-300'
+                            }`}
+                          >
+                            Custom Charge (Rs.)
+                          </button>
+                        </div>
+                        {extractedProduct.deliveryFeeType === 'custom' && (
+                          <div className="flex items-center gap-2">
+                            <span className="text-xs font-bold text-slate-700 dark:text-slate-300">
+                              Fixed Delivery Charge (Rs.):
+                            </span>
+                            <input
+                              type="number"
+                              min={0}
+                              value={extractedProduct.customDeliveryCharge ?? 0}
+                              onChange={(e) =>
+                                setExtractedProduct({
+                                  ...extractedProduct,
+                                  customDeliveryCharge: Math.max(0, Math.round(Number(e.target.value) || 0)),
+                                })
+                              }
+                              className="w-32 px-2.5 py-1 text-xs font-mono font-bold rounded-lg border border-blue-400 dark:border-blue-700 bg-white dark:bg-slate-900 text-slate-900 dark:text-white"
+                            />
+                          </div>
+                        )}
                       </div>
                     </div>
                   </div>

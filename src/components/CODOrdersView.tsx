@@ -56,6 +56,8 @@ interface CODOrdersViewProps {
   products: ProductItem[];
   customers: Customer[];
   profile: BusinessProfile;
+  userRole?: string;
+  onAuditRepairOrders?: () => Promise<void> | void;
   onUpdateOrderStatus: (
     orderId: string,
     newStatus: CODOrderStatus,
@@ -69,6 +71,8 @@ export const CODOrdersView: React.FC<CODOrdersViewProps> = ({
   products,
   customers,
   profile,
+  userRole = 'admin',
+  onAuditRepairOrders,
   onUpdateOrderStatus,
   onAddNewCODOrder,
 }) => {
@@ -98,6 +102,22 @@ export const CODOrdersView: React.FC<CODOrdersViewProps> = ({
   const [dispatchCourier, setDispatchCourier] = useState<string>('WASAL delivery');
   const [dispatchTracking, setDispatchTracking] = useState<string>('');
   const [createOrderError, setCreateOrderError] = useState<string | null>(null);
+  const [isAuditingOrders, setIsAuditingOrders] = useState(false);
+
+  const canAuditOrders =
+    Boolean(onAuditRepairOrders) &&
+    (userRole === 'super_admin' || userRole === 'admin' || userRole === 'manager');
+
+  const handleRunAuditRepair = async () => {
+    if (!onAuditRepairOrders || isAuditingOrders) return;
+    setIsAuditingOrders(true);
+    try {
+      await onAuditRepairOrders();
+      setFeedbackNotice('Backend order history & customer links audited and cleaned.');
+    } finally {
+      setIsAuditingOrders(false);
+    }
+  };
 
   const pushToast = (text: string, type: ToastMessage['type'] = 'info') => {
     const id = `toast_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
@@ -251,10 +271,10 @@ export const CODOrdersView: React.FC<CODOrdersViewProps> = ({
     }
     if (searchQuery.trim()) {
       const q = searchQuery.toLowerCase();
-      const matchNum = o.orderNumber.toLowerCase().includes(q);
-      const matchName = o.customerName.toLowerCase().includes(q);
-      const matchPhone = o.phone.includes(q);
-      const matchCity = o.city.toLowerCase().includes(q);
+      const matchNum = (o.orderNumber || '').toLowerCase().includes(q);
+      const matchName = (o.customerName || '').toLowerCase().includes(q);
+      const matchPhone = (o.phone || '').includes(q);
+      const matchCity = (o.city || '').toLowerCase().includes(q);
       const matchTrack = o.trackingNumber ? o.trackingNumber.toLowerCase().includes(q) : false;
       if (!matchNum && !matchName && !matchPhone && !matchCity && !matchTrack) return false;
     }
@@ -347,8 +367,8 @@ export const CODOrdersView: React.FC<CODOrdersViewProps> = ({
   };
 
   const handleSendDispatchWhatsApp = (order: CODOrder) => {
-    const cleanPhone = order.phone.replace(/\D/g, '');
-    const itemsList = order.items.map((i) => `• ${i.description} (${i.quantity}x)`).join('\n');
+    const cleanPhone = (order.phone || '').replace(/\D/g, '');
+    const itemsList = (order.items || []).map((i) => `• ${i.description} (${i.quantity}x)`).join('\n');
     const msg = `📦 *کیش آن ڈلیوری آرڈر روانہ / COD Parcel Dispatched!*\n*${profile.name} · مدینہ مارکیٹ*\n\nمحترم *${order.customerName}* صاحب،\nآپ کا پارسل بذریعہ کوریئر روانہ کر دیا گیا ہے۔\n\n*Order No:* #${order.orderNumber}\n*Courier Partner:* ${order.courierPartner}\n*Tracking ID:* ${order.trackingNumber || 'Available shortly'}\n\n*آرڈر کی تفصیلات:*\n${itemsList}\n\n*قابل ادائیگی نقد رقم (Pay Cash to Rider):* *${profile.currencySymbol}${order.totalAmount.toLocaleString('en-PK')}*\n*ڈلیوری ایڈریس:* ${order.address}, ${order.city}\n\nپارسل وصول کرتے وقت رائڈر کو نقد رقم ادا فرمائیں۔ کسی بھی مسئلے کی صورت میں ہمارے واٹس ایپ 0312 5256 266 پر رابطہ کریں۔ شکریہ!`;
 
     openWhatsAppDirect(cleanPhone, msg);
@@ -582,7 +602,7 @@ export const CODOrdersView: React.FC<CODOrdersViewProps> = ({
                     filteredWasalOrders.map((ord) => (
                       <tr key={ord.id} className="hover:bg-slate-50/70 dark:hover:bg-slate-800/40">
                         <td className="py-2.5 px-3 font-mono text-[11px] text-slate-600 dark:text-slate-300">
-                          {ord.createdAt.split('T')[0]}
+                          {(ord.createdAt || '').split('T')[0]}
                         </td>
                         <td className="py-2.5 px-3">
                           <span className="font-mono font-bold text-slate-900 dark:text-white block">
@@ -877,7 +897,7 @@ export const CODOrdersView: React.FC<CODOrdersViewProps> = ({
         </div>
 
         {/* Search & Actions */}
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <div className="relative">
             <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-2.5" />
             <input
@@ -888,6 +908,19 @@ export const CODOrdersView: React.FC<CODOrdersViewProps> = ({
               className="pl-8 pr-3 py-1.5 text-xs rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-hidden"
             />
           </div>
+
+          {canAuditOrders && (
+            <button
+              type="button"
+              disabled={isAuditingOrders}
+              onClick={() => void handleRunAuditRepair()}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-emerald-50 hover:bg-emerald-100 dark:bg-emerald-950/50 dark:hover:bg-emerald-900/70 text-emerald-800 dark:text-emerald-200 border border-emerald-200 dark:border-emerald-800 font-bold text-xs rounded-xl cursor-pointer disabled:opacity-60"
+              title="Audit backend order history, repair orphaned orders, sync ledger links & clean domain URLs"
+            >
+              <ShieldCheck className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
+              <span>{isAuditingOrders ? 'Auditing...' : 'Audit & Clean Orders'}</span>
+            </button>
+          )}
 
           <button
             onClick={() => setIsAddOrderOpen(true)}
@@ -929,7 +962,7 @@ export const CODOrdersView: React.FC<CODOrdersViewProps> = ({
                       #{order.orderNumber}
                     </span>
                     <span className="text-slate-400 font-mono text-[11px]">
-                      {order.createdAt.split('T')[0]}
+                      {(order.createdAt || '').split('T')[0]}
                     </span>
                     {order.resellerCode && (
                       <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-purple-100 text-purple-800 dark:bg-purple-950 dark:text-purple-300">
@@ -986,7 +1019,7 @@ export const CODOrdersView: React.FC<CODOrdersViewProps> = ({
                   {/* Items Ordered */}
                   <div className="md:col-span-3 space-y-1 text-[11px] text-slate-600 dark:text-slate-300">
                     <span className="text-[10px] uppercase font-bold text-slate-400 block">Items in Parcel:</span>
-                    {order.items.map((it, idx) => (
+                    {(order.items || []).map((it, idx) => (
                       <div key={idx} className="truncate">
                         • {it.description} <b className="font-mono">({it.quantity}x)</b>
                       </div>
@@ -1133,6 +1166,12 @@ export const CODOrdersView: React.FC<CODOrdersViewProps> = ({
             </div>
 
             <form onSubmit={handleCreateOrder} className="p-6 space-y-4 text-xs overflow-y-auto">
+              {createOrderError && (
+                <div className="p-3 rounded-xl bg-red-50 dark:bg-red-950/50 border border-red-200 dark:border-red-800 text-red-700 dark:text-red-300 flex items-center gap-2 font-semibold">
+                  <AlertCircle className="w-4 h-4 shrink-0" />
+                  <span>{createOrderError}</span>
+                </div>
+              )}
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div>
                   <label className="font-bold text-slate-700 dark:text-slate-300 block mb-1">
