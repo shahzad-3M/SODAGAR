@@ -962,7 +962,7 @@ export const StoreCatalogView: React.FC<StoreCatalogViewProps> = ({
                   : 'bg-slate-100 dark:bg-slate-800 text-slate-800 dark:text-slate-200 hover:bg-slate-200'
               }`}
             >
-              <span>Standard · 3–6 Working Days ({standardProductCount})</span>
+              <span>Dropship · 3–6 Days Promised ({standardProductCount})</span>
             </button>
           </div>
 
@@ -1042,7 +1042,7 @@ export const StoreCatalogView: React.FC<StoreCatalogViewProps> = ({
                     All Catalog Products ({standardGroupProducts.length})
                   </span>
                   <span className="text-[11px] text-slate-500 dark:text-slate-400">
-                    Open across all cities &amp; sub-cities · Delivery in 3 to 6 working days depending on logistics
+                    Open across all Provinces &amp; Kashmir (Cities, Sub-Cities, Child Cities &amp; Villages) · Dropship 3 to 6 days promised delivery
                   </span>
                 </div>
               )}

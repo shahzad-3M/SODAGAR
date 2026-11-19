@@ -62,8 +62,11 @@ import {
 import {
   DEFAULT_CITY_CENTER_DELIVERY_CHARGE,
   ensureCityAreasShape,
+  getOrderedProvincesFromCities,
+  inferProvinceForCity,
   isMuzaffarabadCity,
   normalizeTextKey,
+  PAKISTAN_PROVINCES,
 } from '../utils/locationCategoryHelpers';
 import {
   ToastBanner,
@@ -115,7 +118,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [userListNotice, setUserListNotice] = useState<string | null>(null);
   const [revealedPins, setRevealedPins] = useState<Record<string, boolean>>({});
   const [newDeliveryCity, setNewDeliveryCity] = useState('');
+  const [newDeliveryCityProvince, setNewDeliveryCityProvince] = useState<string>('Azad Kashmir (AJK)');
   const [newDeliveryCityCharge, setNewDeliveryCityCharge] = useState('');
+  const [locationProvinceFilter, setLocationProvinceFilter] = useState<string>('ALL');
+  const [locationSearchQuery, setLocationSearchQuery] = useState('');
   const [expandedCityId, setExpandedCityId] = useState<string | null>('city_muzaffarabad');
   const [newAreaInputs, setNewAreaInputs] = useState<Record<string, string>>({});
   const [newAreaChargeInputs, setNewAreaChargeInputs] = useState<Record<string, string>>({});
@@ -157,6 +163,18 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const otherCities = deliveryCities.filter((c) => !isMuzaffarabadCity(c.name));
   const activeOtherCitiesCount = otherCities.filter((c) => c.allowed).length;
   const isOtherCitiesEnabled = activeOtherCitiesCount > 0;
+  const orderedProvinces = getOrderedProvincesFromCities(deliveryCities);
+  const filteredDeliveryCities = deliveryCities.filter((c) => {
+    const prov = inferProvinceForCity(c.name, c.province);
+    if (locationProvinceFilter !== 'ALL' && prov !== locationProvinceFilter) return false;
+    if (locationSearchQuery.trim()) {
+      const q = locationSearchQuery.trim().toLowerCase();
+      const matchCity = c.name.toLowerCase().includes(q) || prov.toLowerCase().includes(q);
+      const matchArea = (c.areas || []).some((a) => a.name.toLowerCase().includes(q));
+      return matchCity || matchArea;
+    }
+    return true;
+  });
 
   const parseChargeField = (raw: string): number | null | 'invalid' => {
     const clean = raw.trim();
@@ -323,7 +341,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       pushToast('Delivery charge must be a valid number (0 or higher).', 'error');
       return;
     }
-    const res = await apiAddCity(trimmed, true, parsedCharge);
+    const chosenProvince = newDeliveryCityProvince || inferProvinceForCity(trimmed);
+    const res = await apiAddCity(trimmed, true, parsedCharge, chosenProvince);
     if (res.ok && res.cities) {
       const nextProf = { ...formData, deliveryCities: res.cities };
       setFormData(nextProf);
@@ -331,7 +350,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       setNewDeliveryCity('');
       setNewDeliveryCityCharge('');
       pushToast(
-        `City "${trimmed}"${parsedCharge !== null ? ` (Rs. ${parsedCharge})` : ''} added and synced.`,
+        `City "${trimmed}" (${chosenProvince})${parsedCharge !== null ? ` · Rs. ${parsedCharge}` : ''} added and synced.`,
         'success'
       );
     } else {
@@ -1290,10 +1309,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 </span>
                 <div>
                   <h4 className="text-sm font-bold text-slate-900 dark:text-white">
-                    Cities, Areas &amp; Delivery Charges (شہر، علاقے اور ڈلیوری چارجز)
+                    Provinces, Kashmir, Cities, Sub-Cities, Villages &amp; Charges
                   </h4>
                   <p className="text-xs text-slate-500 dark:text-slate-400">
-                    Default city: <b>Muzaffarabad</b> (City Center default: <b>Rs. {cityCenterDefaultFee}</b>). Enter city-wise or area-wise delivery charges to show live to customers.
+                    All provinces &amp; Azad Kashmir (<b>{deliveryCities.length}</b> districts/cities, sub-cities, child cities &amp; villages) are <b>OPEN for Dropship (3–6 working days promised delivery)</b>. Default City Center: <b>Muzaffarabad Rs. {cityCenterDefaultFee}</b>.
                   </p>
                 </div>
               </div>
@@ -1303,7 +1322,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold text-amber-800 dark:text-amber-200 bg-amber-100 hover:bg-amber-200 dark:bg-amber-950/60 dark:hover:bg-amber-900 rounded-lg cursor-pointer shrink-0"
               >
                 <RotateCcw className="w-3.5 h-3.5" />
-                <span>Reset Cities</span>
+                <span>Reset Defaults</span>
               </button>
             </div>
 
@@ -1352,7 +1371,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     Express Delivery — Other Cities Except Muzaffarabad ({activeOtherCitiesCount}/{otherCities.length} Unlocked)
                   </span>
                   <span className="text-[11px] text-slate-500 dark:text-slate-400">
-                    Unchecked cities &amp; sub-cities remain locked 🔒 for Express items. Standard products (3–6 working days) stay open in ALL cities &amp; sub-cities.
+                    Unchecked cities &amp; sub-cities remain locked 🔒 for Express items. Dropship items (3–6 working days promised delivery) stay OPEN across all provinces, Kashmir, cities &amp; villages.
                   </span>
                 </div>
                 <div className="inline-flex rounded-lg border border-slate-300 dark:border-slate-600 overflow-hidden bg-white dark:bg-slate-900">
@@ -1382,8 +1401,19 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               </div>
             </div>
 
-            {/* Add City Row (with optional delivery fee) */}
-            <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 max-w-2xl">
+            {/* Add City Row (with Province + optional delivery fee) */}
+            <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 max-w-3xl">
+              <select
+                value={newDeliveryCityProvince}
+                onChange={(e) => setNewDeliveryCityProvince(e.target.value)}
+                className="sm:w-48 px-2.5 py-1.5 text-xs rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white"
+              >
+                {PAKISTAN_PROVINCES.map((prov) => (
+                  <option key={prov} value={prov}>
+                    {prov}
+                  </option>
+                ))}
+              </select>
               <input
                 type="text"
                 value={newDeliveryCity}
@@ -1394,7 +1424,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     void handleAddSettingsCity();
                   }
                 }}
-                placeholder="Add new city (e.g. Bagh, Kotli, Chakwal)..."
+                placeholder="Add city / district (e.g. Bagh, Turbat, Skardu)..."
                 className="flex-1 px-3 py-1.5 text-xs rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white"
               />
               <input
@@ -1415,10 +1445,58 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               </button>
             </div>
 
-            {/* Cities Accordion with Nested Areas & Delivery Fees */}
-            <div className="border border-slate-200 dark:border-slate-800 rounded-xl divide-y divide-slate-100 dark:divide-slate-800 overflow-hidden">
-              {deliveryCities.map((c) => {
+            {/* Province Filter Tabs & Search */}
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pt-1">
+              <div className="flex flex-wrap items-center gap-1">
+                <button
+                  type="button"
+                  onClick={() => setLocationProvinceFilter('ALL')}
+                  className={`px-2.5 py-1 rounded-lg text-[11px] font-bold cursor-pointer ${
+                    locationProvinceFilter === 'ALL'
+                      ? 'bg-slate-900 text-white dark:bg-amber-500 dark:text-slate-950'
+                      : 'bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 hover:bg-slate-200'
+                  }`}
+                >
+                  All Provinces ({deliveryCities.length})
+                </button>
+                {orderedProvinces.map((prov) => {
+                  const cnt = deliveryCities.filter(
+                    (c) => inferProvinceForCity(c.name, c.province) === prov
+                  ).length;
+                  return (
+                    <button
+                      key={prov}
+                      type="button"
+                      onClick={() => setLocationProvinceFilter(prov)}
+                      className={`px-2.5 py-1 rounded-lg text-[11px] font-semibold cursor-pointer ${
+                        locationProvinceFilter === prov
+                          ? 'bg-slate-900 text-white dark:bg-amber-500 dark:text-slate-950'
+                          : 'bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 hover:bg-slate-200'
+                      }`}
+                    >
+                      {prov} ({cnt})
+                    </button>
+                  );
+                })}
+              </div>
+
+              <div className="relative sm:w-64 shrink-0">
+                <Search className="w-3.5 h-3.5 absolute left-2.5 top-2 text-slate-400" />
+                <input
+                  type="text"
+                  value={locationSearchQuery}
+                  onChange={(e) => setLocationSearchQuery(e.target.value)}
+                  placeholder="Search city, sub-city, or village..."
+                  className="w-full pl-8 pr-2.5 py-1.5 text-xs rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white"
+                />
+              </div>
+            </div>
+
+            {/* Cities Accordion with Nested Sub-Cities / Child Cities / Villages & Delivery Fees */}
+            <div className="border border-slate-200 dark:border-slate-800 rounded-xl divide-y divide-slate-100 dark:divide-slate-800 overflow-hidden max-h-[540px] overflow-y-auto">
+              {filteredDeliveryCities.map((c) => {
                 const cityKey = c.id || c.name;
+                const cityProvince = inferProvinceForCity(c.name, c.province);
                 const isExpanded = expandedCityId === cityKey;
                 const areas = c.areas || [];
                 const activeAreaCount = areas.filter((a) => a.allowed).length;
@@ -1473,6 +1551,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                             </span>
                           )}
                         </button>
+
+                        <span className="px-2 py-0.5 text-[10px] font-semibold rounded bg-amber-50 text-amber-800 dark:bg-amber-950/50 dark:text-amber-300 border border-amber-200/70 dark:border-amber-800/60">
+                          {cityProvince}
+                        </span>
 
                         {isMzd ? (
                           <span className="px-2 py-0.5 text-[10px] font-bold rounded bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300">

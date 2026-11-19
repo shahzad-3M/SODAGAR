@@ -668,6 +668,54 @@ export function buildInvestorProductInquiryMessage(
   return lines.join('\n');
 }
 
+export function buildAddMyProductInvestorMessage(
+  product: ProductItem,
+  profile: BusinessProfile,
+  options?: ProductMessageOptions
+): string {
+  const productUrl = options?.productUrl || buildProductPageUrl(product.id);
+  const storeTitle = (profile.name || '100DAGAR').split('·')[0].trim() || '100DAGAR';
+  const investorGreeting = options?.investorName
+    ? `Dear ${options.investorName},`
+    : 'Dear Investor Partner,';
+  const lastName = extractCustomerLastName(options?.customerName);
+
+  const lines: string[] = [
+    `*ADD MY PRODUCT & INVESTOR CONTACT — ${storeTitle}*`,
+    ``,
+    investorGreeting,
+    ``,
+    lastName
+      ? `My name is *${lastName}*. I saw your listing on ${storeTitle} and would like to add my product / connect directly with you for full details:`
+      : `I saw your listing on ${storeTitle} and would like to add my product / connect directly with you for full details:`,
+    ``,
+    `*Referenced Product:* ${product.name}`,
+    `*SKU:* ${product.sku || product.id}`,
+    `*Product Link:* ${productUrl}`,
+    ``,
+    `Please share how I can submit my product details and connect with you directly.`,
+  ];
+
+  return lines.join('\n');
+}
+
+export function openExternalLinkSafe(rawUrl: string): void {
+  const trimmed = (rawUrl || '').trim();
+  if (!trimmed) return;
+  const href = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+  try {
+    const link = document.createElement('a');
+    link.href = href;
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  } catch (err) {
+    console.error('External link error:', err);
+  }
+}
+
 function loadCorsImage(src: string): Promise<HTMLImageElement | null> {
   return new Promise((resolve) => {
     if (!src) {

@@ -150,6 +150,7 @@ export interface ProductItem {
   rating?: number;
   investorId?: string; // Assigned investor
   investorWhatsApp?: string; // Optional direct WhatsApp number for investor-supplied product
+  addMyProductUrl?: string; // Manual editable link for "Add My Product" directing to investor contact/details
   createdAt: string;
 }
 
@@ -277,11 +278,13 @@ export interface DeliveryAreaConfig {
   name: string;
   allowed: boolean;
   deliveryCharge?: number;
+  areaType?: 'sub_city' | 'tehsil' | 'town' | 'village' | 'sector';
 }
 
 export interface DeliveryCityConfig {
   id?: string;
   name: string;
+  province?: string;
   allowed: boolean;
   deliveryCharge?: number;
   areas?: DeliveryAreaConfig[];

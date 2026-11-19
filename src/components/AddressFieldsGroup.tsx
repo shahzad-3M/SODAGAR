@@ -1,7 +1,12 @@
 import React, { useMemo, useState } from 'react';
-import { MapPin, Navigation, Home, Building2, Lock, Zap, CheckCircle2 } from 'lucide-react';
+import { MapPin, Navigation, Home, Building2, Lock, Zap, CheckCircle2, Globe2 } from 'lucide-react';
 import { DeliveryCityConfig } from '../types';
-import { isMuzaffarabadCity, normalizeTextKey } from '../utils/locationCategoryHelpers';
+import {
+  getOrderedProvincesFromCities,
+  inferProvinceForCity,
+  isMuzaffarabadCity,
+  normalizeTextKey,
+} from '../utils/locationCategoryHelpers';
 
 interface AddressFieldsGroupProps {
   cities: DeliveryCityConfig[];
@@ -39,25 +44,65 @@ export const AddressFieldsGroup: React.FC<AddressFieldsGroupProps> = ({
   compact = false,
 }) => {
   const [customAreaMode, setCustomAreaMode] = useState(false);
+  const [provinceFilter, setProvinceFilter] = useState<string>('ALL');
 
   const visibleCities = useMemo(() => {
+    let base: DeliveryCityConfig[];
     if (deliveryMode === 'all_open' || deliveryMode === 'express_locked') {
-      if (city && !cities.some((c) => normalizeTextKey(c.name) === normalizeTextKey(city))) {
-        return [...cities, { id: `legacy_${city}`, name: city, allowed: false, areas: [] }];
-      }
-      return cities;
+      base = cities;
+    } else {
+      base = filterActiveCitiesOnly ? cities.filter((c) => c.allowed) : cities;
     }
-    const base = filterActiveCitiesOnly ? cities.filter((c) => c.allowed) : cities;
     if (city && !base.some((c) => normalizeTextKey(c.name) === normalizeTextKey(city))) {
-      return [...base, { id: `legacy_${city}`, name: city, allowed: true, areas: [] }];
+      return [
+        ...base,
+        {
+          id: `legacy_${city}`,
+          name: city,
+          province: inferProvinceForCity(city),
+          allowed: deliveryMode !== 'express_locked',
+          areas: [],
+        },
+      ];
     }
     return base;
   }, [cities, city, filterActiveCitiesOnly, deliveryMode]);
 
-  const selectedCityObj = useMemo(
-    () => cities.find((c) => normalizeTextKey(c.name) === normalizeTextKey(city)),
-    [cities, city]
+  const orderedProvinces = useMemo(
+    () => getOrderedProvincesFromCities(visibleCities),
+    [visibleCities]
   );
+
+  const selectedCityObj = useMemo(
+    () => visibleCities.find((c) => normalizeTextKey(c.name) === normalizeTextKey(city)),
+    [visibleCities, city]
+  );
+
+  const effectiveProvinceFilter =
+    provinceFilter !== 'ALL' && orderedProvinces.includes(provinceFilter)
+      ? provinceFilter
+      : 'ALL';
+
+  const citiesInActiveScope = useMemo(() => {
+    if (effectiveProvinceFilter === 'ALL') return visibleCities;
+    return visibleCities.filter(
+      (c) => inferProvinceForCity(c.name, c.province) === effectiveProvinceFilter
+    );
+  }, [visibleCities, effectiveProvinceFilter]);
+
+  const groupedByProvince = useMemo(() => {
+    const groups = new Map<string, DeliveryCityConfig[]>();
+    for (const p of orderedProvinces) {
+      groups.set(p, []);
+    }
+    for (const c of citiesInActiveScope) {
+      const p = inferProvinceForCity(c.name, c.province);
+      const list = groups.get(p) || [];
+      list.push(c);
+      groups.set(p, list);
+    }
+    return Array.from(groups.entries()).filter(([, list]) => list.length > 0);
+  }, [citiesInActiveScope, orderedProvinces]);
 
   const cityAreas = useMemo(() => {
     const rawAreas = selectedCityObj?.areas || [];
@@ -91,6 +136,40 @@ export const AddressFieldsGroup: React.FC<AddressFieldsGroupProps> = ({
     cityAreas.length > 0 &&
     (!selectedAreaObj || !selectedAreaObj.allowed);
 
+  const activeCityProvince = selectedCityObj
+    ? inferProvinceForCity(selectedCityObj.name, selectedCityObj.province)
+    : city
+    ? inferProvinceForCity(city)
+    : '';
+
+  const handleProvinceChange = (nextProv: string) => {
+    setProvinceFilter(nextProv);
+    if (nextProv === 'ALL') return;
+    const provCities = visibleCities.filter(
+      (c) => inferProvinceForCity(c.name, c.province) === nextProv
+    );
+    if (provCities.length === 0) return;
+    const currentStillInProv = provCities.some(
+      (c) => normalizeTextKey(c.name) === normalizeTextKey(city)
+    );
+    if (!currentStillInProv) {
+      const preferred =
+        deliveryMode === 'express_locked'
+          ? provCities.find((c) => isMuzaffarabadCity(c.name) || c.allowed) || provCities[0]
+          : provCities[0];
+      if (preferred) {
+        const nextAreas = (preferred.areas || []).filter((a) =>
+          deliveryMode === 'express_locked' ? a.allowed : true
+        );
+        setCustomAreaMode(false);
+        onChange({
+          city: preferred.name,
+          area: nextAreas[0]?.name || '',
+        });
+      }
+    }
+  };
+
   return (
     <div className={compact ? 'space-y-2.5' : 'space-y-3'}>
       {deliveryMode === 'express_locked' && (
@@ -105,7 +184,7 @@ export const AddressFieldsGroup: React.FC<AddressFieldsGroupProps> = ({
             <>
               <Lock className="w-3.5 h-3.5 shrink-0" />
               <span>
-                Express items deliver ONLY in manually unlocked cities &amp; sub-cities. Other cities/sub-cities remain locked (🔒).
+                Express items deliver ONLY in manually unlocked cities &amp; sub-cities. Other provinces/cities remain locked (🔒).
               </span>
             </>
           ) : (
@@ -123,24 +202,56 @@ export const AddressFieldsGroup: React.FC<AddressFieldsGroupProps> = ({
         <div className="px-2.5 py-1.5 rounded-lg border border-emerald-200 dark:border-emerald-800/70 bg-emerald-50/70 dark:bg-emerald-950/20 text-emerald-800 dark:text-emerald-200 text-[10px] font-semibold flex items-center gap-1.5">
           <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
           <span>
-            Open across all cities &amp; sub-cities — Delivery in 3 to 6 working days depending on logistics.
+            All Provinces &amp; Kashmir Open — Dropship 3 to 6 Working Days Promised Delivery (Major Cities, Sub-Cities, Child Cities &amp; Villages).
           </span>
         </div>
       )}
 
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-        {/* City Dropdown */}
+      {/* Province / Region Filter Row */}
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
         <div>
           <label className="text-[11px] font-bold text-slate-700 dark:text-slate-300 mb-1 flex items-center gap-1">
-            <Building2 className="w-3.5 h-3.5 text-amber-500" />
-            <span>City / شہر {required && '*'}</span>
+            <Globe2 className="w-3.5 h-3.5 text-amber-500" />
+            <span>Province / Kashmir (صوبہ)</span>
+          </label>
+          <select
+            value={effectiveProvinceFilter}
+            onChange={(e) => handleProvinceChange(e.target.value)}
+            className={fieldCls}
+          >
+            <option value="ALL">All Provinces &amp; Kashmir ({visibleCities.length})</option>
+            {orderedProvinces.map((prov) => {
+              const count = visibleCities.filter(
+                (c) => inferProvinceForCity(c.name, c.province) === prov
+              ).length;
+              return (
+                <option key={prov} value={prov}>
+                  {prov} ({count})
+                </option>
+              );
+            })}
+          </select>
+        </div>
+
+        {/* Major City / District Dropdown */}
+        <div>
+          <label className="text-[11px] font-bold text-slate-700 dark:text-slate-300 mb-1 flex items-center justify-between gap-1">
+            <span className="flex items-center gap-1">
+              <Building2 className="w-3.5 h-3.5 text-amber-500" />
+              <span>City / District (شہر) {required && '*'}</span>
+            </span>
+            {activeCityProvince && (
+              <span className="text-[9px] font-semibold text-slate-400 truncate max-w-[95px]">
+                {activeCityProvince}
+              </span>
+            )}
           </label>
           <select
             required={required}
             value={city}
             onChange={(e) => {
               const nextCity = e.target.value;
-              const nextCityObj = cities.find(
+              const nextCityObj = visibleCities.find(
                 (c) => normalizeTextKey(c.name) === normalizeTextKey(nextCity)
               );
               const nextAreas = (nextCityObj?.areas || []).filter((a) =>
@@ -160,41 +271,65 @@ export const AddressFieldsGroup: React.FC<AddressFieldsGroupProps> = ({
             }}
             className={fieldCls}
           >
-            <option value="">-- Select City --</option>
-            {visibleCities.map((c) => {
-              const isLockedForExpress =
-                deliveryMode === 'express_locked' && !isMuzaffarabadCity(c.name) && !c.allowed;
-              const isDisabled = isLockedForExpress;
-              return (
-                <option key={c.id || c.name} value={c.name} disabled={isDisabled}>
-                  {isLockedForExpress ? '🔒 ' : ''}
-                  {c.name}
-                  {typeof c.deliveryCharge === 'number' ? ` (Rs. ${c.deliveryCharge})` : ''}
-                  {isLockedForExpress
-                    ? ' — Locked (Express OFF)'
-                    : deliveryMode === 'legacy' && !c.allowed
-                    ? ' (Delivery Disabled)'
-                    : ''}
-                </option>
-              );
-            })}
+            <option value="">-- Select City / District --</option>
+            {effectiveProvinceFilter === 'ALL'
+              ? groupedByProvince.map(([provLabel, provCities]) => (
+                  <optgroup key={provLabel} label={provLabel}>
+                    {provCities.map((c) => {
+                      const isLockedForExpress =
+                        deliveryMode === 'express_locked' &&
+                        !isMuzaffarabadCity(c.name) &&
+                        !c.allowed;
+                      return (
+                        <option key={c.id || c.name} value={c.name} disabled={isLockedForExpress}>
+                          {isLockedForExpress ? '🔒 ' : ''}
+                          {c.name}
+                          {typeof c.deliveryCharge === 'number' ? ` (Rs. ${c.deliveryCharge})` : ''}
+                          {isLockedForExpress
+                            ? ' — Express Locked'
+                            : deliveryMode === 'legacy' && !c.allowed
+                            ? ' (Delivery Disabled)'
+                            : ''}
+                        </option>
+                      );
+                    })}
+                  </optgroup>
+                ))
+              : citiesInActiveScope.map((c) => {
+                  const isLockedForExpress =
+                    deliveryMode === 'express_locked' &&
+                    !isMuzaffarabadCity(c.name) &&
+                    !c.allowed;
+                  return (
+                    <option key={c.id || c.name} value={c.name} disabled={isLockedForExpress}>
+                      {isLockedForExpress ? '🔒 ' : ''}
+                      {c.name}
+                      {typeof c.deliveryCharge === 'number' ? ` (Rs. ${c.deliveryCharge})` : ''}
+                      {isLockedForExpress
+                        ? ' — Express Locked'
+                        : deliveryMode === 'legacy' && !c.allowed
+                        ? ' (Delivery Disabled)'
+                        : ''}
+                    </option>
+                  );
+                })}
           </select>
         </div>
 
-        {/* Dynamic Area / Sub-City Dropdown */}
+        {/* Dynamic Sub-City / Child City / Tehsil / Village Dropdown */}
         <div>
           <div className="flex items-center justify-between mb-1">
             <label className="text-[11px] font-bold text-slate-700 dark:text-slate-300 flex items-center gap-1">
               <MapPin className="w-3.5 h-3.5 text-amber-500" />
-              <span>Sub-City / Area Name (علاقہ)</span>
+              <span>Sub-City / Child City / Village</span>
             </label>
             {cityAreas.length > 0 && allowCustomAreaTyping && (
               <button
                 type="button"
                 onClick={() => setCustomAreaMode(!customAreaMode)}
-                className="text-[10px] font-semibold text-amber-600 dark:text-amber-400 hover:underline cursor-pointer"
+                className="text-[10px] font-semibold text-amber-600 dark:text-amber-400 hover:underline cursor-pointer shrink-0"
               >
-                {customAreaMode ? 'Choose from list' : 'Other area'}
+                {customAreaMode ? 'From list' : 'Exact Village'}
               </button>
             )}
           </div>
@@ -212,7 +347,7 @@ export const AddressFieldsGroup: React.FC<AddressFieldsGroupProps> = ({
               }}
               className={fieldCls}
             >
-              <option value="">-- Select Sub-City / Area in {city || 'City'} --</option>
+              <option value="">-- Select Sub-City / Village in {city || 'City'} --</option>
               {cityAreas.map((a) => {
                 const isAreaLocked = deliveryMode === 'express_locked' && !a.allowed;
                 return (
@@ -227,32 +362,32 @@ export const AddressFieldsGroup: React.FC<AddressFieldsGroupProps> = ({
               {area && !hasMatchingPredefinedArea && allowCustomAreaTyping && (
                 <option value={area}>{area} (Saved)</option>
               )}
-              {allowCustomAreaTyping && <option value="__OTHER__">+ Type Area Manually</option>}
+              {allowCustomAreaTyping && <option value="__OTHER__">+ Type Exact Village / Area Manually</option>}
             </select>
           ) : (
             <input
               type="text"
               value={area}
               onChange={(e) => onChange({ area: e.target.value })}
-              placeholder={city ? `Enter area in ${city}` : 'Enter area name'}
+              placeholder={city ? `Enter sub-city, tehsil or village in ${city}` : 'Enter exact village / area name'}
               className={fieldCls}
             />
           )}
         </div>
       </div>
 
-      {/* Mohalla & Nearby Landmark */}
+      {/* Village / Mohalla & Nearby Landmark */}
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
         <div>
           <label className="text-[11px] font-bold text-slate-700 dark:text-slate-300 mb-1 flex items-center gap-1">
             <Home className="w-3.5 h-3.5 text-amber-500" />
-            <span>Mohalla / Neighborhood (محلہ / کالونی)</span>
+            <span>Village / Mohalla / Chak (گاؤں / محلہ / کالونی)</span>
           </label>
           <input
             type="text"
             value={mohalla}
             onChange={(e) => onChange({ mohalla: e.target.value })}
-            placeholder="e.g. Mohalla Eidgah / Street 4 / Block B"
+            placeholder="e.g. Village Chak 45 / Mohalla Eidgah / Block B"
             className={fieldCls}
           />
         </div>
@@ -260,13 +395,13 @@ export const AddressFieldsGroup: React.FC<AddressFieldsGroupProps> = ({
         <div>
           <label className="text-[11px] font-bold text-slate-700 dark:text-slate-300 mb-1 flex items-center gap-1">
             <Navigation className="w-3.5 h-3.5 text-amber-500" />
-            <span>Nearby Landmark (قریبی مشہور جگہ)</span>
+            <span>Nearby Landmark / Tehsil (قریبی مشہور جگہ)</span>
           </label>
           <input
             type="text"
             value={landmark}
             onChange={(e) => onChange({ landmark: e.target.value })}
-            placeholder="e.g. Near Jamia Masjid / Main Gate"
+            placeholder="e.g. Near Main Chowk / Jamia Masjid / Stop"
             className={fieldCls}
           />
         </div>
@@ -276,14 +411,14 @@ export const AddressFieldsGroup: React.FC<AddressFieldsGroupProps> = ({
       {showCompleteAddress && (
         <div>
           <label className="block text-[11px] font-bold text-slate-700 dark:text-slate-300 mb-1">
-            Complete Address / House &amp; Shop No. {required && '*'}
+            Complete Address / House, Village &amp; Street Details {required && '*'}
           </label>
           <input
             type="text"
             required={required}
             value={address}
             onChange={(e) => onChange({ address: e.target.value })}
-            placeholder="House / Shop #, Road, Floor or Delivery Instructions"
+            placeholder="House / Shop #, Village / Mohalla, Post Office, Tehsil & Delivery Instructions"
             className={fieldCls}
           />
         </div>
@@ -291,3 +426,4 @@ export const AddressFieldsGroup: React.FC<AddressFieldsGroupProps> = ({
     </div>
   );
 };
+

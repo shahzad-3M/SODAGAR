@@ -24,13 +24,16 @@ import {
   DEFAULT_CITY_CENTER_DELIVERY_CHARGE,
   ensureCityAreasShape,
   findFirstUnlockedExpressCityAndArea,
+  getOrderedProvincesFromCities,
   getProductDeliveryMeta,
+  inferProvinceForCity,
   isMuzaffarabadCity,
+  PAKISTAN_PROVINCES,
   resolveDeliveryCharge,
   resolveExpressAreaAvailability,
   slugifyId,
 } from '../utils/locationCategoryHelpers';
-import { apiToggleOtherCities, apiUpdateCity } from '../utils/storage';
+import { apiAddCity, apiToggleOtherCities, apiUpdateCity } from '../utils/storage';
 import { AddressFieldsGroup } from './AddressFieldsGroup';
 
 export interface CheckoutSalePayload {
@@ -114,7 +117,10 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
       currentUser?.role === 'manager');
 
   const [showCityManager, setShowCityManager] = useState(false);
+  const [citySetupProvinceFilter, setCitySetupProvinceFilter] = useState<string>('ALL');
+  const [citySetupSearch, setCitySetupSearch] = useState('');
   const [newCityName, setNewCityName] = useState('');
+  const [newCityProvince, setNewCityProvince] = useState<string>('Azad Kashmir (AJK)');
   const [newCityFee, setNewCityFee] = useState('');
   const [includeDeliveryForPosFull, setIncludeDeliveryForPosFull] = useState(false);
   const isAuthenticatedCustomer =
@@ -373,17 +379,21 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
       newCityFee.trim() !== '' && Number.isFinite(Number(newCityFee)) && Number(newCityFee) >= 0
         ? Math.round(Number(newCityFee))
         : undefined;
+    const resolvedProv = newCityProvince || inferProvinceForCity(trimmed);
+    const newId = `${slugifyId('city', trimmed)}_${Date.now().toString(36).slice(-4)}`;
     const updatedCities = [
       ...cityConfigs,
       {
-        id: `${slugifyId('city', trimmed)}_${Date.now().toString(36).slice(-4)}`,
+        id: newId,
         name: trimmed,
+        province: resolvedProv,
         allowed: true,
         ...(parsedFee !== undefined ? { deliveryCharge: parsedFee } : {}),
         areas: [],
       },
     ];
     onSaveProfile({ ...profile, deliveryCities: updatedCities });
+    void apiAddCity(trimmed, true, parsedFee ?? null, resolvedProv);
     setBuyerCity(trimmed);
     setBuyerArea('');
     setNewCityName('');
@@ -589,7 +599,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                   </span>
                 ) : (
                   <span className="text-[10px] text-slate-600 dark:text-slate-400 font-semibold">
-                    Open across all {cityConfigs.length} cities &amp; sub-cities (3–6 working days)
+                    Open across all Provinces &amp; Kashmir ({cityConfigs.length} cities, sub-cities &amp; villages) · Dropship 3–6 working days promised
                   </span>
                 )}
                 {canManageCities && (
@@ -677,7 +687,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                       Express Delivery Cities &amp; Fees (Unlock Cities / Enter Rs. Fee)
                     </span>
                     <span className="text-[10px] text-slate-500">
-                      Unchecked cities &amp; sub-cities remain locked 🔒 for Express items. Standard 3–6 working day products stay open everywhere.
+                      Unchecked cities &amp; sub-cities remain locked 🔒 for Express items. Dropship (3–6 working days promised) stays open across all provinces, Kashmir, cities &amp; villages.
                     </span>
                   </div>
                   <div className="flex items-center gap-1.5">
@@ -703,53 +713,107 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                   </div>
                 </div>
 
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 max-h-40 overflow-y-auto pr-1">
-                  {cityConfigs.map((c) => {
-                    const isMzd = isMuzaffarabadCity(c.name);
-                    return (
-                      <div
-                        key={c.name}
-                        className={`flex items-center justify-between gap-1.5 px-2 py-1.5 rounded-lg border text-[11px] ${
-                          isMzd || c.allowed
-                            ? 'bg-emerald-50/70 dark:bg-emerald-950/30 border-emerald-200 dark:border-emerald-800 text-emerald-900 dark:text-emerald-200 font-semibold'
-                            : 'bg-slate-50 dark:bg-slate-800/60 border-slate-200 dark:border-slate-700 text-slate-400'
-                        }`}
-                      >
-                        <label className="flex items-center gap-1.5 min-w-0 cursor-pointer select-none">
-                          <input
-                            type="checkbox"
-                            checked={isMzd ? true : c.allowed}
-                            disabled={isMzd}
-                            onChange={() => handleToggleCityAllowed(c.name)}
-                            className="w-3.5 h-3.5 rounded text-emerald-600 cursor-pointer shrink-0"
-                          />
-                          <span className={`truncate ${!isMzd && !c.allowed ? 'line-through' : ''}`}>
-                            {c.name}
-                          </span>
-                        </label>
-                        <div className="flex items-center gap-1 shrink-0">
-                          <span className="text-[10px] text-slate-500">Rs.</span>
-                          <input
-                            type="number"
-                            min={0}
-                            value={c.deliveryCharge ?? ''}
-                            placeholder={isMzd ? '50' : '250'}
-                            onChange={(e) => handleQuickCityChargeChange(c.name, e.target.value)}
-                            className="w-14 px-1 py-0.5 text-[10px] font-mono rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-900 dark:text-white"
-                          />
-                        </div>
-                      </div>
-                    );
-                  })}
+                {/* Quick Province Filter & Search */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
+                  <select
+                    value={citySetupProvinceFilter}
+                    onChange={(e) => setCitySetupProvinceFilter(e.target.value)}
+                    className="px-2 py-1 text-[11px] rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-white"
+                  >
+                    <option value="ALL">All Provinces &amp; Kashmir ({cityConfigs.length})</option>
+                    {getOrderedProvincesFromCities(cityConfigs).map((prov) => (
+                      <option key={prov} value={prov}>
+                        {prov}
+                      </option>
+                    ))}
+                  </select>
+                  <input
+                    type="text"
+                    value={citySetupSearch}
+                    onChange={(e) => setCitySetupSearch(e.target.value)}
+                    placeholder="Filter cities / villages..."
+                    className="px-2.5 py-1 text-[11px] rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white"
+                  />
                 </div>
 
-                <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 pt-1">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 max-h-40 overflow-y-auto pr-1">
+                  {cityConfigs
+                    .filter((c) => {
+                      const prov = inferProvinceForCity(c.name, c.province);
+                      if (citySetupProvinceFilter !== 'ALL' && prov !== citySetupProvinceFilter) {
+                        return false;
+                      }
+                      const q = citySetupSearch.trim().toLowerCase();
+                      if (!q) return true;
+                      return (
+                        c.name.toLowerCase().includes(q) ||
+                        prov.toLowerCase().includes(q) ||
+                        (c.areas || []).some((a) => a.name.toLowerCase().includes(q))
+                      );
+                    })
+                    .map((c) => {
+                      const isMzd = isMuzaffarabadCity(c.name);
+                      const provLabel = inferProvinceForCity(c.name, c.province);
+                      return (
+                        <div
+                          key={c.id || c.name}
+                          className={`flex items-center justify-between gap-1.5 px-2 py-1.5 rounded-lg border text-[11px] ${
+                            isMzd || c.allowed
+                              ? 'bg-emerald-50/70 dark:bg-emerald-950/30 border-emerald-200 dark:border-emerald-800 text-emerald-900 dark:text-emerald-200 font-semibold'
+                              : 'bg-slate-50 dark:bg-slate-800/60 border-slate-200 dark:border-slate-700 text-slate-400'
+                          }`}
+                        >
+                          <label className="flex items-center gap-1.5 min-w-0 cursor-pointer select-none">
+                            <input
+                              type="checkbox"
+                              checked={isMzd ? true : c.allowed}
+                              disabled={isMzd}
+                              onChange={() => handleToggleCityAllowed(c.name)}
+                              className="w-3.5 h-3.5 rounded text-emerald-600 cursor-pointer shrink-0"
+                            />
+                            <div className="min-w-0">
+                              <span className={`truncate block ${!isMzd && !c.allowed ? 'line-through' : ''}`}>
+                                {c.name}
+                              </span>
+                              <span className="text-[9px] text-slate-500 dark:text-slate-400 truncate block">
+                                {provLabel} · {(c.areas || []).length} areas
+                              </span>
+                            </div>
+                          </label>
+                          <div className="flex items-center gap-1 shrink-0">
+                            <span className="text-[10px] text-slate-500">Rs.</span>
+                            <input
+                              type="number"
+                              min={0}
+                              value={c.deliveryCharge ?? ''}
+                              placeholder={isMzd ? '50' : '250'}
+                              onChange={(e) => handleQuickCityChargeChange(c.name, e.target.value)}
+                              className="w-14 px-1 py-0.5 text-[10px] font-mono rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-900 dark:text-white"
+                            />
+                          </div>
+                        </div>
+                      );
+                    })}
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-12 gap-1.5 pt-1">
+                  <select
+                    value={newCityProvince}
+                    onChange={(e) => setNewCityProvince(e.target.value)}
+                    className="sm:col-span-4 px-2 py-1.5 text-[11px] rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white"
+                  >
+                    {PAKISTAN_PROVINCES.map((prov) => (
+                      <option key={prov} value={prov}>
+                        {prov}
+                      </option>
+                    ))}
+                  </select>
                   <input
                     type="text"
                     value={newCityName}
                     onChange={(e) => setNewCityName(e.target.value)}
                     placeholder="Add new city name..."
-                    className="flex-1 px-2.5 py-1.5 text-[11px] rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white"
+                    className="sm:col-span-4 px-2.5 py-1.5 text-[11px] rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white"
                   />
                   <input
                     type="number"
@@ -757,15 +821,15 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                     value={newCityFee}
                     onChange={(e) => setNewCityFee(e.target.value)}
                     placeholder="Fee Rs."
-                    className="w-full sm:w-24 px-2.5 py-1.5 text-[11px] font-mono rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white"
+                    className="sm:col-span-2 px-2 py-1.5 text-[11px] font-mono rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white"
                   />
                   <button
                     type="button"
                     onClick={handleAddDeliveryCity}
-                    className="inline-flex items-center justify-center gap-1 px-3 py-1.5 rounded-lg bg-slate-900 dark:bg-amber-500 text-white dark:text-slate-950 font-bold text-[11px] cursor-pointer"
+                    className="sm:col-span-2 inline-flex items-center justify-center gap-1 px-2.5 py-1.5 rounded-lg bg-slate-900 dark:bg-amber-500 text-white dark:text-slate-950 font-bold text-[11px] cursor-pointer"
                   >
                     <Plus className="w-3 h-3" />
-                    <span>Add City</span>
+                    <span>Add</span>
                   </button>
                 </div>
               </div>
@@ -847,7 +911,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                 return (
                   <div className="px-2.5 py-1.5 rounded-lg bg-white/80 dark:bg-slate-900/60 border border-slate-200 dark:border-slate-700 text-[11px] text-slate-700 dark:text-slate-300 font-medium">
                     <span>
-                      Delivery in 3 to 6 working days depending on logistics · Open across all cities &amp; sub-cities
+                      Dropship 3 to 6 working days promised delivery · Open across all provinces, Kashmir, cities, sub-cities &amp; villages
                     </span>
                   </div>
                 );
@@ -856,7 +920,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                 <div className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800 text-[11px] text-amber-950 dark:text-amber-200 font-semibold">
                   <Zap className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
                   <span>
-                    Mixed Cart: {expressCount} ⚡ Express item(s) (unlocked cities &amp; sub-cities only) · {standardCount} item(s) take 3–6 working days depending on logistics
+                    Mixed Cart: {expressCount} ⚡ Express item(s) (unlocked cities &amp; sub-cities only) · {standardCount} Dropship item(s) (3–6 working days promised delivery)
                   </span>
                 </div>
               );

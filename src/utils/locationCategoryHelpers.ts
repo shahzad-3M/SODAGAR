@@ -273,6 +273,93 @@ export function doesProductMatchCategoryFilter(
 export const DEFAULT_CITY_CENTER_DELIVERY_CHARGE = 50;
 export const DEFAULT_OTHER_CITY_DELIVERY_CHARGE = 250;
 
+export const PAKISTAN_PROVINCES = [
+  'Azad Kashmir (AJK)',
+  'Islamabad (ICT)',
+  'Punjab',
+  'Sindh',
+  'Khyber Pakhtunkhwa',
+  'Balochistan',
+  'Gilgit-Baltistan',
+] as const;
+
+export type PakistanProvince = (typeof PAKISTAN_PROVINCES)[number];
+
+const AJK_KEYWORDS = [
+  'muzaffarabad', 'mirpur', 'kotli', 'bhimber', 'rawalakot', 'poonch', 'bagh',
+  'hattian', 'jhelum valley', 'neelum', 'athmuqam', 'sharda', 'kel', 'sudhnoti',
+  'pallandri', 'haveli', 'kahuta (ajk)', 'forward kahuta', 'dadyal', 'chaksawari',
+  'sehnsa', 'charhoi', 'samahni', 'barnala', 'dhirkot', 'hajira', 'abbaspur', 'ajk', 'kashmir',
+];
+
+const ICT_KEYWORDS = ['islamabad', 'ict'];
+
+const SINDH_KEYWORDS = [
+  'karachi', 'hyderabad', 'sukkur', 'larkana', 'mirpurkhas', 'nawabshah',
+  'shaheed benazirabad', 'khairpur', 'dadu', 'jacobabad', 'shikarpur', 'thatta',
+  'badin', 'tharparkar', 'mithi', 'umerkot', 'ghotki', 'sanghar', 'tando allahyar',
+  'tando muhammad khan', 'matiari', 'jamshoro', 'sujawal', 'naushahro', 'kashmore', 'qambar',
+];
+
+const KPK_KEYWORDS = [
+  'peshawar', 'abbottabad', 'mardan', 'swat', 'mingora', 'mansehra', 'haripur',
+  'kohat', 'nowshera', 'charsadda', 'swabi', 'dera ismail khan', 'd.i. khan',
+  'bannu', 'dir', 'buner', 'shangla', 'chitral', 'battagram', 'kohistan',
+  'malakand', 'karak', 'hangu', 'lakki marwat', 'tank', 'khyber', 'bajaur', 'kurram', 'waziristan',
+];
+
+const BALOCHISTAN_KEYWORDS = [
+  'quetta', 'gwadar', 'turbat', 'kech', 'khuzdar', 'hub', 'lasbela', 'chaman',
+  'sibi', 'zhob', 'loralai', 'pishin', 'ziarat', 'dera murad jamali', 'nasirabad',
+  'jaffarabad', 'kalat', 'mastung', 'panjgur', 'nushki', 'kharan', 'awaran',
+  'barkhan', 'kohlu', 'dera bugti', 'bolan', 'kachhi', 'qilla saifullah', 'qilla abdullah',
+];
+
+const GB_KEYWORDS = [
+  'gilgit', 'skardu', 'hunza', 'nagar', 'ghizer', 'diamer', 'chilas', 'astore',
+  'ghanche', 'khaplu', 'shigar', 'kharmang',
+];
+
+export function inferProvinceForCity(
+  cityName?: string | null,
+  explicitProvince?: string | null
+): string {
+  const cleanProv = (explicitProvince || '').trim();
+  if (cleanProv) {
+    const low = cleanProv.toLowerCase();
+    if (low === 'ajk' || low.includes('kashmir')) return 'Azad Kashmir (AJK)';
+    if (low === 'ict' || low.includes('islamabad')) return 'Islamabad (ICT)';
+    if (low === 'kpk' || low.includes('pakhtunkhwa') || low.includes('khyber')) return 'Khyber Pakhtunkhwa';
+    if (low.includes('gilgit') || low === 'gb') return 'Gilgit-Baltistan';
+    if (low.includes('punjab')) return 'Punjab';
+    if (low.includes('sindh')) return 'Sindh';
+    if (low.includes('baloch')) return 'Balochistan';
+    return cleanProv;
+  }
+
+  const key = normalizeTextKey(cityName);
+  if (!key) return 'Azad Kashmir (AJK)';
+  if (AJK_KEYWORDS.some((kw) => key.includes(kw))) return 'Azad Kashmir (AJK)';
+  if (ICT_KEYWORDS.some((kw) => key.includes(kw))) return 'Islamabad (ICT)';
+  if (SINDH_KEYWORDS.some((kw) => key.includes(kw))) return 'Sindh';
+  if (KPK_KEYWORDS.some((kw) => key.includes(kw))) return 'Khyber Pakhtunkhwa';
+  if (BALOCHISTAN_KEYWORDS.some((kw) => key.includes(kw))) return 'Balochistan';
+  if (GB_KEYWORDS.some((kw) => key.includes(kw))) return 'Gilgit-Baltistan';
+  return 'Punjab';
+}
+
+export function getOrderedProvincesFromCities(cities: DeliveryCityConfig[]): string[] {
+  const present = new Set<string>();
+  for (const c of cities || []) {
+    present.add(inferProvinceForCity(c.name, c.province));
+  }
+  const ordered: string[] = PAKISTAN_PROVINCES.filter((p) => present.has(p));
+  for (const p of present) {
+    if (!ordered.includes(p)) ordered.push(p);
+  }
+  return ordered;
+}
+
 export function isMuzaffarabadCity(name?: string | null): boolean {
   return normalizeTextKey(name) === 'muzaffarabad';
 }
@@ -305,6 +392,9 @@ export function ensureCityAreasShape(cities: DeliveryCityConfig[]): DeliveryCity
         name: (a.name || '').trim(),
         allowed: a.allowed !== false,
       };
+      if (a.areaType) {
+        areaObj.areaType = a.areaType;
+      }
       if (parsedAreaCharge !== undefined) {
         areaObj.deliveryCharge = parsedAreaCharge;
       }
@@ -314,6 +404,7 @@ export function ensureCityAreasShape(cities: DeliveryCityConfig[]): DeliveryCity
     const cityObj: DeliveryCityConfig = {
       id: c.id || slugifyId('city', cleanCityName || `city_${idx}`),
       name: cleanCityName,
+      province: inferProvinceForCity(cleanCityName, c.province),
       allowed: isMuzaffarabadCity(cleanCityName) ? true : c.allowed !== false,
       areas,
     };
@@ -427,10 +518,10 @@ export function getProductDeliveryMeta(product?: Partial<ProductItem> | null): P
   return {
     deliveryType: 'standard',
     isExpress: false,
-    badgeLabel: 'Standard Logistics',
-    etaText: 'Delivery in 3 to 6 working days depending on logistics',
-    etaShort: '3–6 Working Days',
-    urduLabel: '3 سے 6 ورکنگ ڈیز (تمام شہروں میں دستیاب)',
+    badgeLabel: 'Dropship · 3–6 Days Promised',
+    etaText: 'Dropship 3 to 6 working days promised delivery across all provinces, Kashmir, cities, sub-cities & villages',
+    etaShort: '3–6 Days Promised',
+    urduLabel: 'ڈراپ شپ 3 سے 6 ورکنگ ڈیز یقینی ڈیلیوری (تمام صوبے، کشمیر و دیہات)',
   };
 }
 

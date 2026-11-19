@@ -50,6 +50,7 @@ import {
   computeCategoryLevel,
   ensureCityAreasShape,
   getCategoryBreadcrumb,
+  inferProvinceForCity,
   isProductPurchaseBlocked,
   isUpcomingCategoryName,
   normalizeTextKey,
@@ -247,7 +248,9 @@ function runMigrations(db: DatabaseSync, hadExistingDb: boolean) {
   const pendingMigrations =
     !hasMigration('001_initial_schema') ||
     !hasMigration('002_seed_defaults_if_empty') ||
-    !hasMigration('003_upgrade_upcoming_categories_locations');
+    !hasMigration('003_upgrade_upcoming_categories_locations') ||
+    !hasMigration('004_delivery_charges_city_areas') ||
+    !hasMigration('005_all_provinces_kashmir_subcities_villages');
 
   if (hadExistingDb && pendingMigrations) {
     createVerifiedBackup('pre_migration');
@@ -602,6 +605,113 @@ function runMigrations(db: DatabaseSync, hadExistingDb: boolean) {
 
     recordMigration('004_delivery_charges_city_areas', 'Added per-city and per-area delivery_charge columns with City Center Rs. 50 default');
   }
+
+  // MIGRATION 005: Non-destructive expansion across ALL Pakistan provinces & Azad Kashmir (cities, sub-cities, child cities & villages)
+  if (!hasMigration('005_all_provinces_kashmir_subcities_villages')) {
+    if (hadExistingDb) {
+      createVerifiedBackup('pre_migration_005_provinces');
+    }
+    const now = new Date().toISOString();
+
+    const cityCols = db.prepare('PRAGMA table_info(cities)').all() as Array<{ name: string }>;
+    if (!cityCols.some((c) => c.name === 'province')) {
+      db.exec('ALTER TABLE cities ADD COLUMN province TEXT;');
+    }
+
+    const areaCols = db.prepare('PRAGMA table_info(city_areas)').all() as Array<{ name: string }>;
+    if (!areaCols.some((c) => c.name === 'area_type')) {
+      db.exec('ALTER TABLE city_areas ADD COLUMN area_type TEXT;');
+    }
+
+    const findCityByNameOrId = db.prepare(
+      'SELECT id, name, province FROM cities WHERE id = ? OR LOWER(TRIM(name)) = LOWER(TRIM(?)) LIMIT 1'
+    );
+    const insertCityIgnore = db.prepare(`
+      INSERT OR IGNORE INTO cities (id, name, province, allowed, delivery_charge, display_order, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    const updateCityProvinceOnly = db.prepare(
+      'UPDATE cities SET province = COALESCE(NULLIF(TRIM(province), \'\'), ?), updated_at = ? WHERE id = ?'
+    );
+    const findAreaByName = db.prepare(
+      'SELECT id FROM city_areas WHERE city_id = ? AND LOWER(TRIM(name)) = LOWER(TRIM(?)) LIMIT 1'
+    );
+    const updateAreaTypeOnly = db.prepare(
+      'UPDATE city_areas SET area_type = COALESCE(NULLIF(TRIM(area_type), \'\'), ?), updated_at = ? WHERE id = ?'
+    );
+    const insertAreaIgnore = db.prepare(`
+      INSERT OR IGNORE INTO city_areas (id, city_id, name, allowed, delivery_charge, area_type, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    defaultDeliveryCities.forEach((defCity, idx) => {
+      const resolvedProv = inferProvinceForCity(defCity.name, defCity.province);
+      const existingCity = findCityByNameOrId.get(
+        defCity.id || slugifyId('city', defCity.name),
+        defCity.name
+      ) as { id: string; name: string; province?: string } | undefined;
+
+      let targetCityId: string;
+      if (existingCity) {
+        targetCityId = existingCity.id;
+        // Strictly preserve existing allowed & delivery_charge; only populate missing province label
+        updateCityProvinceOnly.run(resolvedProv, now, targetCityId);
+      } else {
+        targetCityId = defCity.id || slugifyId('city', defCity.name);
+        insertCityIgnore.run(
+          targetCityId,
+          defCity.name,
+          resolvedProv,
+          defCity.allowed ? 1 : 0,
+          defCity.deliveryCharge ?? null,
+          idx + 1,
+          now,
+          now
+        );
+      }
+
+      for (const a of defCity.areas || []) {
+        const existingArea = findAreaByName.get(targetCityId, a.name) as { id: string } | undefined;
+        if (existingArea) {
+          if (a.areaType) {
+            updateAreaTypeOnly.run(a.areaType, now, existingArea.id);
+          }
+        } else {
+          insertAreaIgnore.run(
+            a.id || slugifyId('area', `${defCity.name}_${a.name}`),
+            targetCityId,
+            a.name,
+            a.allowed !== false ? 1 : 0,
+            a.deliveryCharge ?? null,
+            a.areaType || null,
+            now,
+            now
+          );
+        }
+      }
+    });
+
+    // Backfill province on any custom cities created before Migration 005
+    const allCityRows = db.prepare('SELECT id, name, province FROM cities').all() as Array<{
+      id: string;
+      name: string;
+      province?: string | null;
+    }>;
+    for (const row of allCityRows) {
+      if (!row.province || !String(row.province).trim()) {
+        db.prepare('UPDATE cities SET province = ? WHERE id = ?').run(
+          inferProvinceForCity(row.name),
+          row.id
+        );
+      }
+    }
+
+    syncDeliveryCitiesIntoBusinessProfile(db);
+    recordMigration(
+      '005_all_provinces_kashmir_subcities_villages',
+      'Non-destructively added all Pakistan provinces & Azad Kashmir cities, sub-cities, child cities & villages while keeping Dropship open nationwide'
+    );
+  }
 }
 
 // ==========================================
@@ -683,6 +793,9 @@ export function getAllCitiesFromDb(db = getDb()): DeliveryCityConfig[] {
       name: String(ar.name),
       allowed: Boolean(ar.allowed),
     };
+    if (ar.area_type) {
+      areaObj.areaType = String(ar.area_type) as DeliveryAreaConfig['areaType'];
+    }
     if (ar.delivery_charge !== null && ar.delivery_charge !== undefined) {
       areaObj.deliveryCharge = Number(ar.delivery_charge);
     }
@@ -691,9 +804,11 @@ export function getAllCitiesFromDb(db = getDb()): DeliveryCityConfig[] {
   }
 
   return cityRows.map((cr) => {
+    const nameStr = String(cr.name);
     const cityObj: DeliveryCityConfig = {
       id: String(cr.id),
-      name: String(cr.name),
+      name: nameStr,
+      province: inferProvinceForCity(nameStr, cr.province ? String(cr.province) : undefined),
       allowed: Boolean(cr.allowed),
       areas: areasByCity.get(String(cr.id)) || [],
     };
@@ -730,20 +845,22 @@ export function replaceCitiesAndAreasFromList(db: DatabaseSync, incomingCities: 
     const c = shaped[i];
     const matchByName = existingByName.get(normalizeTextKey(c.name));
     const cityId = matchByName?.id || c.id || slugifyId('city', c.name);
+    const provinceVal = inferProvinceForCity(c.name, c.province || matchByName?.province);
     const cityCharge =
       typeof c.deliveryCharge === 'number' && Number.isFinite(c.deliveryCharge) && c.deliveryCharge >= 0
         ? Math.round(c.deliveryCharge)
         : null;
     db.prepare(`
-      INSERT INTO cities (id, name, allowed, delivery_charge, display_order, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO cities (id, name, province, allowed, delivery_charge, display_order, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         name = excluded.name,
+        province = excluded.province,
         allowed = excluded.allowed,
         delivery_charge = excluded.delivery_charge,
         display_order = excluded.display_order,
         updated_at = excluded.updated_at
-    `).run(cityId, c.name, c.allowed ? 1 : 0, cityCharge, i + 1, now, now);
+    `).run(cityId, c.name, provinceVal, c.allowed ? 1 : 0, cityCharge, i + 1, now, now);
 
     if (c.areas && c.areas.length > 0) {
       for (const a of c.areas) {
@@ -756,14 +873,15 @@ export function replaceCitiesAndAreasFromList(db: DatabaseSync, incomingCities: 
             ? Math.round(a.deliveryCharge)
             : null;
         db.prepare(`
-          INSERT INTO city_areas (id, city_id, name, allowed, delivery_charge, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?)
+          INSERT INTO city_areas (id, city_id, name, allowed, delivery_charge, area_type, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT(id) DO UPDATE SET
             name = excluded.name,
             allowed = excluded.allowed,
             delivery_charge = excluded.delivery_charge,
+            area_type = COALESCE(excluded.area_type, city_areas.area_type),
             updated_at = excluded.updated_at
-        `).run(areaId, cityId, a.name, a.allowed ? 1 : 0, areaCharge, now, now);
+        `).run(areaId, cityId, a.name, a.allowed ? 1 : 0, areaCharge, a.areaType || null, now, now);
       }
     }
   }
@@ -1208,9 +1326,11 @@ export function mergeLocalSnapshotNonDestructively(localCollections: Record<stri
         const existing = byName.get(normalizeTextKey(lc.name));
         if (!existing) {
           const cid = lc.id || slugifyId('city', lc.name);
-          db.prepare('INSERT OR IGNORE INTO cities (id, name, allowed, display_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)').run(
+          const prov = inferProvinceForCity(lc.name, lc.province);
+          db.prepare('INSERT OR IGNORE INTO cities (id, name, province, allowed, display_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run(
             cid,
             lc.name.trim(),
+            prov,
             lc.allowed !== false ? 1 : 0,
             existingCities.length + added + 1,
             now,
@@ -1218,11 +1338,12 @@ export function mergeLocalSnapshotNonDestructively(localCollections: Record<stri
           );
           for (const a of lc.areas || []) {
             if (!a?.name) continue;
-            db.prepare('INSERT OR IGNORE INTO city_areas (id, city_id, name, allowed, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)').run(
+            db.prepare('INSERT OR IGNORE INTO city_areas (id, city_id, name, allowed, area_type, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run(
               a.id || slugifyId('area', `${lc.name}_${a.name}`),
               cid,
               a.name.trim(),
               a.allowed !== false ? 1 : 0,
+              a.areaType || null,
               now,
               now
             );

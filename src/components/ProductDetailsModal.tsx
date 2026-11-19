@@ -19,14 +19,20 @@ import {
   Zap,
   Lock,
   CheckCircle2,
+  Pencil,
+  Link2,
+  PlusCircle,
 } from 'lucide-react';
 import { AppUser, BusinessProfile, Customer, Investor, ProductItem } from '../types';
 import {
+  buildAddMyProductInvestorMessage,
   buildDirectProductWhatsAppMessage,
   buildInvestorProductInquiryMessage,
   buildProductPageUrl,
   buildProfessionalCustomerProductShareMessage,
   generateProductPriceCardFile,
+  generateWhatsAppLink,
+  openExternalLinkSafe,
   openWhatsAppDirect,
   parseProductVideoUrl,
   resolveProductInvestorContact,
@@ -37,7 +43,9 @@ import {
   DEFAULT_CITY_CENTER_DELIVERY_CHARGE,
   ensureCityAreasShape,
   findFirstUnlockedExpressCityAndArea,
+  getOrderedProvincesFromCities,
   getProductDeliveryMeta,
+  inferProvinceForCity,
   isMuzaffarabadCity,
   isProductPurchaseBlocked,
   normalizeTextKey,
@@ -87,8 +95,11 @@ export const ProductDetailsModal: React.FC<ProductDetailsModalProps> = ({
   const [videoSavedToast, setVideoSavedToast] = useState(false);
   const [estimateCity, setEstimateCity] = useState('Muzaffarabad');
   const [estimateArea, setEstimateArea] = useState('City Center');
+  const [customEstimateVillageMode, setCustomEstimateVillageMode] = useState(false);
   const [isSharingCard, setIsSharingCard] = useState(false);
   const [shareFeedback, setShareFeedback] = useState<string | null>(null);
+  const [addProductLinkInput, setAddProductLinkInput] = useState('');
+  const [isEditingAddProductLink, setIsEditingAddProductLink] = useState(false);
 
   const cityConfigs = ensureCityAreasShape(
     profile.deliveryCities && profile.deliveryCities.length > 0
@@ -110,6 +121,9 @@ export const ProductDetailsModal: React.FC<ProductDetailsModalProps> = ({
     setVideoLinkInput(product.videoUrl || '');
     setVideoSavedToast(false);
     setShareFeedback(null);
+    setAddProductLinkInput(product.addMyProductUrl || '');
+    setIsEditingAddProductLink(false);
+    setCustomEstimateVillageMode(false);
     const isExpress = product.deliveryType === 'express';
     if (isExpress) {
       setEstimateCity(firstExpressLocation.city);
@@ -132,7 +146,7 @@ export const ProductDetailsModal: React.FC<ProductDetailsModalProps> = ({
         product.selectedSize || (product.sizes && product.sizes.length > 0 ? product.sizes[0] : 'Standard')
       );
     }
-  }, [isOpen, product?.id, product?.videoUrl, product?.deliveryType, firstExpressLocation.city, firstExpressLocation.area, defaultStandardCity]);
+  }, [isOpen, product?.id, product?.videoUrl, product?.addMyProductUrl, product?.deliveryType, firstExpressLocation.city, firstExpressLocation.area, defaultStandardCity]);
 
   if (!isOpen || !product) return null;
 
@@ -195,6 +209,14 @@ export const ProductDetailsModal: React.FC<ProductDetailsModalProps> = ({
   const selectedEstimateCityObj =
     cityConfigs.find((c) => normalizeTextKey(c.name) === normalizeTextKey(estimateCity)) ||
     cityConfigs[0];
+  const selectedEstimateProvince = inferProvinceForCity(
+    selectedEstimateCityObj?.name || estimateCity,
+    selectedEstimateCityObj?.province
+  );
+  const estimatorProvinces = getOrderedProvincesFromCities(cityConfigs);
+  const citiesInEstimateProvince = cityConfigs.filter(
+    (c) => inferProvinceForCity(c.name, c.province) === selectedEstimateProvince
+  );
   const estimateCityAreas = selectedEstimateCityObj?.areas || [];
   const estimateAvailability = resolveExpressAreaAvailability(
     cityConfigs,
@@ -329,6 +351,42 @@ export const ProductDetailsModal: React.FC<ProductDetailsModalProps> = ({
     });
     setVideoSavedToast(true);
     setTimeout(() => setVideoSavedToast(false), 3000);
+  };
+
+  const handleAddMyProductDirectInvestor = () => {
+    const addMsg = buildAddMyProductInvestorMessage(product, profile, {
+      customerName: resolvedCustomerName,
+      investorName: investorContact.investorName,
+      selectedSize,
+      imageUrl: activeImage,
+    });
+    const customTarget = (product.addMyProductUrl || '').trim();
+    if (customTarget) {
+      if (/^[\d+\-\s()]{8,18}$/.test(customTarget)) {
+        openWhatsAppDirect(customTarget, addMsg);
+      } else {
+        openExternalLinkSafe(customTarget);
+      }
+      return;
+    }
+    openWhatsAppDirect(investorContact.whatsapp, addMsg);
+  };
+
+  const handleSaveAddProductLink = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!onUpdateProduct) return;
+    const trimmed = addProductLinkInput.trim();
+    onUpdateProduct({
+      ...product,
+      addMyProductUrl: trimmed || undefined,
+      updatedAt: new Date().toISOString(),
+    });
+    setIsEditingAddProductLink(false);
+    setShareFeedback(
+      trimmed
+        ? 'Add My Product direct investor link saved.'
+        : 'Add My Product reset to product investor WhatsApp.'
+    );
   };
 
   return (
@@ -832,50 +890,109 @@ export const ProductDetailsModal: React.FC<ProductDetailsModalProps> = ({
                 </div>
 
                 {cityConfigs.length > 0 && (
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                    <div>
-                      <label className="block text-[10px] font-semibold text-slate-500 dark:text-slate-400 mb-1">
-                        Delivery City
-                      </label>
-                      <select
-                        value={selectedEstimateCityObj?.name || estimateCity}
-                        onChange={(e) => {
-                          const nextCity = e.target.value;
-                          setEstimateCity(nextCity);
-                          const cObj = cityConfigs.find(
-                            (c) => normalizeTextKey(c.name) === normalizeTextKey(nextCity)
-                          );
-                          const areas = cObj?.areas || [];
-                          const nextArea = isExpressProduct
-                            ? areas.find((a) => a.allowed)?.name || ''
-                            : areas[0]?.name || '';
-                          setEstimateArea(
-                            nextArea || (isMuzaffarabadCity(nextCity) ? 'City Center' : '')
-                          );
-                        }}
-                        className="w-full px-2.5 py-1.5 text-xs rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-amber-400"
-                      >
-                        {cityConfigs.map((c) => {
-                          const cityUnlocked = isMuzaffarabadCity(c.name) || c.allowed;
-                          const lockedForExpress = isExpressProduct && !cityUnlocked;
-                          return (
-                            <option
-                              key={c.id || c.name}
-                              value={c.name}
-                              disabled={lockedForExpress}
-                            >
-                              {lockedForExpress ? `🔒 ${c.name} (Locked)` : c.name}
+                  <div className="space-y-2">
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                      <div>
+                        <label className="block text-[10px] font-semibold text-slate-500 dark:text-slate-400 mb-1">
+                          Province / Kashmir
+                        </label>
+                        <select
+                          value={selectedEstimateProvince}
+                          onChange={(e) => {
+                            const nextProv = e.target.value;
+                            const provCities = cityConfigs.filter(
+                              (c) => inferProvinceForCity(c.name, c.province) === nextProv
+                            );
+                            const pickedCity =
+                              (isExpressProduct
+                                ? provCities.find((c) => isMuzaffarabadCity(c.name) || c.allowed)
+                                : undefined) || provCities[0];
+                            if (pickedCity) {
+                              setEstimateCity(pickedCity.name);
+                              setCustomEstimateVillageMode(false);
+                              const areas = pickedCity.areas || [];
+                              const nextArea = isExpressProduct
+                                ? areas.find((a) => a.allowed)?.name || ''
+                                : areas[0]?.name || '';
+                              setEstimateArea(
+                                nextArea || (isMuzaffarabadCity(pickedCity.name) ? 'City Center' : '')
+                              );
+                            }
+                          }}
+                          className="w-full px-2.5 py-1.5 text-xs rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-amber-400"
+                        >
+                          {estimatorProvinces.map((prov) => (
+                            <option key={prov} value={prov}>
+                              {prov}
                             </option>
-                          );
-                        })}
-                      </select>
+                          ))}
+                        </select>
+                      </div>
+
+                      <div>
+                        <label className="block text-[10px] font-semibold text-slate-500 dark:text-slate-400 mb-1">
+                          Delivery City / District
+                        </label>
+                        <select
+                          value={selectedEstimateCityObj?.name || estimateCity}
+                          onChange={(e) => {
+                            const nextCity = e.target.value;
+                            setEstimateCity(nextCity);
+                            setCustomEstimateVillageMode(false);
+                            const cObj = cityConfigs.find(
+                              (c) => normalizeTextKey(c.name) === normalizeTextKey(nextCity)
+                            );
+                            const areas = cObj?.areas || [];
+                            const nextArea = isExpressProduct
+                              ? areas.find((a) => a.allowed)?.name || ''
+                              : areas[0]?.name || '';
+                            setEstimateArea(
+                              nextArea || (isMuzaffarabadCity(nextCity) ? 'City Center' : '')
+                            );
+                          }}
+                          className="w-full px-2.5 py-1.5 text-xs rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-amber-400"
+                        >
+                          {(citiesInEstimateProvince.length > 0 ? citiesInEstimateProvince : cityConfigs).map((c) => {
+                            const cityUnlocked = isMuzaffarabadCity(c.name) || c.allowed;
+                            const lockedForExpress = isExpressProduct && !cityUnlocked;
+                            return (
+                              <option
+                                key={c.id || c.name}
+                                value={c.name}
+                                disabled={lockedForExpress}
+                              >
+                                {lockedForExpress ? `🔒 ${c.name} (Locked)` : c.name}
+                              </option>
+                            );
+                          })}
+                        </select>
+                      </div>
                     </div>
 
                     <div>
-                      <label className="block text-[10px] font-semibold text-slate-500 dark:text-slate-400 mb-1">
-                        Sub-City / Area
-                      </label>
-                      {estimateCityAreas.length > 0 ? (
+                      <div className="flex items-center justify-between gap-2 mb-1">
+                        <label className="block text-[10px] font-semibold text-slate-500 dark:text-slate-400">
+                          Sub-City / Child City / Village
+                        </label>
+                        {!isExpressProduct && estimateCityAreas.length > 0 && (
+                          <button
+                            type="button"
+                            onClick={() => setCustomEstimateVillageMode((prev) => !prev)}
+                            className="text-[10px] font-bold text-amber-700 dark:text-amber-400 hover:underline cursor-pointer"
+                          >
+                            {customEstimateVillageMode ? 'Pick from list' : '+ Type Exact Village'}
+                          </button>
+                        )}
+                      </div>
+                      {!isExpressProduct && (customEstimateVillageMode || estimateCityAreas.length === 0) ? (
+                        <input
+                          type="text"
+                          value={estimateArea}
+                          onChange={(e) => setEstimateArea(e.target.value)}
+                          placeholder={`Enter village, town or tehsil in ${selectedEstimateCityObj?.name || estimateCity}...`}
+                          className="w-full px-2.5 py-1.5 text-xs rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-amber-400"
+                        />
+                      ) : estimateCityAreas.length > 0 ? (
                         <select
                           value={estimateArea}
                           onChange={(e) => setEstimateArea(e.target.value)}
@@ -897,9 +1014,7 @@ export const ProductDetailsModal: React.FC<ProductDetailsModalProps> = ({
                         </select>
                       ) : (
                         <div className="px-2.5 py-1.5 text-xs rounded-lg border border-slate-200 dark:border-slate-700 bg-white/70 dark:bg-slate-900/60 text-slate-500 dark:text-slate-400">
-                          {isExpressProduct
-                            ? 'All areas in unlocked city covered'
-                            : 'Open across all areas'}
+                          All areas &amp; villages in unlocked city covered
                         </div>
                       )}
                     </div>
@@ -923,53 +1038,56 @@ export const ProductDetailsModal: React.FC<ProductDetailsModalProps> = ({
                   )}
                 </div>
 
-                {/* Delivery Conditions Banner: Express Symbol+Lock vs Standard Open Without Symbol */}
+                {/* Delivery Conditions Banner: Refined two-tier presentation */}
                 {!isProductPurchaseBlocked(product) && (
                   isExpressProduct ? (
                     <div
-                      className={`p-2.5 rounded-lg border text-[11px] flex items-center justify-between gap-2 ${
+                      className={`p-3 rounded-xl border border-l-4 shadow-2xs space-y-1.5 ${
                         estimateAvailability.allowed
-                          ? 'bg-emerald-50 dark:bg-emerald-950/40 border-emerald-200 dark:border-emerald-800 text-emerald-900 dark:text-emerald-200'
-                          : 'bg-rose-50 dark:bg-rose-950/40 border-rose-200 dark:border-rose-800 text-rose-900 dark:text-rose-200'
+                          ? 'bg-emerald-50/90 dark:bg-emerald-950/40 border-emerald-200 dark:border-emerald-800 border-l-emerald-600 text-emerald-950 dark:text-emerald-100'
+                          : 'bg-rose-50/90 dark:bg-rose-950/40 border-rose-200 dark:border-rose-800 border-l-rose-600 text-rose-950 dark:text-rose-100'
                       }`}
                     >
-                      <div className="flex items-center gap-2 min-w-0">
-                        {estimateAvailability.allowed ? (
-                          <Zap className="w-4 h-4 text-emerald-600 fill-emerald-500 shrink-0" />
-                        ) : (
-                          <Lock className="w-4 h-4 text-rose-600 shrink-0" />
-                        )}
-                        <div className="min-w-0">
-                          <span className="font-extrabold flex items-center gap-1">
-                            <span>⚡ {deliveryMeta.badgeLabel}</span>
-                            {estimateAvailability.allowed ? (
-                              <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 inline" />
-                            ) : null}
-                          </span>
-                          <span className="text-[10px] opacity-90 block">
-                            {estimateAvailability.allowed
-                              ? 'Instant Express delivery available only in manually selected cities & sub-cities (others locked).'
-                              : estimateAvailability.reason}
-                          </span>
-                        </div>
+                      <div className="flex items-center justify-between gap-2 pb-1.5 border-b border-current/10">
+                        <span className="font-extrabold text-[11px] inline-flex items-center gap-1.5">
+                          {estimateAvailability.allowed ? (
+                            <Zap className="w-3.5 h-3.5 text-emerald-600 fill-emerald-500 shrink-0" />
+                          ) : (
+                            <Lock className="w-3.5 h-3.5 text-rose-600 shrink-0" />
+                          )}
+                          <span>⚡ {deliveryMeta.badgeLabel}</span>
+                          {estimateAvailability.allowed && (
+                            <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                          )}
+                        </span>
+                        <span className="font-urdu text-[11px] font-bold shrink-0 text-right leading-none">
+                          {deliveryMeta.urduLabel}
+                        </span>
                       </div>
-                      <span className="font-urdu text-[10px] font-semibold shrink-0 text-right">
-                        {deliveryMeta.urduLabel}
-                      </span>
+                      <p className="text-[11px] font-medium leading-relaxed opacity-95">
+                        {estimateAvailability.allowed
+                          ? 'Instant Express delivery is active ONLY in manually selected cities & sub-cities (others remain locked).'
+                          : estimateAvailability.reason}
+                      </p>
                     </div>
                   ) : (
-                    <div className="p-2.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white/80 dark:bg-slate-900/60 text-slate-700 dark:text-slate-300 text-[11px] flex items-center justify-between gap-2">
-                      <div className="min-w-0">
-                        <span className="font-bold text-slate-900 dark:text-white block">
-                          Delivery in 3 to 6 working days depending on logistics
+                    <div className="p-3 rounded-xl border border-slate-200 dark:border-slate-700 border-l-4 border-l-amber-500 bg-white dark:bg-slate-900 shadow-2xs space-y-1.5">
+                      <div className="flex items-center justify-between gap-2 pb-1.5 border-b border-slate-100 dark:border-slate-800">
+                        <span className="text-[10px] font-extrabold uppercase tracking-wider text-slate-500 dark:text-slate-400">
+                          Delivery Schedule
                         </span>
-                        <span className="text-[10px] text-slate-500 dark:text-slate-400 block">
-                          Open across all cities &amp; all their sub-cities
+                        <span className="font-urdu text-[11px] font-bold text-slate-700 dark:text-slate-200 shrink-0 text-right leading-none">
+                          {deliveryMeta.urduLabel}
                         </span>
                       </div>
-                      <span className="font-urdu text-[10px] font-semibold shrink-0 text-right text-slate-600 dark:text-slate-300">
-                        {deliveryMeta.urduLabel}
-                      </span>
+                      <div className="space-y-0.5">
+                        <p className="text-xs font-bold text-slate-900 dark:text-white leading-snug">
+                          Dropship · 3 to 6 Working Days Promised Delivery
+                        </p>
+                        <p className="text-[11px] text-slate-500 dark:text-slate-400 leading-snug">
+                          Open across all Provinces &amp; Kashmir (Cities, Sub-Cities, Child Cities &amp; Villages)
+                        </p>
+                      </div>
                     </div>
                   )
                 )}
@@ -979,29 +1097,145 @@ export const ProductDetailsModal: React.FC<ProductDetailsModalProps> = ({
                     {isProductPurchaseBlocked(product)
                       ? 'Pre-arrival informational item · Delivery charges apply once stocked'
                       : product.stockQty > 0
-                      ? `${product.stockQty} units in stock · ${deliveryMeta.etaText}`
+                      ? `${product.stockQty} units ready in stock`
                       : 'Temporarily out of stock · Confirm restock via WhatsApp'}
                   </span>
                 </div>
 
-                <div className="pt-2 border-t border-slate-200/80 dark:border-slate-700/80 flex flex-wrap items-center gap-2">
-                  <button
-                    type="button"
-                    disabled={isSharingCard}
-                    onClick={handleSharePriceImageCard}
-                    className="flex-1 min-w-[140px] py-1.5 px-3 bg-white dark:bg-slate-900 hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-800 dark:text-slate-100 border border-slate-300 dark:border-slate-700 font-semibold text-[11px] rounded-lg transition-colors flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-60"
-                  >
-                    <Share2 className="w-3.5 h-3.5 text-amber-600 dark:text-amber-400" />
-                    <span>{isSharingCard ? 'Preparing Card...' : 'Share Product Card'}</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={handleCopyProductLink}
-                    className="py-1.5 px-3 bg-white dark:bg-slate-900 hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-200 border border-slate-300 dark:border-slate-700 font-semibold text-[11px] rounded-lg transition-colors flex items-center justify-center gap-1.5 cursor-pointer"
-                  >
-                    <Copy className="w-3.5 h-3.5" />
-                    <span>Copy Link</span>
-                  </button>
+                <div className="pt-2.5 border-t border-slate-200/80 dark:border-slate-700/80 space-y-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      disabled={isSharingCard}
+                      onClick={handleSharePriceImageCard}
+                      className="flex-1 min-w-[130px] py-1.5 px-3 bg-white dark:bg-slate-900 hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-800 dark:text-slate-100 border border-slate-300 dark:border-slate-700 font-semibold text-[11px] rounded-lg transition-colors flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-60"
+                    >
+                      <Share2 className="w-3.5 h-3.5 text-amber-600 dark:text-amber-400" />
+                      <span>{isSharingCard ? 'Preparing Card...' : 'Share Product Card'}</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleCopyProductLink}
+                      className="py-1.5 px-3 bg-white dark:bg-slate-900 hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-200 border border-slate-300 dark:border-slate-700 font-semibold text-[11px] rounded-lg transition-colors flex items-center justify-center gap-1.5 cursor-pointer"
+                    >
+                      <Copy className="w-3.5 h-3.5" />
+                      <span>Copy Link</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleAddMyProductDirectInvestor}
+                      title={
+                        product.addMyProductUrl
+                          ? `Open Add My Product link (${product.addMyProductUrl})`
+                          : `Add My Product — Contact ${investorContact.investorName || 'Investor'} (${investorContact.whatsapp}) for details`
+                      }
+                      className="py-1.5 px-3 bg-teal-600 hover:bg-teal-700 text-white font-bold text-[11px] rounded-lg transition-colors flex items-center justify-center gap-1.5 cursor-pointer shadow-2xs"
+                    >
+                      <PlusCircle className="w-3.5 h-3.5" />
+                      <span>Add My Product</span>
+                    </button>
+                    {canEditProduct && onUpdateProduct && (
+                      <button
+                        type="button"
+                        onClick={() => setIsEditingAddProductLink((prev) => !prev)}
+                        title="Edit manual direct investor contact link for Add My Product"
+                        className={`py-1.5 px-2.5 rounded-lg border text-[11px] font-semibold transition-colors flex items-center gap-1 cursor-pointer ${
+                          isEditingAddProductLink
+                            ? 'bg-amber-500 text-slate-950 border-amber-500'
+                            : 'bg-white dark:bg-slate-900 text-slate-600 dark:text-slate-300 border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800'
+                        }`}
+                      >
+                        <Pencil className="w-3 h-3" />
+                        <span>Edit Link</span>
+                      </button>
+                    )}
+                  </div>
+
+                  {/* Concise helper line showing who the Add My Product button directs to */}
+                  <div className="flex flex-wrap items-center justify-between gap-1.5 text-[10px] text-slate-500 dark:text-slate-400">
+                    <span className="inline-flex items-center gap-1 truncate">
+                      <Link2 className="w-3 h-3 text-teal-600 shrink-0" />
+                      <span className="truncate">
+                        {product.addMyProductUrl
+                          ? `Manual Link: ${product.addMyProductUrl}`
+                          : `Direct Investor Contact: ${
+                              investorContact.investorName
+                                ? `${investorContact.investorName} (${investorContact.whatsapp})`
+                                : investorContact.whatsapp
+                            }`}
+                      </span>
+                    </span>
+                    <span className="text-teal-700 dark:text-teal-400 font-semibold shrink-0">
+                      Contact Investor for Details
+                    </span>
+                  </div>
+
+                  {/* Manual Editable Link Panel for Admin / Manager */}
+                  {canEditProduct && onUpdateProduct && isEditingAddProductLink && (
+                    <form
+                      onSubmit={handleSaveAddProductLink}
+                      className="p-2.5 rounded-lg bg-white dark:bg-slate-900 border border-teal-200 dark:border-teal-800 space-y-2"
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <label className="text-[10px] font-bold text-slate-700 dark:text-slate-200">
+                          Manual Editable Link (Direct Investor URL or WhatsApp Number):
+                        </label>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setAddProductLinkInput(
+                              generateWhatsAppLink(
+                                investorContact.whatsapp,
+                                buildAddMyProductInvestorMessage(product, profile, {
+                                  customerName: resolvedCustomerName,
+                                  investorName: investorContact.investorName,
+                                  selectedSize,
+                                  imageUrl: activeImage,
+                                })
+                              )
+                            )
+                          }
+                          className="text-[10px] font-bold text-teal-700 dark:text-teal-300 hover:underline cursor-pointer shrink-0"
+                        >
+                          Auto-Fill Investor WhatsApp
+                        </button>
+                      </div>
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <input
+                          type="text"
+                          value={addProductLinkInput}
+                          onChange={(e) => setAddProductLinkInput(e.target.value)}
+                          placeholder={`https://wa.me/92... or ${investorContact.whatsapp} or custom URL`}
+                          className="flex-1 min-w-[180px] px-2.5 py-1.5 text-[11px] font-mono rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-teal-500"
+                        />
+                        <button
+                          type="submit"
+                          className="px-2.5 py-1.5 bg-teal-600 hover:bg-teal-700 text-white font-bold text-[11px] rounded-lg inline-flex items-center gap-1 cursor-pointer shrink-0"
+                        >
+                          <Save className="w-3 h-3" />
+                          <span>Save Link</span>
+                        </button>
+                        {product.addMyProductUrl && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setAddProductLinkInput('');
+                              onUpdateProduct({
+                                ...product,
+                                addMyProductUrl: undefined,
+                                updatedAt: new Date().toISOString(),
+                              });
+                              setIsEditingAddProductLink(false);
+                              setShareFeedback('Reverted to default Investor WhatsApp.');
+                            }}
+                            className="px-2 py-1.5 text-[10px] font-semibold text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg border border-slate-200 dark:border-slate-700 cursor-pointer"
+                          >
+                            Reset
+                          </button>
+                        )}
+                      </div>
+                    </form>
+                  )}
                 </div>
 
                 {shareFeedback && (

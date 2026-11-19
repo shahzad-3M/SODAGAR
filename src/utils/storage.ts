@@ -672,14 +672,15 @@ export async function apiDeleteCategoryRecord(
 export async function apiAddCity(
   name: string,
   allowed = true,
-  deliveryCharge?: number | null
+  deliveryCharge?: number | null,
+  province?: string
 ): Promise<{ ok: boolean; cities?: DeliveryCityConfig[]; error?: string }> {
   try {
     const res = await fetch('/api/cities', {
       method: 'POST',
       headers: getAuthHeaders(),
       cache: 'no-store',
-      body: JSON.stringify({ name, allowed, deliveryCharge }),
+      body: JSON.stringify({ name, allowed, deliveryCharge, province }),
     });
     const parsed = await safeParseJsonResponse<{ ok?: boolean; cities?: DeliveryCityConfig[]; error?: string }>(res);
     if (!parsed.ok) return { ok: false, error: parsed.data?.error || parsed.error || 'Failed to add city.' };
@@ -692,7 +693,7 @@ export async function apiAddCity(
 
 export async function apiUpdateCity(
   idOrName: string,
-  updates: { name?: string; allowed?: boolean; deliveryCharge?: number | null }
+  updates: { name?: string; province?: string; allowed?: boolean; deliveryCharge?: number | null }
 ): Promise<{ ok: boolean; cities?: DeliveryCityConfig[]; error?: string }> {
   try {
     const res = await fetch(`/api/cities/${encodeURIComponent(idOrName)}`, {

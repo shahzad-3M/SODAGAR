@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import http from 'node:http';
 import path from 'node:path';
 import express, { NextFunction, Request, Response } from 'express';
 import { createServer as createViteServer } from 'vite';
@@ -23,6 +24,7 @@ import {
   computeCategoryLevel,
   getCategoryBreadcrumb,
   getCategoryDescendantIds,
+  inferProvinceForCity,
   isMuzaffarabadCity,
   isProductPurchaseBlocked,
   isUpcomingCategoryName,
@@ -70,8 +72,13 @@ function readCliArg(flag: string): string | undefined {
   return eq ? eq.slice(flag.length + 1) : undefined;
 }
 
-const PORT = Number(readCliArg('--port') || process.env.PORT || 3000);
-const HOST = readCliArg('--host') || process.env.HOST || '0.0.0.0';
+const cliPort = readCliArg('--port') || process.env.npm_config_port;
+const envPort =
+  process.env.PORT && process.env.PORT !== process.env.NGINX_PORT
+    ? process.env.PORT
+    : undefined;
+const PORT = Number(cliPort || envPort || process.env.DEFAULT_APP_PORT || 3000);
+const HOST = readCliArg('--host') || process.env.npm_config_host || process.env.HOST || '0.0.0.0';
 const SESSION_SECRET = process.env.SESSION_SECRET || crypto.createHash('sha256').update(`100dagar_${process.cwd()}`).digest('hex');
 
 interface SessionClaims {
@@ -911,9 +918,10 @@ async function startServer() {
     const id = slugifyId('city', name) + '_' + Date.now().toString(36).slice(-4);
     const now = new Date().toISOString();
     const chargeToSave = parsedCharge !== undefined ? parsedCharge : isMuzaffarabadCity(name) ? 50 : null;
+    const province = inferProvinceForCity(name, typeof req.body?.province === 'string' ? req.body.province : undefined);
     db.prepare(
-      'INSERT INTO cities (id, name, allowed, delivery_charge, display_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
-    ).run(id, name, allowed ? 1 : 0, chargeToSave, existing.length + 1, now, now);
+      'INSERT INTO cities (id, name, province, allowed, delivery_charge, display_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+    ).run(id, name, province, allowed ? 1 : 0, chargeToSave, existing.length + 1, now, now);
     const profile = syncDeliveryCitiesIntoBusinessProfile(db);
     broadcastSyncEvent('locations', req.header('x-client-id'));
     res.json({ ok: true, cities: profile.deliveryCities, syncVersion: getSyncVersion() });
@@ -986,9 +994,14 @@ async function startServer() {
       return;
     }
 
-    const now = new Date().toISOString();
-    db.prepare('UPDATE cities SET name = ?, allowed = ?, delivery_charge = ?, updated_at = ? WHERE id = ?').run(
+    const nextProvince = inferProvinceForCity(
       nextName,
+      typeof req.body?.province === 'string' ? req.body.province : target.province
+    );
+    const now = new Date().toISOString();
+    db.prepare('UPDATE cities SET name = ?, province = ?, allowed = ?, delivery_charge = ?, updated_at = ? WHERE id = ?').run(
+      nextName,
+      nextProvince,
       nextAllowed ? 1 : 0,
       nextCharge,
       now,
@@ -1027,16 +1040,18 @@ async function startServer() {
       return;
     }
 
+    const areaType = typeof req.body?.areaType === 'string' && req.body.areaType.trim() ? req.body.areaType.trim() : null;
     const areaId = slugifyId('area', `${city.name}_${areaName}`) + '_' + Date.now().toString(36).slice(-4);
     const now = new Date().toISOString();
     db.prepare(
-      'INSERT INTO city_areas (id, city_id, name, allowed, delivery_charge, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+      'INSERT INTO city_areas (id, city_id, name, allowed, delivery_charge, area_type, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
     ).run(
       areaId,
       city.id,
       areaName,
       req.body?.allowed !== false ? 1 : 0,
       parsedCharge !== undefined ? parsedCharge : null,
+      areaType,
       now,
       now
     );
@@ -1364,11 +1379,20 @@ async function startServer() {
     });
   });
 
+  const httpServer = http.createServer(app);
+  let viteInstance: Awaited<ReturnType<typeof createViteServer>> | null = null;
+
   // Frontend middleware / static dist serving
   if (process.env.NODE_ENV !== 'production') {
     const vitePromise = createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        hmr: process.env.DISABLE_HMR === 'true' ? false : { server: httpServer },
+      },
       appType: 'spa',
+    }).then((vite) => {
+      viteInstance = vite;
+      return vite;
     });
     app.use((req, res, next) => {
       vitePromise
@@ -1385,9 +1409,26 @@ async function startServer() {
     }
   }
 
-  app.listen(PORT, HOST, () => {
+  httpServer.listen(PORT, HOST, () => {
     console.log(`100DAGAR Full-Stack Server running on http://${HOST}:${PORT}`);
   });
+
+  const shutdown = () => {
+    for (const client of sseClients) {
+      try {
+        client.end();
+      } catch {
+        // ignore close errors
+      }
+    }
+    sseClients.clear();
+    void viteInstance?.close().catch(() => {});
+    httpServer.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 1500).unref();
+  };
+
+  process.once('SIGINT', shutdown);
+  process.once('SIGTERM', shutdown);
 }
 
 startServer().catch((err) => {
