@@ -36,8 +36,13 @@ function normalizeSpecifier(filePath, specifier) {
 
 for (const filePath of collectFiles(projectRoot)) {
   const original = fs.readFileSync(filePath, 'utf8');
-  const updated = original.replace(/((?:from|import)\s*[(]?[\s]*['"])(\.[^'"]+)(['"])/g, (match, prefix, specifier, suffix) => {
+  let updated = original.replace(/((?:from|import)\s*[(]?[\s]*['"])(\.[^'"]+)(['"])/g, (match, prefix, specifier, suffix) => {
     return `${prefix}${normalizeSpecifier(filePath, specifier)}${suffix}`;
   });
+
+  updated = updated.replace(/import\s+\{([\s\S]*?)\}\s+from\s+(['"][^'"]*types\/index\.ts['"])/g, (match, names, source) => {
+    return `import type {${names}} from ${source}`;
+  });
+
   if (updated !== original) fs.writeFileSync(filePath, updated);
 }
