@@ -47,6 +47,7 @@ import {
   getCommissionRecords,
   saveCommissionRecords,
   calculateSalespersonCommission,
+  apiLogCrmActivity,
 } from '../utils/storage';
 import { openWhatsAppDirect } from '../utils/whatsapp';
 import { isProductPurchaseBlocked } from '../utils/locationCategoryHelpers';
@@ -370,11 +371,13 @@ export const WalkInSalesView: React.FC<WalkInSalesViewProps> = ({
       if (cartItem) {
         stockChanged = true;
         const newStock = Math.max(0, prod.stockQty - cartItem.quantity);
+        const lineProfit = Math.max(0, Number(cartItem.totalAmount || 0) - Number(prod.costPrice || 0) * Number(cartItem.quantity || 0));
         return {
           ...prod,
           stockQty: newStock,
           salesCount: (prod.salesCount || 0) + cartItem.quantity,
           totalRevenue: (prod.totalRevenue || 0) + cartItem.totalAmount,
+          totalProfit: (prod.totalProfit || 0) + lineProfit,
         };
       }
       return prod;
@@ -382,6 +385,17 @@ export const WalkInSalesView: React.FC<WalkInSalesViewProps> = ({
 
     if (stockChanged && onStockUpdated) {
       onStockUpdated(updatedProducts);
+    }
+
+    if (existingCust?.id || customerPhoneInput.trim()) {
+      void apiLogCrmActivity({
+        customerId: existingCust?.id,
+        eventType: 'order_placed',
+        title: `Walk-in Sale #${receiptNumber}`,
+        description: `Walk-in counter sale at ${activeBranch.name} · Rs. ${netTotal.toLocaleString('en-PK')}`,
+        orderNumber: receiptNumber,
+        amount: netTotal,
+      });
     }
 
     // Open receipt modal

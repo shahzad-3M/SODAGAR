@@ -24,7 +24,7 @@ import {
   Sparkles,
   Edit3,
 } from 'lucide-react';
-import { LoginFormConfig, LoginAuditRecord, UserAccount, UserRole } from '../types';
+import { CRMPermissions, CRMRoleSpecialization, LoginFormConfig, LoginAuditRecord, UserAccount, UserRole } from '../types';
 import {
   createUserAccount,
   getLoginAudits,
@@ -33,8 +33,33 @@ import {
   resetUserPasswordToDefault,
   saveLoginFormConfig,
   updateUserAccount,
+  apiAdminResetPassword,
 } from '../utils/storage';
 import { createPasswordRecord } from '../utils/security';
+
+const CRM_ROLE_LABELS: Array<{ value: CRMRoleSpecialization; label: string }> = [
+  { value: 'administrator', label: 'Administrator (Full CRM Access)' },
+  { value: 'store_manager', label: 'Store Manager (All Operations + Bulk Approval)' },
+  { value: 'salesperson', label: 'Salesperson (Leads, Follow-Ups & WhatsApp)' },
+  { value: 'customer_support', label: 'Customer Support (Tickets, Follow-Ups & 360°)' },
+  { value: 'marketing', label: 'Marketing (Segments, Campaigns & Loyalty)' },
+  { value: 'accountant', label: 'Accountant (Reports & Financial Balances)' },
+];
+
+const CRM_PERMISSION_LABELS: Array<{ key: keyof CRMPermissions; label: string }> = [
+  { key: 'canViewCrmDashboard', label: 'View CRM Dashboard' },
+  { key: 'canEditCustomers', label: 'Edit Customer CRM Profile' },
+  { key: 'canManageSegments', label: 'Manage Custom Segments' },
+  { key: 'canManageFollowUps', label: 'Manage Follow-Up Tasks' },
+  { key: 'canManageLeads', label: 'Manage Leads Pipeline' },
+  { key: 'canSendWhatsAppCrm', label: 'Send WhatsApp CRM' },
+  { key: 'canManageCampaigns', label: 'Create Campaigns' },
+  { key: 'canApproveBulkMessages', label: 'Approve Bulk Campaigns' },
+  { key: 'canManageLoyalty', label: 'Manage Loyalty & Coupons' },
+  { key: 'canManageTickets', label: 'Manage Support Tickets' },
+  { key: 'canManageAutomation', label: 'Toggle Automation Rules' },
+  { key: 'canExportReports', label: 'Export CRM Reports' },
+];
 
 interface UserManagementViewProps {
   currentUserRole: UserRole;
@@ -68,6 +93,8 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
   const [editEmail, setEditEmail] = useState('');
   const [editRole, setEditRole] = useState<UserRole>('customer');
   const [editCreditAuth, setEditCreditAuth] = useState(false);
+  const [editCrmRole, setEditCrmRole] = useState<CRMRoleSpecialization>('salesperson');
+  const [editCrmPermissions, setEditCrmPermissions] = useState<CRMPermissions>({});
 
   // New user form state
   const [newUsername, setNewUsername] = useState('');
@@ -76,6 +103,8 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
   const [newEmail, setNewEmail] = useState('');
   const [newRole, setNewRole] = useState<UserRole>('customer');
   const [newCreditAuth, setNewCreditAuth] = useState(false);
+  const [newCrmRole, setNewCrmRole] = useState<CRMRoleSpecialization>('salesperson');
+  const [newCrmPermissions, setNewCrmPermissions] = useState<CRMPermissions>({});
   const [customPassword, setCustomPassword] = useState('');
   const [useDefaultMobilePin, setUseDefaultMobilePin] = useState(true);
 
@@ -139,6 +168,8 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
       role: newRole,
       status: 'active',
       canAuthorizeCreditSale: allowCredit,
+      crmRole: isSellerRole ? newCrmRole : undefined,
+      crmPermissions: isSellerRole ? newCrmPermissions : undefined,
       passwordHash: passRecord.hash,
       passwordSalt: passRecord.salt,
       mustChangePassword: true,
@@ -152,6 +183,7 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
     setNewPhone('');
     setNewEmail('');
     setNewCreditAuth(false);
+    setNewCrmPermissions({});
     setCustomPassword('');
     refreshData();
 
@@ -160,7 +192,7 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
   };
 
   // Handle Admin Reset Password to Default Mobile PIN
-  const handleResetPassword = (user: UserAccount) => {
+  const handleResetPassword = async (user: UserAccount) => {
     if (user.role === 'super_admin') {
       showNotification(
         'error',
@@ -168,12 +200,12 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
       );
       return;
     }
+    const serverReset = await apiAdminResetPassword(user.id);
     const result = resetUserPasswordToDefault(user.id);
     refreshData();
-    if (result.account) {
-      setResetModalData({ user: result.account, tempPin: result.tempPin });
-      setIsResetSuccessModalOpen(true);
-    }
+    const resolvedTempPin = serverReset.ok && serverReset.tempPin ? serverReset.tempPin : result.tempPin;
+    setResetModalData({ user: result.account || user, tempPin: resolvedTempPin });
+    setIsResetSuccessModalOpen(true);
   };
 
   // Open Edit User Modal
@@ -185,6 +217,15 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
     setEditEmail(user.email || '');
     setEditRole(user.role);
     setEditCreditAuth(Boolean(user.canAuthorizeCreditSale ?? user.managerAuthorities?.canAuthorizeCreditSale));
+    setEditCrmRole(
+      user.crmRole ||
+        (user.role === 'super_admin' || user.role === 'admin'
+          ? 'administrator'
+          : user.role === 'manager'
+          ? 'store_manager'
+          : 'salesperson')
+    );
+    setEditCrmPermissions(user.crmPermissions || {});
   };
 
   // Save Edited User Details
@@ -214,6 +255,11 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
       effectiveRole === 'admin' ||
       ((effectiveRole === 'manager' || effectiveRole === 'staff') && editCreditAuth);
 
+    const isSellerRole =
+      effectiveRole === 'super_admin' ||
+      effectiveRole === 'admin' ||
+      effectiveRole === 'manager' ||
+      effectiveRole === 'staff';
     updateUserAccount(editingUser.id, {
       fullName: editFullName.trim(),
       username: cleanUsername,
@@ -221,6 +267,8 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
       email: editEmail.trim() || undefined,
       role: effectiveRole,
       canAuthorizeCreditSale: allowCredit,
+      crmRole: isSellerRole ? editCrmRole : undefined,
+      crmPermissions: isSellerRole ? editCrmPermissions : undefined,
       managerAuthorities: editingUser.managerAuthorities
         ? { ...editingUser.managerAuthorities, canAuthorizeCreditSale: allowCredit }
         : undefined,
@@ -881,19 +929,35 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
                 </div>
               </div>
 
-              {(newRole === 'manager' || newRole === 'staff') && (
-                <div className="p-2.5 bg-amber-50 dark:bg-amber-950/40 rounded-lg border border-amber-200 dark:border-amber-800">
-                  <label className="flex items-center gap-2 cursor-pointer select-none">
-                    <input
-                      type="checkbox"
-                      checked={newCreditAuth}
-                      onChange={(e) => setNewCreditAuth(e.target.checked)}
-                      className="w-4 h-4 rounded text-amber-500"
-                    />
-                    <span className="text-xs font-bold text-amber-900 dark:text-amber-200">
-                      Authorize Seller Credit Sales (صرف مجاز سیلرز کو ادھار فروخت کی اجازت)
-                    </span>
-                  </label>
+              {(newRole === 'manager' || newRole === 'staff' || newRole === 'admin') && (
+                <div className="p-2.5 bg-amber-50 dark:bg-amber-950/40 rounded-lg border border-amber-200 dark:border-amber-800 space-y-2.5">
+                  {(newRole === 'manager' || newRole === 'staff') && (
+                    <label className="flex items-center gap-2 cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        checked={newCreditAuth}
+                        onChange={(e) => setNewCreditAuth(e.target.checked)}
+                        className="w-4 h-4 rounded text-amber-500"
+                      />
+                      <span className="text-xs font-bold text-amber-900 dark:text-amber-200">
+                        Authorize Seller Credit Sales (صرف مجاز سیلرز کو ادھار فروخت کی اجازت)
+                      </span>
+                    </label>
+                  )}
+                  <div>
+                    <label className="block text-[11px] font-bold text-slate-700 dark:text-slate-300 mb-1">
+                      CRM Specialization Role:
+                    </label>
+                    <select
+                      value={newCrmRole}
+                      onChange={(e) => setNewCrmRole(e.target.value as CRMRoleSpecialization)}
+                      className="w-full px-2.5 py-1.5 text-xs rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white"
+                    >
+                      {CRM_ROLE_LABELS.map((r) => (
+                        <option key={r.value} value={r.value}>{r.label}</option>
+                      ))}
+                    </select>
+                  </div>
                 </div>
               )}
 
@@ -917,7 +981,7 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
                     </label>
                     <input
                       type="text"
-                      placeholder="e.g. 580987"
+                      placeholder="Min 4 characters"
                       value={customPassword}
                       onChange={(e) => setCustomPassword(e.target.value)}
                       className="w-full px-3 py-2 text-xs font-mono rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-amber-400 focus:outline-hidden"
@@ -1099,19 +1163,55 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
                 </div>
               </div>
 
-              {(editRole === 'manager' || editRole === 'staff') && (
-                <div className="p-2.5 bg-amber-50 dark:bg-amber-950/40 rounded-lg border border-amber-200 dark:border-amber-800">
-                  <label className="flex items-center gap-2 cursor-pointer select-none">
-                    <input
-                      type="checkbox"
-                      checked={editCreditAuth}
-                      onChange={(e) => setEditCreditAuth(e.target.checked)}
-                      className="w-4 h-4 rounded text-amber-500"
-                    />
-                    <span className="text-xs font-bold text-amber-900 dark:text-amber-200">
-                      Authorize Seller Credit Sales
-                    </span>
-                  </label>
+              {(editRole === 'manager' || editRole === 'staff' || editRole === 'admin') && (
+                <div className="p-3 bg-amber-50 dark:bg-amber-950/40 rounded-lg border border-amber-200 dark:border-amber-800 space-y-2.5">
+                  {(editRole === 'manager' || editRole === 'staff') && (
+                    <label className="flex items-center gap-2 cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        checked={editCreditAuth}
+                        onChange={(e) => setEditCreditAuth(e.target.checked)}
+                        className="w-4 h-4 rounded text-amber-500"
+                      />
+                      <span className="text-xs font-bold text-amber-900 dark:text-amber-200">
+                        Authorize Seller Credit Sales
+                      </span>
+                    </label>
+                  )}
+
+                  <div>
+                    <label className="block text-[11px] font-bold text-slate-700 dark:text-slate-300 mb-1">
+                      CRM Team Role Specialization:
+                    </label>
+                    <select
+                      value={editCrmRole}
+                      onChange={(e) => setEditCrmRole(e.target.value as CRMRoleSpecialization)}
+                      className="w-full px-2.5 py-1.5 text-xs rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white"
+                    >
+                      {CRM_ROLE_LABELS.map((r) => (
+                        <option key={r.value} value={r.value}>{r.label}</option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-1.5 pt-1">
+                    {CRM_PERMISSION_LABELS.map((perm) => (
+                      <label key={perm.key} className="flex items-center gap-1.5 text-[11px] text-slate-700 dark:text-slate-300 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={editCrmPermissions[perm.key] ?? true}
+                          onChange={(e) =>
+                            setEditCrmPermissions((prev) => ({
+                              ...prev,
+                              [perm.key]: e.target.checked,
+                            }))
+                          }
+                          className="w-3.5 h-3.5 rounded text-amber-500"
+                        />
+                        <span>{perm.label}</span>
+                      </label>
+                    ))}
+                  </div>
                 </div>
               )}
 

@@ -84,6 +84,7 @@ import {
   saveCartItems,
   getMonthlyExpenses,
   saveMonthlyExpenses,
+  apiLogCrmActivity,
 } from './utils/storage';
 import { isProductPurchaseBlocked, normalizeTextKey } from './utils/locationCategoryHelpers';
 import {
@@ -133,6 +134,7 @@ import { BranchManagementView } from './components/BranchManagementView';
 import { WalkInSalesView } from './components/WalkInSalesView';
 import { ProductImporterModal } from './components/ProductImporterModal';
 import { FinancialMasterView } from './components/FinancialMasterView';
+import { CRMWorkspaceView } from './components/CRMWorkspaceView';
 import {
   ToastBanner,
   ToastMessage,
@@ -207,6 +209,7 @@ export default function App() {
     return role === 'customer' ? 'customer' : 'merchant';
   });
   const [selectedCustomerId, setSelectedCustomerId] = useState<string | undefined>(undefined);
+  const [crmCustomerFocusId, setCrmCustomerFocusId] = useState<string | undefined>(undefined);
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedCategory, setSelectedCategory] = useState('All Categories');
 
@@ -260,13 +263,22 @@ export default function App() {
         'hr_payroll',
         'financial_master',
         'lucky_draw',
+        ...(currentUser?.crmPermissions?.canViewCrmDashboard !== false ? ['crm'] : []),
       ];
       if (!allowed.includes(tab)) {
         setCurrentTab('walkin_pos');
         return;
       }
     } else if (activeRole === 'staff') {
-      const allowed = ['store', 'walkin_pos', 'cod_orders', 'reports', 'history', 'lucky_draw'];
+      const allowed = [
+        'store',
+        'walkin_pos',
+        'cod_orders',
+        'reports',
+        'history',
+        'lucky_draw',
+        ...(currentUser?.crmPermissions?.canViewCrmDashboard !== false ? ['crm'] : []),
+      ];
       if (!allowed.includes(tab)) {
         setCurrentTab('walkin_pos');
         return;
@@ -501,7 +513,16 @@ export default function App() {
       `Added "${product.name}"${resolvedSize ? ` (${resolvedSize})` : ''} to cart.`,
       'success'
     );
-  }, [pushToast]);
+    void apiLogCrmActivity({
+      customerId: currentUser?.customerId,
+      phone: currentUser?.phone,
+      eventType: 'cart_add',
+      productId: product.id,
+      productName: product.name,
+      category: product.category,
+      amount: unitPrice * resolvedQty,
+    });
+  }, [pushToast, currentUser?.customerId, currentUser?.phone]);
 
   // Support deep-link ?add_to_cart=<id|sku|slug> from website links (e.g. www.madinamarket.pk)
   useEffect(() => {
@@ -2069,6 +2090,10 @@ export default function App() {
             profile={profile}
             selectedCustomerId={selectedCustomerId}
             onSelectCustomer={(cId) => setSelectedCustomerId(cId)}
+            onOpenCrmProfile={(cId) => {
+              setCrmCustomerFocusId(cId);
+              handleTabChange('crm');
+            }}
             onOpenAddCustomer={() => setIsAddCustomerOpen(true)}
             onOpenAddTransaction={openAddTransaction}
             onOpenScheduleWhatsApp={openScheduleWhatsApp}
@@ -2092,6 +2117,22 @@ export default function App() {
                 },
               });
             }}
+          />
+        )}
+
+        {/* 6B. INTEGRATED CRM & RETENTION WORKSPACE */}
+        {currentTab === 'crm' && (
+          <CRMWorkspaceView
+            currentUser={currentUser}
+            profile={profile}
+            products={products}
+            initialCustomerId={crmCustomerFocusId}
+            onClearInitialCustomer={() => setCrmCustomerFocusId(undefined)}
+            onOpenCustomerKhata={(custId) => {
+              setSelectedCustomerId(custId);
+              handleTabChange('customers');
+            }}
+            onRefreshGlobalData={handleRefreshAllData}
           />
         )}
 

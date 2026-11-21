@@ -30,6 +30,7 @@ import {
   Plus,
   Pencil,
   ChevronDown,
+  ChevronLeft,
   ChevronRight,
   Database,
 } from 'lucide-react';
@@ -42,8 +43,7 @@ import {
   startFromScratchData,
   getLoginAudits,
   saveLoginAudits,
-  getOwnerPin,
-  updateOwnerPin,
+  apiChangeMasterPin,
   updateCustomerPin,
   updateResellerPin,
   getDefaultPinForPhone,
@@ -102,10 +102,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [activeTab, setActiveTab] = useState<'profile' | 'wasal' | 'security' | 'backup'>('profile');
 
   // Security / PIN States
-  const [ownerMasterPin, setOwnerMasterPin] = useState(profile.adminPin || getOwnerPin() || '580987');
+  const [currentMasterPin, setCurrentMasterPin] = useState('');
   const [newMasterPin, setNewMasterPin] = useState('');
   const [confirmMasterPin, setConfirmMasterPin] = useState('');
-  const [showMasterPin, setShowMasterPin] = useState(false);
   const [pinChangeMsg, setPinChangeMsg] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
   // Audit Logs State
@@ -116,6 +115,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   // User PIN Directory State
   const [userSearchQuery, setUserSearchQuery] = useState('');
   const [userRoleFilter, setUserRoleFilter] = useState<'all' | 'customer' | 'reseller'>('all');
+  const [userDirPage, setUserDirPage] = useState(1);
+  const USER_DIR_PAGE_SIZE = 25;
   const [userListNotice, setUserListNotice] = useState<string | null>(null);
   const [revealedPins, setRevealedPins] = useState<Record<string, boolean>>({});
   const [newDeliveryCity, setNewDeliveryCity] = useState('');
@@ -497,9 +498,17 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   };
 
   // OWNER PIN UPDATE
-  const handleUpdateMasterPin = (e: React.FormEvent) => {
+  const handleUpdateMasterPin = async (e: React.FormEvent) => {
     e.preventDefault();
     setPinChangeMsg(null);
+
+    if (!currentMasterPin.trim()) {
+      setPinChangeMsg({
+        type: 'error',
+        text: 'موجودہ ماسٹر پن درج کریں۔ (Please enter your current Master PIN)',
+      });
+      return;
+    }
 
     const cleanPin = newMasterPin.trim();
     if (!cleanPin || cleanPin.length < 4) {
@@ -518,12 +527,16 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       return;
     }
 
-    // Save to storage and profile
-    updateOwnerPin(cleanPin);
-    const updatedProfile = { ...formData, adminPin: cleanPin };
-    setFormData(updatedProfile);
-    onSaveProfile(updatedProfile);
-    setOwnerMasterPin(cleanPin);
+    const res = await apiChangeMasterPin(currentMasterPin.trim(), cleanPin);
+    if (!res.ok) {
+      setPinChangeMsg({
+        type: 'error',
+        text: res.error || 'Could not update Master PIN. Verify your current PIN.',
+      });
+      return;
+    }
+
+    setCurrentMasterPin('');
     setNewMasterPin('');
     setConfirmMasterPin('');
     setPinChangeMsg({
@@ -641,6 +654,13 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     }
     return true;
   });
+
+  const userDirTotalPages = Math.max(1, Math.ceil(filteredUsers.length / USER_DIR_PAGE_SIZE));
+  const safeUserDirPage = Math.min(userDirPage, userDirTotalPages);
+  const paginatedUsers = filteredUsers.slice(
+    (safeUserDirPage - 1) * USER_DIR_PAGE_SIZE,
+    safeUserDirPage * USER_DIR_PAGE_SIZE
+  );
 
   // Backup & Restore Handlers
   const handleExportBackup = () => {
@@ -1915,43 +1935,44 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   <h3 className="text-sm font-bold text-slate-900 dark:text-white flex items-center gap-2">
                     Store Owner Master PIN / ایڈمن ماسٹر سیکیورٹی پن
                     <span className="px-2 py-0.5 text-[10px] font-bold rounded-full bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300">
-                      Master PIN
+                      Hashed on Server
                     </span>
                   </h3>
                   <p className="text-xs text-slate-500 dark:text-slate-400">
-                    Default Master PIN is <span className="font-mono font-bold text-amber-600">580987</span>. Store owner can update this PIN anytime here.
+                    Protected with server-side salted scrypt hashing. Enter your current Master PIN to set a new PIN.
                   </p>
                 </div>
-              </div>
-
-              {/* Current PIN Display */}
-              <div className="flex items-center gap-2 px-3.5 py-1.5 rounded-lg bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700">
-                <span className="text-xs text-slate-500 dark:text-slate-400">Current PIN:</span>
-                <span className="font-mono font-bold text-sm text-slate-900 dark:text-white tracking-widest">
-                  {showMasterPin ? ownerMasterPin : '••••••'}
-                </span>
-                <button
-                  type="button"
-                  onClick={() => setShowMasterPin(!showMasterPin)}
-                  className="text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 p-0.5 cursor-pointer"
-                  title={showMasterPin ? 'Hide PIN' : 'Show PIN'}
-                >
-                  {showMasterPin ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                </button>
               </div>
             </div>
 
             {/* Change Owner PIN Form */}
             <form onSubmit={handleUpdateMasterPin} className="mt-4 pt-2">
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+              <div className="grid grid-cols-1 sm:grid-cols-4 gap-4">
+                <div>
+                  <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1">
+                    Current Master PIN
+                  </label>
+                  <input
+                    type="password"
+                    required
+                    maxLength={20}
+                    placeholder="••••••"
+                    value={currentMasterPin}
+                    onChange={(e) => setCurrentMasterPin(e.target.value)}
+                    className="w-full px-3 py-2 text-sm font-mono tracking-widest bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg text-slate-900 dark:text-white"
+                  />
+                </div>
+
                 <div>
                   <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1">
                     New Master PIN (نیا ماسٹر پن)
                   </label>
                   <input
                     type="password"
-                    maxLength={10}
-                    placeholder="e.g. 580987"
+                    required
+                    minLength={4}
+                    maxLength={20}
+                    placeholder="Min 4 characters"
                     value={newMasterPin}
                     onChange={(e) => setNewMasterPin(e.target.value)}
                     className="w-full px-3 py-2 text-sm font-mono tracking-widest bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg text-slate-900 dark:text-white"
@@ -1964,8 +1985,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   </label>
                   <input
                     type="password"
-                    maxLength={10}
-                    placeholder="e.g. 580987"
+                    required
+                    minLength={4}
+                    maxLength={20}
+                    placeholder="Repeat new PIN"
                     value={confirmMasterPin}
                     onChange={(e) => setConfirmMasterPin(e.target.value)}
                     className="w-full px-3 py-2 text-sm font-mono tracking-widest bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg text-slate-900 dark:text-white"
@@ -1978,7 +2001,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     className="w-full inline-flex items-center justify-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-amber-600 hover:bg-amber-700 rounded-lg transition-colors cursor-pointer shadow-xs"
                   >
                     <KeyRound className="w-4 h-4" />
-                    <span>Reset / Update Master PIN</span>
+                    <span>Update Master PIN</span>
                   </button>
                 </div>
               </div>
@@ -2027,14 +2050,20 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     type="text"
                     placeholder="Search name or phone..."
                     value={userSearchQuery}
-                    onChange={(e) => setUserSearchQuery(e.target.value)}
+                    onChange={(e) => {
+                      setUserSearchQuery(e.target.value);
+                      setUserDirPage(1);
+                    }}
                     className="pl-8 pr-3 py-1.5 text-xs bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg text-slate-900 dark:text-white w-44"
                   />
                 </div>
 
                 <div className="flex rounded-lg border border-slate-300 dark:border-slate-700 p-0.5 text-xs">
                   <button
-                    onClick={() => setUserRoleFilter('all')}
+                    onClick={() => {
+                      setUserRoleFilter('all');
+                      setUserDirPage(1);
+                    }}
                     className={`px-2.5 py-1 rounded-md text-[11px] font-medium cursor-pointer ${
                       userRoleFilter === 'all'
                         ? 'bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900'
@@ -2044,7 +2073,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     All ({combinedUsers.length})
                   </button>
                   <button
-                    onClick={() => setUserRoleFilter('customer')}
+                    onClick={() => {
+                      setUserRoleFilter('customer');
+                      setUserDirPage(1);
+                    }}
                     className={`px-2.5 py-1 rounded-md text-[11px] font-medium cursor-pointer ${
                       userRoleFilter === 'customer'
                         ? 'bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900'
@@ -2054,7 +2086,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     Customers ({customers.length})
                   </button>
                   <button
-                    onClick={() => setUserRoleFilter('reseller')}
+                    onClick={() => {
+                      setUserRoleFilter('reseller');
+                      setUserDirPage(1);
+                    }}
                     className={`px-2.5 py-1 rounded-md text-[11px] font-medium cursor-pointer ${
                       userRoleFilter === 'reseller'
                         ? 'bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900'
@@ -2088,14 +2123,14 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
-                  {filteredUsers.length === 0 ? (
+                  {paginatedUsers.length === 0 ? (
                     <tr>
                       <td colSpan={6} className="py-6 text-center text-slate-400">
                         No registered users found matching filter.
                       </td>
                     </tr>
                   ) : (
-                    filteredUsers.map((u) => {
+                    paginatedUsers.map((u) => {
                       const defaultDigits = getDefaultPinForPhone(u.phone);
                       const currentPin = u.pin || defaultDigits;
                       const isRevealed = !!revealedPins[u.id];
@@ -2186,6 +2221,35 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 </tbody>
               </table>
             </div>
+
+            {userDirTotalPages > 1 && (
+              <div className="mt-3 pt-3 border-t border-slate-100 dark:border-slate-800 flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
+                <span>
+                  Page <strong className="text-slate-900 dark:text-white">{safeUserDirPage}</strong> of{' '}
+                  <strong className="text-slate-900 dark:text-white">{userDirTotalPages}</strong> ({filteredUsers.length} users)
+                </span>
+                <div className="flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    disabled={safeUserDirPage <= 1}
+                    onClick={() => setUserDirPage((p) => Math.max(1, p - 1))}
+                    className="px-2.5 py-1 rounded-lg border border-slate-200 dark:border-slate-700 disabled:opacity-40 hover:bg-slate-100 dark:hover:bg-slate-800 cursor-pointer flex items-center gap-1"
+                  >
+                    <ChevronLeft className="w-3.5 h-3.5" />
+                    <span>Prev</span>
+                  </button>
+                  <button
+                    type="button"
+                    disabled={safeUserDirPage >= userDirTotalPages}
+                    onClick={() => setUserDirPage((p) => Math.min(userDirTotalPages, p + 1))}
+                    className="px-2.5 py-1 rounded-lg border border-slate-200 dark:border-slate-700 disabled:opacity-40 hover:bg-slate-100 dark:hover:bg-slate-800 cursor-pointer flex items-center gap-1"
+                  >
+                    <span>Next</span>
+                    <ChevronRight className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
 
           {/* Card 3: Login Activity & Security Audit Logs */}

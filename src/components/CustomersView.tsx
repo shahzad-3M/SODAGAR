@@ -14,6 +14,9 @@ import {
   MapPin,
   Edit2,
   X,
+  UserCheck,
+  ChevronLeft,
+  ChevronRight,
 } from 'lucide-react';
 import { BusinessProfile, Customer, Transaction } from '../types';
 import { defaultDeliveryCities } from '../utils/defaultData';
@@ -32,6 +35,7 @@ interface CustomersViewProps {
   onOpenInvoiceModal: (tx: Transaction, customer: Customer) => void;
   onDeleteTransaction: (txId: string) => void;
   onUpdateCustomer?: (updated: Customer) => void;
+  onOpenCrmProfile?: (customerId: string) => void;
 }
 
 export const CustomersView: React.FC<CustomersViewProps> = ({
@@ -46,10 +50,13 @@ export const CustomersView: React.FC<CustomersViewProps> = ({
   onOpenInvoiceModal,
   onDeleteTransaction,
   onUpdateCustomer,
+  onOpenCrmProfile,
 }) => {
   const [searchQuery, setSearchQuery] = useState('');
   const [filterType, setFilterType] = useState<'all' | 'due' | 'settled' | 'overdue'>('all');
   const [sortBy, setSortBy] = useState<'balance_desc' | 'name' | 'recent'>('balance_desc');
+  const [currentPage, setCurrentPage] = useState(1);
+  const PAGE_SIZE = 25;
   const [editingAddressCustomer, setEditingAddressCustomer] = useState<Customer | null>(null);
   const [draftCity, setDraftCity] = useState('');
   const [draftArea, setDraftArea] = useState('');
@@ -99,6 +106,13 @@ export const CustomersView: React.FC<CustomersViewProps> = ({
         return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
       });
   }, [customers, searchQuery, filterType, sortBy, transactions, todayStr]);
+
+  const totalPages = Math.max(1, Math.ceil(filteredCustomers.length / PAGE_SIZE));
+  const safePage = Math.min(currentPage, totalPages);
+  const paginatedCustomers = useMemo(() => {
+    const start = (safePage - 1) * PAGE_SIZE;
+    return filteredCustomers.slice(start, start + PAGE_SIZE);
+  }, [filteredCustomers, safePage]);
 
   // Transactions for active customer with running balance
   const activeCustomerTransactions = useMemo(() => {
@@ -220,12 +234,12 @@ export const CustomersView: React.FC<CustomersViewProps> = ({
 
         {/* Customer List items */}
         <div className="mt-3 space-y-1.5 max-h-[580px] overflow-y-auto pr-1">
-          {filteredCustomers.length === 0 ? (
+          {paginatedCustomers.length === 0 ? (
             <div className="py-8 text-center text-xs text-slate-500">
               No customers match your search criteria.
             </div>
           ) : (
-            filteredCustomers.map((c) => {
+            paginatedCustomers.map((c) => {
               const isSelected = activeCustomer?.id === c.id;
               const hasDue = c.balance > 0;
               return (
@@ -275,6 +289,32 @@ export const CustomersView: React.FC<CustomersViewProps> = ({
             })
           )}
         </div>
+
+        {totalPages > 1 && (
+          <div className="mt-3 pt-2 border-t border-slate-200 dark:border-slate-800 flex items-center justify-between text-xs text-slate-500">
+            <span>
+              Page {safePage} of {totalPages} ({filteredCustomers.length} total)
+            </span>
+            <div className="flex items-center gap-1">
+              <button
+                type="button"
+                disabled={safePage <= 1}
+                onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
+                className="p-1 rounded border border-slate-200 dark:border-slate-700 disabled:opacity-40 cursor-pointer"
+              >
+                <ChevronLeft className="w-3.5 h-3.5" />
+              </button>
+              <button
+                type="button"
+                disabled={safePage >= totalPages}
+                onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
+                className="p-1 rounded border border-slate-200 dark:border-slate-700 disabled:opacity-40 cursor-pointer"
+              >
+                <ChevronRight className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Right Column: Customer Ledger Detail View (7 Cols on lg) */}
@@ -404,6 +444,17 @@ export const CustomersView: React.FC<CustomersViewProps> = ({
                   <Send className="w-3.5 h-3.5" />
                   WhatsApp Statement
                 </button>
+
+                {onOpenCrmProfile && (
+                  <button
+                    type="button"
+                    onClick={() => onOpenCrmProfile(activeCustomer.id)}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold text-slate-950 bg-[#FFD200] hover:bg-amber-400 rounded-lg shadow-xs transition-colors cursor-pointer"
+                  >
+                    <UserCheck className="w-3.5 h-3.5" />
+                    Open 360° CRM Profile
+                  </button>
+                )}
 
                 <button
                   onClick={handlePrintLedger}

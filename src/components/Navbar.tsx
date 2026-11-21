@@ -30,6 +30,7 @@ import {
   Calculator,
   CreditCard,
   Tag,
+  HeartHandshake,
 } from 'lucide-react';
 import { AppUser, BusinessProfile, CategoryRecord, UserRole } from '../types';
 import { openWhatsAppDirect } from '../utils/whatsapp';
@@ -149,10 +150,16 @@ export const Navbar: React.FC<NavbarProps> = ({
   ];
 
   // 5. Staff Navigation
+  const canViewCrm =
+    userRole === 'super_admin' ||
+    userRole === 'admin' ||
+    currentUser?.crmPermissions?.canViewCrmDashboard !== false;
+
   const staffNavItems: NavItem[] = [
     { id: 'store', label: 'Store & POS', urdu: 'سیل و کیٹلاگ', icon: ShoppingBag },
     { id: 'walkin_pos', label: 'Walk-in POS', urdu: 'واک ان کاؤنٹر', icon: Receipt },
     { id: 'cod_orders', label: 'COD Orders', urdu: 'کیش آن ڈلیوری', icon: Truck, badge: codPendingCount > 0 ? codPendingCount : undefined },
+    ...(canViewCrm ? [{ id: 'crm', label: 'CRM & Retention', urdu: 'کسٹمر رشتے داری', icon: HeartHandshake }] : []),
     { id: 'reports', label: 'Daybook', urdu: 'روزنامچہ', icon: BarChart3 },
   ];
   const staffDropdownItems: NavItem[] = [
@@ -166,6 +173,7 @@ export const Navbar: React.FC<NavbarProps> = ({
     { id: 'walkin_pos', label: 'Walk-in POS', urdu: 'واک ان کاؤنٹر', icon: Receipt },
     { id: 'branches_manage', label: 'Branch & Store', urdu: 'برانچ مینجمنٹ', icon: Building2 },
     { id: 'inventory', label: 'Branch Stock', urdu: 'اسٹاک و وننگ اشیاء', icon: Package },
+    ...(canViewCrm ? [{ id: 'crm', label: 'CRM & Retention', urdu: 'کسٹمر رشتے داری', icon: HeartHandshake }] : []),
     { id: 'reports', label: 'Daybook & Reports', urdu: 'رپورٹس', icon: BarChart3 },
   ];
   const managerDropdownItems: NavItem[] = [
@@ -186,6 +194,7 @@ export const Navbar: React.FC<NavbarProps> = ({
     { id: 'branches_manage', label: 'Branches & Managers', urdu: 'برانچز و مینیجرز', icon: Building2 },
     { id: 'walkin_pos', label: 'Walk-in POS', urdu: 'واک ان سیلز', icon: Receipt },
     { id: 'cod_orders', label: 'COD Orders', urdu: 'کیش آن ڈلیوری', icon: Truck, badge: codPendingCount > 0 ? codPendingCount : undefined },
+    { id: 'crm', label: 'CRM & Retention', urdu: 'کسٹمر رشتے داری', icon: HeartHandshake },
     { id: 'users', label: 'User Management', urdu: 'صارفین و سیکیورٹی', icon: Users },
     { id: 'investors', label: 'Investors', urdu: 'انویسٹرز کیپٹل', icon: TrendingUp },
     { id: 'reports', label: 'Daybook & Reports', urdu: 'روزنامچہ و آڈٹ', icon: BarChart3 },

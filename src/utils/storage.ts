@@ -36,6 +36,21 @@ import {
   WalkInSale,
   WasalSettlement,
   WhatsAppNotification,
+  CRMActivityEvent,
+  CRMAutomationRule,
+  CRMCampaign,
+  CRMCustomSegmentRule,
+  CRMDashboardKPIs,
+  CRMFollowUpTask,
+  CRMLead,
+  CRMLoyaltyAccount,
+  CRMLoyaltyConfig,
+  CRMLoyaltyCoupon,
+  CRMLoyaltyLedgerEntry,
+  CRMProductIntelligence,
+  CRMReportKey,
+  CRMSupportTicket,
+  Customer360Profile,
 } from '../types';
 import {
   defaultAttendance,
@@ -202,12 +217,6 @@ function getAuthHeaders(): Record<string, string> {
   const token = getSessionToken();
   if (token) {
     headers['Authorization'] = `Bearer ${token}`;
-  }
-  const user = getCurrentUser();
-  if (user && user.isAuthenticated) {
-    headers['x-actor-id'] = encodeURIComponent(user.id || '');
-    headers['x-actor-role'] = encodeURIComponent(user.role || '');
-    headers['x-actor-name'] = encodeURIComponent(user.name || '');
   }
   return headers;
 }
@@ -1034,9 +1043,6 @@ export function getBusinessProfile(): BusinessProfile {
   if (!prof.shippingPartner) {
     prof.shippingPartner = defaultBusinessProfile.shippingPartner;
   }
-  if (!prof.adminPin) {
-    prof.adminPin = '580987';
-  }
   if (prof.defaultCityCenterDeliveryCharge === undefined) {
     prof.defaultCityCenterDeliveryCharge = 50;
   }
@@ -1476,7 +1482,682 @@ export function updateOwnerPin(newPin: string): void {
 
 export function getOwnerPin(): string {
   const prof = getBusinessProfile();
-  return prof.adminPin || '580987';
+  return prof.adminPin || '';
+}
+
+// ==========================================
+// AUTHENTICATION & CRM SERVER API HELPERS
+// ==========================================
+
+export async function apiRegisterCustomer(payload: {
+  fullName: string;
+  phone: string;
+  pin: string;
+  city?: string;
+}): Promise<{ ok: boolean; user?: Partial<AppUser>; sessionToken?: string; error?: string }> {
+  try {
+    const res = await fetch('/api/auth/register-customer', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-client-id': CLIENT_ID },
+      cache: 'no-store',
+      body: JSON.stringify(payload),
+    });
+    const parsed = await safeParseJsonResponse<{
+      ok?: boolean;
+      user?: Partial<AppUser>;
+      sessionToken?: string;
+      error?: string;
+    }>(res);
+    if (!parsed.ok || !parsed.data?.ok) {
+      return { ok: false, error: parsed.data?.error || parsed.error || 'Registration failed.' };
+    }
+    if (parsed.data.sessionToken) {
+      setSessionToken(parsed.data.sessionToken);
+      await refreshSyncState();
+    }
+    return { ok: true, user: parsed.data.user, sessionToken: parsed.data.sessionToken };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
+export async function apiChangeOwnPassword(
+  currentPin: string,
+  newPin: string
+): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await fetch('/api/auth/change-password', {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      cache: 'no-store',
+      body: JSON.stringify({ currentPin, newPin }),
+    });
+    const parsed = await safeParseJsonResponse<{ ok?: boolean; error?: string }>(res);
+    if (!parsed.ok || !parsed.data?.ok) {
+      return { ok: false, error: parsed.data?.error || parsed.error || 'Could not update password.' };
+    }
+    await refreshSyncState();
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
+export async function apiChangeMasterPin(
+  currentPin: string,
+  newPin: string
+): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await fetch('/api/auth/change-master-pin', {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      cache: 'no-store',
+      body: JSON.stringify({ currentPin, newPin }),
+    });
+    const parsed = await safeParseJsonResponse<{ ok?: boolean; error?: string }>(res);
+    if (!parsed.ok || !parsed.data?.ok) {
+      return { ok: false, error: parsed.data?.error || parsed.error || 'Could not update master PIN.' };
+    }
+    await refreshSyncState();
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
+export async function apiAdminResetPassword(
+  userId: string,
+  tempPin?: string
+): Promise<{ ok: boolean; tempPin?: string; error?: string }> {
+  try {
+    const res = await fetch(`/api/admin/users/${encodeURIComponent(userId)}/reset-password`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      cache: 'no-store',
+      body: JSON.stringify({ tempPin }),
+    });
+    const parsed = await safeParseJsonResponse<{ ok?: boolean; tempPin?: string; error?: string }>(res);
+    if (!parsed.ok || !parsed.data?.ok) {
+      return { ok: false, error: parsed.data?.error || parsed.error || 'Reset failed.' };
+    }
+    await refreshSyncState();
+    return { ok: true, tempPin: parsed.data.tempPin };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
+export interface CRMStateBundle {
+  kpis: CRMDashboardKPIs;
+  intelligence: CRMProductIntelligence;
+  profiles: Customer360Profile[];
+  customSegments: CRMCustomSegmentRule[];
+  followUps: CRMFollowUpTask[];
+  leads: CRMLead[];
+  campaigns: CRMCampaign[];
+  loyaltyConfig: CRMLoyaltyConfig;
+  loyaltyAccounts: CRMLoyaltyAccount[];
+  loyaltyLedger: CRMLoyaltyLedgerEntry[];
+  coupons: CRMLoyaltyCoupon[];
+  tickets: CRMSupportTicket[];
+  automationRules: CRMAutomationRule[];
+  automationLogs: Array<{
+    id: string;
+    ruleId: string;
+    ruleName?: string;
+    triggerType?: string;
+    customerId: string;
+    customerName?: string;
+    actionSummary: string;
+    status: string;
+    createdAt: string;
+  }>;
+  whatsappTemplates?: Array<{ type: string; label: string; urduLabel: string; body: string }>;
+  autoSegmentsCatalog?: string[];
+  reportCatalog?: Array<{ key: CRMReportKey; title: string; category: string; description: string }>;
+}
+
+export async function apiFetchCrmState(): Promise<{ ok: boolean; data?: CRMStateBundle; error?: string }> {
+  try {
+    const res = await fetch('/api/crm/state', { headers: getAuthHeaders(), cache: 'no-store' });
+    const parsed = await safeParseJsonResponse<{ ok?: boolean; error?: string } & Partial<CRMStateBundle>>(res);
+    if (!parsed.ok || !parsed.data?.ok) {
+      return { ok: false, error: parsed.data?.error || parsed.error || 'Failed to load CRM state.' };
+    }
+    return { ok: true, data: parsed.data as unknown as CRMStateBundle };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
+export async function apiFetchCrmDashboard(filters: {
+  dateFrom?: string;
+  dateTo?: string;
+  city?: string;
+  customerType?: string;
+  salesperson?: string;
+}): Promise<{ ok: boolean; kpis?: CRMDashboardKPIs; error?: string }> {
+  try {
+    const qs = new URLSearchParams();
+    Object.entries(filters).forEach(([k, v]) => {
+      if (v && v !== 'ALL') qs.set(k, v);
+    });
+    const res = await fetch(`/api/crm/dashboard?${qs.toString()}`, { headers: getAuthHeaders(), cache: 'no-store' });
+    const parsed = await safeParseJsonResponse<{ ok?: boolean; kpis?: CRMDashboardKPIs; error?: string }>(res);
+    if (!parsed.ok || !parsed.data?.ok) {
+      return { ok: false, error: parsed.data?.error || parsed.error || 'Dashboard fetch failed.' };
+    }
+    return { ok: true, kpis: parsed.data.kpis };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
+export async function apiFetchCrmCustomers(params: {
+  page?: number;
+  limit?: number;
+  q?: string;
+  segment?: string;
+  city?: string;
+  customerType?: string;
+}): Promise<{
+  ok: boolean;
+  items?: Customer360Profile[];
+  total?: number;
+  page?: number;
+  limit?: number;
+  error?: string;
+}> {
+  try {
+    const qs = new URLSearchParams();
+    if (params.page) qs.set('page', String(params.page));
+    if (params.limit) qs.set('limit', String(params.limit));
+    if (params.q) qs.set('q', params.q);
+    if (params.segment && params.segment !== 'ALL') qs.set('segment', params.segment);
+    if (params.city && params.city !== 'ALL') qs.set('city', params.city);
+    if (params.customerType && params.customerType !== 'ALL') qs.set('customerType', params.customerType);
+    const res = await fetch(`/api/crm/customers?${qs.toString()}`, { headers: getAuthHeaders(), cache: 'no-store' });
+    const parsed = await safeParseJsonResponse<{
+      ok?: boolean;
+      items?: Customer360Profile[];
+      total?: number;
+      page?: number;
+      limit?: number;
+      error?: string;
+    }>(res);
+    if (!parsed.ok || !parsed.data?.ok) {
+      return { ok: false, error: parsed.data?.error || parsed.error || 'Failed to load CRM customers.' };
+    }
+    return {
+      ok: true,
+      items: parsed.data.items || [],
+      total: parsed.data.total || 0,
+      page: parsed.data.page || 1,
+      limit: parsed.data.limit || 25,
+    };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
+export async function apiFetchCustomer360(
+  customerId: string
+): Promise<{ ok: boolean; profile360?: Customer360Profile; error?: string }> {
+  try {
+    const res = await fetch(`/api/crm/customers/${encodeURIComponent(customerId)}/360`, {
+      headers: getAuthHeaders(),
+      cache: 'no-store',
+    });
+    const parsed = await safeParseJsonResponse<{ ok?: boolean; profile?: Customer360Profile; error?: string }>(res);
+    if (!parsed.ok || !parsed.data?.ok || !parsed.data.profile) {
+      return { ok: false, error: parsed.data?.error || parsed.error || 'Failed to load 360 profile.' };
+    }
+    return { ok: true, profile360: parsed.data.profile };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
+export async function apiUpdateCrmCustomer(
+  customerId: string,
+  updates: Partial<Customer>
+): Promise<{ ok: boolean; customer?: Customer; error?: string }> {
+  try {
+    const res = await fetch(`/api/crm/customers/${encodeURIComponent(customerId)}`, {
+      method: 'PUT',
+      headers: getAuthHeaders(),
+      cache: 'no-store',
+      body: JSON.stringify(updates),
+    });
+    const parsed = await safeParseJsonResponse<{ ok?: boolean; customer?: Customer; error?: string }>(res);
+    if (!parsed.ok || !parsed.data?.ok) {
+      return { ok: false, error: parsed.data?.error || parsed.error || 'Update failed.' };
+    }
+    await refreshSyncState();
+    return { ok: true, customer: parsed.data.customer };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
+export async function apiSaveCrmCustomSegment(
+  rule: Partial<CRMCustomSegmentRule> & { name: string }
+): Promise<{ ok: boolean; rule?: CRMCustomSegmentRule; error?: string }> {
+  try {
+    const res = await fetch('/api/crm/segments', {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      cache: 'no-store',
+      body: JSON.stringify(rule),
+    });
+    const parsed = await safeParseJsonResponse<{ ok?: boolean; segment?: CRMCustomSegmentRule; error?: string }>(res);
+    if (!parsed.ok || !parsed.data?.ok) {
+      return { ok: false, error: parsed.data?.error || parsed.error || 'Save segment failed.' };
+    }
+    return { ok: true, rule: parsed.data.segment };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
+export async function apiDeleteCrmCustomSegment(id: string): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await fetch(`/api/crm/segments/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+      headers: getAuthHeaders(),
+      cache: 'no-store',
+    });
+    const parsed = await safeParseJsonResponse<{ ok?: boolean; error?: string }>(res);
+    if (!parsed.ok || !parsed.data?.ok) {
+      return { ok: false, error: parsed.data?.error || parsed.error || 'Delete segment failed.' };
+    }
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
+export async function apiSaveCrmTask(
+  task: Partial<CRMFollowUpTask>
+): Promise<{ ok: boolean; task?: CRMFollowUpTask; error?: string }> {
+  try {
+    const isUpdate = Boolean(task.id);
+    const res = await fetch(isUpdate ? `/api/crm/tasks/${encodeURIComponent(task.id!)}` : '/api/crm/tasks', {
+      method: isUpdate ? 'PUT' : 'POST',
+      headers: getAuthHeaders(),
+      cache: 'no-store',
+      body: JSON.stringify(task),
+    });
+    const parsed = await safeParseJsonResponse<{ ok?: boolean; task?: CRMFollowUpTask; error?: string }>(res);
+    if (!parsed.ok || !parsed.data?.ok) {
+      return { ok: false, error: parsed.data?.error || parsed.error || 'Task save failed.' };
+    }
+    return { ok: true, task: parsed.data.task };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
+export async function apiDeleteCrmTask(id: string): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await fetch(`/api/crm/tasks/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+      headers: getAuthHeaders(),
+      cache: 'no-store',
+    });
+    const parsed = await safeParseJsonResponse<{ ok?: boolean; error?: string }>(res);
+    if (!parsed.ok || !parsed.data?.ok) {
+      return { ok: false, error: parsed.data?.error || parsed.error || 'Delete task failed.' };
+    }
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
+export async function apiSaveCrmLead(
+  lead: Partial<CRMLead>
+): Promise<{ ok: boolean; lead?: CRMLead; error?: string }> {
+  try {
+    const isUpdate = Boolean(lead.id);
+    const res = await fetch(isUpdate ? `/api/crm/leads/${encodeURIComponent(lead.id!)}` : '/api/crm/leads', {
+      method: isUpdate ? 'PUT' : 'POST',
+      headers: getAuthHeaders(),
+      cache: 'no-store',
+      body: JSON.stringify(lead),
+    });
+    const parsed = await safeParseJsonResponse<{ ok?: boolean; lead?: CRMLead; error?: string }>(res);
+    if (!parsed.ok || !parsed.data?.ok) {
+      return { ok: false, error: parsed.data?.error || parsed.error || 'Lead save failed.' };
+    }
+    return { ok: true, lead: parsed.data.lead };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
+export async function apiConvertCrmLead(
+  leadId: string
+): Promise<{ ok: boolean; customer?: Customer; reusedExisting?: boolean; lead?: CRMLead; error?: string }> {
+  try {
+    const res = await fetch(`/api/crm/leads/${encodeURIComponent(leadId)}/convert`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      cache: 'no-store',
+      body: JSON.stringify({}),
+    });
+    const parsed = await safeParseJsonResponse<{
+      ok?: boolean;
+      customer?: Customer;
+      reusedExisting?: boolean;
+      lead?: CRMLead;
+      error?: string;
+    }>(res);
+    if (!parsed.ok || !parsed.data?.ok) {
+      return { ok: false, error: parsed.data?.error || parsed.error || 'Lead conversion failed.' };
+    }
+    await refreshSyncState();
+    return {
+      ok: true,
+      customer: parsed.data.customer,
+      reusedExisting: parsed.data.reusedExisting,
+      lead: parsed.data.lead,
+    };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
+export async function apiSaveCrmCampaign(
+  campaign: Partial<CRMCampaign>
+): Promise<{ ok: boolean; campaign?: CRMCampaign; error?: string }> {
+  try {
+    const isUpdate = Boolean(campaign.id);
+    const res = await fetch(isUpdate ? `/api/crm/campaigns/${encodeURIComponent(campaign.id!)}` : '/api/crm/campaigns', {
+      method: isUpdate ? 'PUT' : 'POST',
+      headers: getAuthHeaders(),
+      cache: 'no-store',
+      body: JSON.stringify(campaign),
+    });
+    const parsed = await safeParseJsonResponse<{ ok?: boolean; campaign?: CRMCampaign; error?: string }>(res);
+    if (!parsed.ok || !parsed.data?.ok) {
+      return { ok: false, error: parsed.data?.error || parsed.error || 'Campaign save failed.' };
+    }
+    return { ok: true, campaign: parsed.data.campaign };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
+export async function apiSaveCrmLoyaltyConfig(
+  config: CRMLoyaltyConfig
+): Promise<{ ok: boolean; config?: CRMLoyaltyConfig; error?: string }> {
+  try {
+    const res = await fetch('/api/crm/loyalty', {
+      method: 'PUT',
+      headers: getAuthHeaders(),
+      cache: 'no-store',
+      body: JSON.stringify(config),
+    });
+    const parsed = await safeParseJsonResponse<{ ok?: boolean; config?: CRMLoyaltyConfig; error?: string }>(res);
+    if (!parsed.ok || !parsed.data?.ok) {
+      return { ok: false, error: parsed.data?.error || parsed.error || 'Config update failed.' };
+    }
+    return { ok: true, config: parsed.data.config };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
+export async function apiRedeemLoyaltyPoints(payload: {
+  customerId: string;
+  points: number;
+  notes?: string;
+}): Promise<{ ok: boolean; coupon?: CRMLoyaltyCoupon; account?: CRMLoyaltyAccount; error?: string }> {
+  try {
+    const res = await fetch('/api/crm/loyalty/redeem', {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      cache: 'no-store',
+      body: JSON.stringify(payload),
+    });
+    const parsed = await safeParseJsonResponse<{
+      ok?: boolean;
+      coupon?: CRMLoyaltyCoupon;
+      account?: CRMLoyaltyAccount;
+      error?: string;
+    }>(res);
+    if (!parsed.ok || !parsed.data?.ok) {
+      return { ok: false, error: parsed.data?.error || parsed.error || 'Redemption failed.' };
+    }
+    return { ok: true, coupon: parsed.data.coupon, account: parsed.data.account };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
+export async function apiSaveCrmCoupon(
+  coupon: Partial<CRMLoyaltyCoupon>
+): Promise<{ ok: boolean; coupon?: CRMLoyaltyCoupon; error?: string }> {
+  try {
+    const res = await fetch('/api/crm/coupons', {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      cache: 'no-store',
+      body: JSON.stringify(coupon),
+    });
+    const parsed = await safeParseJsonResponse<{ ok?: boolean; coupon?: CRMLoyaltyCoupon; error?: string }>(res);
+    if (!parsed.ok || !parsed.data?.ok) {
+      return { ok: false, error: parsed.data?.error || parsed.error || 'Coupon save failed.' };
+    }
+    return { ok: true, coupon: parsed.data.coupon };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
+export async function apiSaveCrmTicket(
+  ticket: Partial<CRMSupportTicket>
+): Promise<{ ok: boolean; ticket?: CRMSupportTicket; error?: string }> {
+  try {
+    const isUpdate = Boolean(ticket.id);
+    const res = await fetch(isUpdate ? `/api/crm/tickets/${encodeURIComponent(ticket.id!)}` : '/api/crm/tickets', {
+      method: isUpdate ? 'PUT' : 'POST',
+      headers: getAuthHeaders(),
+      cache: 'no-store',
+      body: JSON.stringify(ticket),
+    });
+    const parsed = await safeParseJsonResponse<{ ok?: boolean; ticket?: CRMSupportTicket; error?: string }>(res);
+    if (!parsed.ok || !parsed.data?.ok) {
+      return { ok: false, error: parsed.data?.error || parsed.error || 'Ticket save failed.' };
+    }
+    return { ok: true, ticket: parsed.data.ticket };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
+export async function apiSaveCrmAutomationRule(
+  rule: Partial<CRMAutomationRule> & { id: string }
+): Promise<{ ok: boolean; rule?: CRMAutomationRule; error?: string }> {
+  try {
+    const res = await fetch(`/api/crm/automation/rules/${encodeURIComponent(rule.id)}`, {
+      method: 'PUT',
+      headers: getAuthHeaders(),
+      cache: 'no-store',
+      body: JSON.stringify(rule),
+    });
+    const parsed = await safeParseJsonResponse<{ ok?: boolean; rule?: CRMAutomationRule; error?: string }>(res);
+    if (!parsed.ok || !parsed.data?.ok) {
+      return { ok: false, error: parsed.data?.error || parsed.error || 'Rule update failed.' };
+    }
+    return { ok: true, rule: parsed.data.rule };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
+export async function apiRunCrmAutomation(
+  ruleId: string,
+  options: { dryRun?: boolean; approveBulk?: boolean }
+): Promise<{
+  ok: boolean;
+  dryRun?: boolean;
+  executedCount?: number;
+  skippedDuplicate?: number;
+  skippedOptOut?: number;
+  blockedBulkApproval?: number;
+  previewMatches?: Array<{
+    ruleId: string;
+    ruleName: string;
+    customerId: string;
+    customerName: string;
+    customerPhone: string;
+    idempotencyKey: string;
+    alreadyExecuted: boolean;
+    optedOut: boolean;
+    renderedMessage: string;
+  }>;
+  error?: string;
+}> {
+  try {
+    const res = await fetch('/api/crm/automation/run', {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      cache: 'no-store',
+      body: JSON.stringify({ ruleId, ...options }),
+    });
+    const parsed = await safeParseJsonResponse<{
+      ok?: boolean;
+      dryRun?: boolean;
+      executedCount?: number;
+      skippedDuplicate?: number;
+      skippedOptOut?: number;
+      blockedBulkApproval?: number;
+      previewMatches?: Array<{
+        ruleId: string;
+        ruleName: string;
+        customerId: string;
+        customerName: string;
+        customerPhone: string;
+        idempotencyKey: string;
+        alreadyExecuted: boolean;
+        optedOut: boolean;
+        renderedMessage: string;
+      }>;
+      error?: string;
+    }>(res);
+    if (!parsed.ok || !parsed.data?.ok) {
+      return { ok: false, error: parsed.data?.error || parsed.error || 'Automation run failed.' };
+    }
+    return { ok: true, ...parsed.data };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
+export async function apiLogCrmActivity(event: {
+  customerId?: string;
+  phone?: string;
+  eventType: CRMActivityEvent['eventType'];
+  title?: string;
+  description?: string;
+  notes?: string;
+  productId?: string;
+  productName?: string;
+  category?: string;
+  orderNumber?: string;
+  amount?: number;
+}): Promise<void> {
+  try {
+    await fetch('/api/crm/activity', {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      cache: 'no-store',
+      body: JSON.stringify({ ...event, notes: event.notes || event.description || event.title }),
+    });
+  } catch {
+    // non-blocking telemetry
+  }
+}
+
+export async function apiFetchCrmReport(
+  reportKey: CRMReportKey,
+  params: { dateFrom?: string; dateTo?: string }
+): Promise<{
+  ok: boolean;
+  report?: {
+    key: CRMReportKey;
+    title: string;
+    columns: string[];
+    rows: Array<Record<string, string | number>>;
+    summary?: Record<string, string | number>;
+  };
+  error?: string;
+}> {
+  try {
+    const qs = new URLSearchParams();
+    if (params.dateFrom) qs.set('dateFrom', params.dateFrom);
+    if (params.dateTo) qs.set('dateTo', params.dateTo);
+    const res = await fetch(`/api/crm/reports/${encodeURIComponent(reportKey)}?${qs.toString()}`, {
+      headers: getAuthHeaders(),
+      cache: 'no-store',
+    });
+    const parsed = await safeParseJsonResponse<{
+      ok?: boolean;
+      report?: { key: CRMReportKey; title: string; category: string; description: string };
+      columns?: string[];
+      rows?: Array<Record<string, string | number>>;
+      summary?: Record<string, string | number>;
+      error?: string;
+    }>(res);
+    if (!parsed.ok || !parsed.data?.ok || !parsed.data.columns) {
+      return { ok: false, error: parsed.data?.error || parsed.error || 'Failed to generate report.' };
+    }
+    return {
+      ok: true,
+      report: {
+        key: parsed.data.report?.key || reportKey,
+        title: parsed.data.report?.title || reportKey,
+        columns: parsed.data.columns,
+        rows: parsed.data.rows || [],
+        summary: parsed.data.summary,
+      },
+    };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
+export async function downloadCrmReportFile(
+  reportKey: CRMReportKey,
+  format: 'csv' | 'xls',
+  params: { dateFrom?: string; dateTo?: string }
+): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const qs = new URLSearchParams({ format });
+    if (params.dateFrom) qs.set('dateFrom', params.dateFrom);
+    if (params.dateTo) qs.set('dateTo', params.dateTo);
+    const res = await fetch(`/api/crm/reports/${encodeURIComponent(reportKey)}?${qs.toString()}`, {
+      headers: getAuthHeaders(),
+      cache: 'no-store',
+    });
+    if (!res.ok) {
+      return { ok: false, error: `Export failed (HTTP ${res.status})` };
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `100DAGAR_${reportKey}_${new Date().toISOString().split('T')[0]}.${format}`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Download error' };
+  }
 }
 
 // INVESTOR MANAGEMENT

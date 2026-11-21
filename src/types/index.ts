@@ -2,7 +2,7 @@ export type TransactionType = 'credit' | 'debit'; // credit = You gave (Udhaar /
 
 export type PaymentMode = 'cash' | 'easypaisa' | 'jazzcash' | 'sadapay' | 'bank_transfer' | 'cheque' | 'cod' | 'other';
 
-export type CustomerType = 'individual' | 'retail';
+export type CustomerType = 'individual' | 'retail' | 'wholesale' | 'shopkeeper' | 'reseller';
 
 export type GenderType = 'male' | 'female' | 'unspecified';
 
@@ -37,6 +37,21 @@ export interface Customer {
   lastPurchaseAmount?: number;
   lastPaidAmount?: number; // Total paid amount of last purchase items (used for dynamic 1st prize in lucky draw)
   lastPurchaseDate?: string;
+  // Optional CRM 360 & Segmentation Metadata
+  whatsapp?: string;
+  customerSource?: CRMSourceChannel | string;
+  referralCode?: string;
+  referredBy?: string;
+  tags?: string[];
+  assignedSalespersonId?: string;
+  assignedSalespersonName?: string;
+  lastActivityAt?: string;
+  interestedCategories?: string[];
+  paymentPreference?: PaymentMode;
+  whatsappOptOut?: boolean;
+  whatsappConsent?: boolean;
+  birthday?: string;
+  isVipManual?: boolean;
 }
 
 export type SalePaymentType = 'full' | 'partial' | 'time_credit' | 'cod';
@@ -323,7 +338,7 @@ export interface BusinessProfile {
   monthlyReminderDay: number; // e.g. 1st, 5th
   autoSendEnabled: boolean;
   defaultPaymentTermsDays: number;
-  adminPin?: string; // Owner Master PIN (default: '580987', resettable in settings)
+  adminPin?: string; // Server-side Owner Master PIN override (never hardcoded in client)
   loginFormConfig?: LoginFormConfig;
 }
 
@@ -478,6 +493,8 @@ export interface ManagerAuthorities {
   canAuthorizeDiscount: boolean;
   canAuthorizeCreditSale?: boolean;
   maxDiscountPercent?: number;
+  crmRole?: CRMRoleSpecialization;
+  crmPermissions?: CRMPermissions;
 }
 
 export interface Branch {
@@ -507,6 +524,8 @@ export interface AppUser {
   branchId?: string;
   branchName?: string;
   managerAuthorities?: ManagerAuthorities;
+  crmRole?: CRMRoleSpecialization;
+  crmPermissions?: CRMPermissions;
   canAuthorizeCreditSale?: boolean;
   isAuthenticated?: boolean;
   mustChangePassword?: boolean;
@@ -533,12 +552,15 @@ export interface UserAccount {
   linkedBranchId?: string;
   linkedBranchName?: string;
   managerAuthorities?: ManagerAuthorities;
+  crmRole?: CRMRoleSpecialization;
+  crmPermissions?: CRMPermissions;
   canAuthorizeCreditSale?: boolean;
   resetToken?: string;
   resetTokenExpiresAt?: string;
   lastLoginAt?: string;
   loginCount?: number;
   createdAt: string;
+  createdBy?: string;
 }
 
 // INVESTOR MANAGEMENT MODEL
@@ -876,3 +898,474 @@ export interface MonthlyExpense {
   createdAt: string;
   updatedAt?: string;
 }
+
+// ==========================================
+// INTEGRATED CRM & RETENTION SYSTEM TYPES
+// ==========================================
+
+export type CRMSourceChannel =
+  | 'WhatsApp'
+  | 'Website'
+  | 'Facebook'
+  | 'Instagram'
+  | 'Walk-in'
+  | 'Phone'
+  | 'Referral'
+  | 'Reseller Network';
+
+export type CRMRoleSpecialization =
+  | 'administrator'
+  | 'store_manager'
+  | 'salesperson'
+  | 'customer_support'
+  | 'marketing'
+  | 'accountant';
+
+export interface CRMPermissions {
+  canViewCrmDashboard?: boolean;
+  canViewCustomer360?: boolean;
+  canEditCustomers?: boolean;
+  canManageSegments?: boolean;
+  canManageFollowUps?: boolean;
+  canManageLeads?: boolean;
+  canSendWhatsAppCrm?: boolean;
+  canManageCampaigns?: boolean;
+  canApproveBulkMessages?: boolean;
+  canManageLoyalty?: boolean;
+  canManageTickets?: boolean;
+  canManageAutomation?: boolean;
+  canExportReports?: boolean;
+  canViewFinancialBalances?: boolean;
+}
+
+export type CRMAutoSegmentName =
+  | 'New Customer'
+  | 'First Order'
+  | 'Repeat Customer'
+  | 'Regular Customer'
+  | 'VIP Customer'
+  | 'Wholesale Customer'
+  | 'Reseller'
+  | 'High Value'
+  | 'Inactive 30 Days'
+  | 'Inactive 60 Days'
+  | 'Inactive 90 Days'
+  | 'Lost Customer'
+  | 'COD Risk'
+  | 'Outstanding Payment'
+  | 'Garments Customer'
+  | 'Cosmetics Customer'
+  | 'Kitchen Products Customer';
+
+export interface CRMCustomSegmentRule {
+  id: string;
+  name: string;
+  description?: string;
+  isActive: boolean;
+  criteria: {
+    minTotalSpend?: number;
+    maxTotalSpend?: number;
+    minOrders?: number;
+    maxOrders?: number;
+    minDaysSinceLastOrder?: number;
+    maxDaysSinceLastOrder?: number;
+    categoryKeyword?: string;
+    city?: string;
+    referralSource?: string;
+    hasOutstandingBalance?: boolean;
+    customerType?: CustomerType;
+  };
+  createdAt: string;
+  updatedAt?: string;
+}
+
+export type CRMFollowUpTaskType =
+  | 'Call'
+  | 'WhatsApp'
+  | 'Visit'
+  | 'Payment Collection'
+  | 'Order Check'
+  | 'Complaint Follow-Up'
+  | 'Lead Follow-Up'
+  | 'call'
+  | 'whatsapp'
+  | 'visit'
+  | 'payment_collection'
+  | 'order_check'
+  | 'complaint_follow_up'
+  | 'lead_follow_up';
+
+export type CRMFollowUpPriority = 'Low' | 'Medium' | 'High' | 'Urgent' | 'low' | 'medium' | 'high' | 'urgent';
+export type CRMFollowUpStatus = 'Pending' | 'In Progress' | 'Completed' | 'Cancelled';
+
+export interface CRMFollowUpTask {
+  id: string;
+  title: string;
+  customerId?: string;
+  customerName: string;
+  customerPhone?: string;
+  leadId?: string;
+  taskType: CRMFollowUpTaskType;
+  followUpDate: string; // YYYY-MM-DD
+  assignedEmployeeId?: string;
+  assignedEmployeeName?: string;
+  priority: CRMFollowUpPriority;
+  notes?: string;
+  status: CRMFollowUpStatus;
+  outcome?: string;
+  nextFollowUpDate?: string;
+  createdBy?: string;
+  createdAt: string;
+  updatedAt?: string;
+  completedAt?: string;
+}
+
+export type CRMLeadStage = 'New' | 'Contacted' | 'Interested' | 'Follow-up' | 'Converted' | 'Lost';
+
+export interface CRMLead {
+  id: string;
+  leadName: string;
+  phone: string;
+  whatsapp?: string;
+  email?: string;
+  city?: string;
+  source: CRMSourceChannel;
+  interestedProductId?: string;
+  interestedProductName?: string;
+  interestedCategory?: string;
+  estimatedValue: number;
+  assignedSalespersonId?: string;
+  assignedSalespersonName?: string;
+  notes?: string;
+  followUpDate?: string;
+  stage: CRMLeadStage;
+  convertedCustomerId?: string;
+  convertedAt?: string;
+  createdAt: string;
+  updatedAt?: string;
+}
+
+export type CRMWhatsAppTemplateType =
+  | 'welcome'
+  | 'order_confirmation'
+  | 'delivery_confirmation'
+  | 'feedback_request'
+  | 'product_recommendation'
+  | 'new_arrivals'
+  | 'discount_offer'
+  | 'payment_reminder'
+  | 'abandoned_cart'
+  | 'repeat_purchase_reminder'
+  | 'inactive_recovery'
+  | 'vip_offer'
+  | 'referral_invitation';
+
+export interface CRMCampaign {
+  id: string;
+  name: string;
+  description?: string;
+  channel?: 'whatsapp_click_to_chat' | 'broadcast_queue' | 'referral_push';
+  status: 'Draft' | 'Approved' | 'Launched' | 'Completed' | 'Paused' | 'draft' | 'approved' | 'active' | 'completed' | 'paused';
+  segmentName?: string;
+  targetCity?: string;
+  cityFilter?: string;
+  categoryFilter?: string;
+  minSpendFilter?: number;
+  minOrdersFilter?: number;
+  templateType: CRMWhatsAppTemplateType;
+  messageBody: string;
+  couponCode?: string;
+  discountPercent?: number;
+  discountFlat?: number;
+  adminApproved?: boolean;
+  approvedBy?: string;
+  adminApprovedBy?: string;
+  adminApprovedAt?: string;
+  recipientsCount: number;
+  sentCount: number;
+  conversionsCount: number;
+  revenueGenerated: number;
+  startDate?: string;
+  endDate?: string;
+  createdAt: string;
+  updatedAt?: string;
+}
+
+export type CRMLoyaltyTier = 'Bronze' | 'Silver' | 'Gold' | 'VIP Platinum';
+
+export interface CRMLoyaltyAccount {
+  customerId: string;
+  pointsBalance: number;
+  lifetimePointsEarned: number;
+  lifetimePointsRedeemed: number;
+  tier: CRMLoyaltyTier;
+  updatedAt: string;
+}
+
+export interface CRMLoyaltyLedgerEntry {
+  id: string;
+  customerId: string;
+  type: 'earned' | 'redeemed' | 'bonus' | 'expired' | 'adjusted';
+  points: number;
+  orderNumber?: string;
+  couponCode?: string;
+  notes?: string;
+  createdAt: string;
+}
+
+export interface CRMLoyaltyCoupon {
+  id: string;
+  code: string;
+  title?: string;
+  rewardType?: 'purchase' | 'birthday' | 'repeat' | 'review' | 'vip' | 'campaign';
+  reason?: string;
+  discountType: 'fixed' | 'percent' | 'percentage';
+  discountValue: number;
+  minOrderAmount?: number;
+  customerId?: string;
+  usageLimit?: number;
+  usedCount?: number;
+  expiresAt?: string;
+  redeemedAt?: string;
+  status: 'active' | 'redeemed' | 'used' | 'expired' | 'disabled';
+  createdAt: string;
+}
+
+export interface CRMLoyaltyConfig {
+  pointsPerThousandPkr: number;
+  pkrPerPoint: number;
+  silverThresholdPoints: number;
+  goldThresholdPoints: number;
+  vipThresholdPoints: number;
+  vipDiscountPercent: number;
+  goldDiscountPercent: number;
+  silverDiscountPercent: number;
+  birthdayCouponAmount: number;
+  reviewCouponAmount: number;
+  repeatOrderCouponAmount: number;
+  couponValidityDays: number;
+}
+
+export type CRMTicketCategory =
+  | 'Damaged product'
+  | 'Wrong item'
+  | 'Late delivery'
+  | 'Payment issue'
+  | 'Refund request'
+  | 'Product quality'
+  | 'Courier issue'
+  | 'Staff complaint'
+  | 'General inquiry'
+  | 'Product Inquiry';
+
+export type CRMTicketStatus = 'Open' | 'Investigating' | 'Resolved' | 'Closed' | 'Escalated';
+export type CRMTicketPriority = 'Low' | 'Medium' | 'High' | 'Urgent' | 'low' | 'medium' | 'high' | 'critical';
+
+export interface CRMSupportTicket {
+  id: string;
+  ticketNumber: string;
+  customerId?: string;
+  customerName: string;
+  customerPhone?: string;
+  orderId?: string;
+  orderNumber?: string;
+  category: CRMTicketCategory;
+  subject: string;
+  description?: string;
+  priority: CRMTicketPriority;
+  status: CRMTicketStatus;
+  assignedEmployeeId?: string;
+  assignedEmployeeName?: string;
+  slaHours?: number;
+  dueAt: string;
+  resolutionNotes?: string;
+  resolvedAt?: string;
+  createdAt: string;
+  updatedAt?: string;
+}
+
+export type CRMAutomationTriggerType =
+  | 'after_first_order'
+  | 'after_delivery'
+  | 'review_request_after_delivery'
+  | 'no_order_30_days'
+  | 'no_order_60_days'
+  | 'no_order_90_days'
+  | 'payment_due_soon'
+  | 'payment_overdue'
+  | 'abandoned_cart'
+  | 'vip_threshold_reached'
+  | 'frequent_cod_returns'
+  | 'birthday_or_anniversary'
+  | 'back_in_stock_for_interested';
+
+export interface CRMAutomationRule {
+  id: string;
+  triggerType: CRMAutomationTriggerType;
+  name: string;
+  description: string;
+  enabled: boolean;
+  isBulkAction: boolean;
+  requiresAdminApproval: boolean;
+  templateType: CRMWhatsAppTemplateType;
+  actionMode: 'create_task' | 'queue_whatsapp' | 'both';
+  delayDays?: number;
+  thresholdValue?: number;
+  lastRunAt?: string;
+  totalTriggeredCount: number;
+}
+
+export interface CRMAutomationLog {
+  id: string;
+  ruleId: string;
+  ruleName?: string;
+  triggerType: CRMAutomationTriggerType;
+  customerId: string;
+  customerName: string;
+  idempotencyKey: string;
+  actionTaken?: string;
+  actionSummary?: string;
+  createdTaskId?: string;
+  status: 'executed' | 'queued' | 'task_created' | 'skipped_opt_out' | 'skipped_approval' | 'dry_run';
+  details?: string;
+  createdAt: string;
+}
+
+export type CRMActivityEventType =
+  | 'product_view'
+  | 'product_inquiry'
+  | 'cart_add'
+  | 'cart_abandon'
+  | 'order_placed'
+  | 'order_delivered'
+  | 'order_returned'
+  | 'note_added'
+  | 'call_logged'
+  | 'whatsapp_opened'
+  | 'ticket_opened'
+  | 'loyalty_earned'
+  | 'lead_converted';
+
+export interface CRMActivityEvent {
+  id: string;
+  customerId?: string;
+  customerName?: string;
+  phone?: string;
+  eventType: CRMActivityEventType;
+  productId?: string;
+  productName?: string;
+  category?: string;
+  orderNumber?: string;
+  amount?: number;
+  notes?: string;
+  actorName?: string;
+  createdAt: string;
+}
+
+export interface CRMDashboardKPIs {
+  totalCustomers: number;
+  newToday: number;
+  newThisWeek: number;
+  newThisMonth: number;
+  activeCustomers: number;
+  repeatCustomers: number;
+  vipCustomers: number;
+  inactiveCustomers: number;
+  lostCustomers: number;
+  totalCustomerRevenue: number;
+  averageOrderValue: number;
+  customerLifetimeValue: number;
+  repeatPurchaseRate: number;
+  retentionRate: number;
+  totalLeads: number;
+  convertedLeads: number;
+  leadConversionRate: number;
+  todaysFollowUps: number;
+  overdueFollowUps: number;
+  outstandingBalances: number;
+  openTickets: number;
+}
+
+export interface Customer360TimelineItem {
+  id: string;
+  timestamp: string;
+  kind:
+    | 'order'
+    | 'payment'
+    | 'refund'
+    | 'return'
+    | 'complaint'
+    | 'message'
+    | 'follow_up'
+    | 'referral'
+    | 'reward'
+    | 'note'
+    | 'activity';
+  title: string;
+  description: string;
+  amount?: number;
+  status?: string;
+}
+
+export interface Customer360Profile {
+  customer: Customer;
+  totalOrders: number;
+  totalPurchaseValue: number;
+  totalPaid: number;
+  outstandingBalance: number;
+  refundsTotal: number;
+  returnsTotal: number;
+  returnedOrdersCount: number;
+  deliveredCodCount: number;
+  totalCodCount: number;
+  averageOrderValue: number;
+  customerLifetimeValue: number;
+  orderFrequencyDays: number | null;
+  daysSinceLastOrder: number | null;
+  lastOrderDate?: string;
+  lastActivityDate?: string;
+  purchasedProducts: Array<{ productId?: string; name: string; quantity: number; totalSpent: number; category?: string }>;
+  preferredCategories: string[];
+  paymentPreference: string;
+  autoSegments: CRMAutoSegmentName[];
+  customSegments: string[];
+  loyalty?: CRMLoyaltyAccount;
+  loyaltyLedger: CRMLoyaltyLedgerEntry[];
+  followUps: CRMFollowUpTask[];
+  tickets: CRMSupportTicket[];
+  coupons: CRMLoyaltyCoupon[];
+  recommendedProducts: ProductItem[];
+  timeline: Customer360TimelineItem[];
+}
+
+export interface CRMProductIntelligence {
+  mostViewedProducts: Array<{ productId: string; name: string; views: number; orders: number; stockQty: number }>;
+  inquiredNotOrdered: Array<{ productId: string; name: string; inquiries: number; orders: number }>;
+  cartAbandonedProducts: Array<{ productId: string; name: string; cartAdds: number; orders: number }>;
+  bestRepeatProducts: Array<{ productId: string; name: string; repeatBuyers: number; totalUnits: number }>;
+  highestComplaintProducts: Array<{ productId?: string; name: string; ticketsCount: number; returnedOrders: number }>;
+  categoryRepeatSummary: Array<{ category: string; uniqueBuyers: number; repeatBuyers: number; repeatRatePercent: number }>;
+  frequentlyBoughtTogether: Array<{ productA: string; productB: string; coOccurrences: number }>;
+  priceSensitivity: { fullPriceOrders: number; discountedSavingsOrders: number; averageDiscountPercent: number };
+}
+
+export type CRMReportKey =
+  | 'customer_lifetime_value'
+  | 'repeat_purchase_report'
+  | 'inactive_customers_report'
+  | 'vip_customers_report'
+  | 'outstanding_khata_report'
+  | 'city_sales_report'
+  | 'category_customer_report'
+  | 'lead_conversion_report'
+  | 'salesperson_crm_performance'
+  | 'followup_completion_report'
+  | 'complaint_resolution_report'
+  | 'cod_return_risk_customers'
+  | 'reseller_retention_report'
+  | 'campaign_performance_report'
+  | 'loyalty_points_report'
+  | 'daily_sales_report'
+  | 'monthly_profit_loss_report';
+
+

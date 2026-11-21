@@ -7,11 +7,26 @@ import {
   BusinessProfile,
   CategoryRecord,
   CODOrder,
+  CRMActivityEvent,
+  CRMAutomationLog,
+  CRMAutomationRule,
+  CRMCampaign,
+  CRMCustomSegmentRule,
+  CRMFollowUpTask,
+  CRMLead,
+  CRMLoyaltyAccount,
+  CRMLoyaltyConfig,
+  CRMLoyaltyCoupon,
+  CRMLoyaltyLedgerEntry,
+  CRMLoyaltyTier,
+  CRMSupportTicket,
   Customer,
   DeliveryAreaConfig,
   DeliveryCityConfig,
   MonthlyExpense,
   ProductItem,
+  Reseller,
+  ReviewRewardSubmission,
   Transaction,
   UserAccount,
 } from '../types';
@@ -267,7 +282,8 @@ function runMigrations(db: DatabaseSync, hadExistingDb: boolean) {
     !hasMigration('005_all_provinces_kashmir_subcities_villages') ||
     !hasMigration('006_product_delivery_fees_and_templates') ||
     !hasMigration('007_fix_broadcast_templates_key') ||
-    !hasMigration('008_audit_clean_order_history_and_links');
+    !hasMigration('008_audit_clean_order_history_and_links') ||
+    !hasMigration('009_crm_schema_and_security_hardening');
 
   if (hadExistingDb && pendingMigrations) {
     createVerifiedBackup('pre_migration');
@@ -862,6 +878,197 @@ function runMigrations(db: DatabaseSync, hadExistingDb: boolean) {
       'Audited and repaired backend COD orders, orphaned customer/transaction links, balances, and madinamarket.pk links'
     );
   }
+
+  // MIGRATION 009: Complete CRM tables, retention automation defaults & server-side scrypt secret hardening
+  if (!hasMigration('009_crm_schema_and_security_hardening')) {
+    if (hadExistingDb) {
+      createVerifiedBackup('pre_migration_009_crm_and_security');
+    }
+
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS crm_follow_ups (
+        id TEXT PRIMARY KEY,
+        customer_id TEXT,
+        lead_id TEXT,
+        assigned_employee_id TEXT,
+        follow_up_date TEXT NOT NULL,
+        priority TEXT NOT NULL DEFAULT 'medium',
+        status TEXT NOT NULL DEFAULT 'Pending',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        data_json TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_crm_follow_ups_date_status ON crm_follow_ups (follow_up_date, status);
+      CREATE INDEX IF NOT EXISTS idx_crm_follow_ups_cust ON crm_follow_ups (customer_id);
+
+      CREATE TABLE IF NOT EXISTS crm_leads (
+        id TEXT PRIMARY KEY,
+        phone TEXT NOT NULL,
+        stage TEXT NOT NULL DEFAULT 'New',
+        source TEXT NOT NULL DEFAULT 'WhatsApp',
+        assigned_salesperson_id TEXT,
+        converted_customer_id TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        data_json TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_crm_leads_stage ON crm_leads (stage);
+      CREATE INDEX IF NOT EXISTS idx_crm_leads_phone ON crm_leads (phone);
+
+      CREATE TABLE IF NOT EXISTS crm_campaigns (
+        id TEXT PRIMARY KEY,
+        status TEXT NOT NULL DEFAULT 'draft',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        data_json TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS crm_support_tickets (
+        id TEXT PRIMARY KEY,
+        ticket_number TEXT NOT NULL UNIQUE,
+        customer_id TEXT,
+        order_id TEXT,
+        category TEXT NOT NULL,
+        priority TEXT NOT NULL DEFAULT 'medium',
+        status TEXT NOT NULL DEFAULT 'Open',
+        assigned_employee_id TEXT,
+        due_at TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        data_json TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_crm_tickets_status ON crm_support_tickets (status, priority);
+      CREATE INDEX IF NOT EXISTS idx_crm_tickets_cust ON crm_support_tickets (customer_id);
+
+      CREATE TABLE IF NOT EXISTS crm_loyalty_accounts (
+        customer_id TEXT PRIMARY KEY,
+        points_balance INTEGER NOT NULL DEFAULT 0,
+        lifetime_points_earned INTEGER NOT NULL DEFAULT 0,
+        lifetime_points_redeemed INTEGER NOT NULL DEFAULT 0,
+        tier TEXT NOT NULL DEFAULT 'Bronze',
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS crm_loyalty_ledger (
+        id TEXT PRIMARY KEY,
+        customer_id TEXT NOT NULL,
+        type TEXT NOT NULL,
+        points INTEGER NOT NULL,
+        order_number TEXT,
+        coupon_code TEXT,
+        notes TEXT,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_crm_loyalty_ledger_cust ON crm_loyalty_ledger (customer_id, created_at);
+
+      CREATE TABLE IF NOT EXISTS crm_coupons (
+        id TEXT PRIMARY KEY,
+        code TEXT NOT NULL COLLATE NOCASE UNIQUE,
+        customer_id TEXT,
+        status TEXT NOT NULL DEFAULT 'active',
+        expires_at TEXT,
+        created_at TEXT NOT NULL,
+        data_json TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS crm_custom_segments (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        is_active INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        data_json TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS crm_automation_rules (
+        id TEXT PRIMARY KEY,
+        trigger_type TEXT NOT NULL UNIQUE,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        last_run_at TEXT,
+        total_triggered_count INTEGER NOT NULL DEFAULT 0,
+        data_json TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS crm_automation_logs (
+        id TEXT PRIMARY KEY,
+        rule_id TEXT NOT NULL,
+        trigger_type TEXT NOT NULL,
+        customer_id TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        status TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        data_json TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_crm_auto_logs_created ON crm_automation_logs (created_at);
+
+      CREATE TABLE IF NOT EXISTS crm_activity_events (
+        id TEXT PRIMARY KEY,
+        customer_id TEXT,
+        phone TEXT,
+        event_type TEXT NOT NULL,
+        product_id TEXT,
+        category TEXT,
+        order_number TEXT,
+        created_at TEXT NOT NULL,
+        data_json TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_crm_activity_cust ON crm_activity_events (customer_id, created_at);
+      CREATE INDEX IF NOT EXISTS idx_crm_activity_prod ON crm_activity_events (product_id, event_type);
+    `);
+
+    // Security hardening: migrate legacy plaintext PINs in user_accounts & business_profile to scrypt hashes
+    try {
+      const bp = getCollectionValue<BusinessProfile>(db, 'business_profile', defaultBusinessProfile);
+      const envMasterPin = (process.env.ADMIN_MASTER_PIN || '').trim();
+      const rawAdminPin = typeof bp.adminPin === 'string' && bp.adminPin.trim() ? bp.adminPin.trim() : undefined;
+
+      const accounts = getCollectionValue<UserAccount[]>(db, 'user_accounts', []);
+      let accountsChanged = false;
+      const migratedAccounts = accounts.map((acc) => {
+        const next: UserAccount = { ...acc };
+        if (next.suggestedDefaultPin !== undefined) {
+          delete next.suggestedDefaultPin;
+          accountsChanged = true;
+        }
+        if (next.resetToken !== undefined) {
+          delete next.resetToken;
+          delete next.resetTokenExpiresAt;
+          accountsChanged = true;
+        }
+        const plainSecret =
+          (acc.id === 'usr_superadmin' || acc.role === 'super_admin') && !acc.passwordHash
+            ? rawAdminPin || envMasterPin
+            : acc.passwordHash;
+
+        if (plainSecret && !plainSecret.startsWith('scrypt:') && !acc.passwordSalt) {
+          const rec = hashServerSecret(plainSecret);
+          next.passwordHash = rec.hash;
+          next.passwordSalt = rec.salt;
+          accountsChanged = true;
+        }
+        return next;
+      });
+      if (accountsChanged) {
+        saveCollectionValue(db, 'user_accounts', migratedAccounts);
+      }
+
+      if (bp.adminPin !== undefined) {
+        const cleanedBp: BusinessProfile = { ...bp };
+        delete cleanedBp.adminPin;
+        saveCollectionValue(db, 'business_profile', cleanedBp);
+      }
+    } catch (err) {
+      console.warn('Migration 009 secret hardening warning:', err);
+    }
+
+    // Seed CRM loyalty config & automation rules (idempotent)
+    seedCrmDefaultsIfEmpty(db);
+
+    recordMigration(
+      '009_crm_schema_and_security_hardening',
+      'Created CRM tables (leads, follow-ups, campaigns, tickets, loyalty, coupons, custom segments, automation, activity), seeded defaults, and hashed stored credentials via scrypt'
+    );
+  }
 }
 
 // ==========================================
@@ -1361,40 +1568,905 @@ export function getAdminAuditLogs(db = getDb()): AdminAuditLog[] {
   }));
 }
 
+export interface ActorContext {
+  id?: string;
+  role?: string;
+  name?: string;
+  customerId?: string;
+  investorId?: string;
+  resellerCode?: string;
+  branchId?: string;
+  phone?: string;
+}
+
+export function hashServerSecret(plainText: string): { hash: string; salt: string } {
+  const saltBytes = crypto.randomBytes(16).toString('hex');
+  const derived = crypto.scryptSync(plainText.trim(), saltBytes, 64).toString('hex');
+  return {
+    hash: `scrypt:${derived}`,
+    salt: `scrypt:${saltBytes}`,
+  };
+}
+
+export function verifyServerSecret(
+  plainText: string,
+  storedHash?: string | null,
+  storedSalt?: string | null
+): boolean {
+  if (!plainText || !storedHash) return false;
+  const trimmed = plainText.trim();
+
+  // 1. Node scrypt format
+  if (storedHash.startsWith('scrypt:') && storedSalt?.startsWith('scrypt:')) {
+    const rawSalt = storedSalt.slice('scrypt:'.length);
+    const expectedHex = storedHash.slice('scrypt:'.length);
+    const derived = crypto.scryptSync(trimmed, rawSalt, 64);
+    const expected = Buffer.from(expectedHex, 'hex');
+    if (derived.length !== expected.length) return false;
+    return crypto.timingSafeEqual(derived, expected);
+  }
+
+  // 2. Client WebCrypto SHA-256 salted format (64 hex chars + random salt)
+  if (storedSalt && !storedSalt.startsWith('scrypt:')) {
+    const digest = crypto.createHash('sha256').update(`${storedSalt}:${trimmed}`).digest('hex');
+    if (digest.length === storedHash.length) {
+      return crypto.timingSafeEqual(Buffer.from(digest, 'utf8'), Buffer.from(storedHash, 'utf8'));
+    }
+  }
+
+  // 3. Plaintext fallback ONLY for pre-hash compatibility if any external record still uses plain PIN
+  if (!storedSalt) {
+    const a = Buffer.from(trimmed, 'utf8');
+    const b = Buffer.from(storedHash, 'utf8');
+    if (a.length !== b.length) return false;
+    return crypto.timingSafeEqual(a, b);
+  }
+
+  return false;
+}
+
+export const DEFAULT_CRM_LOYALTY_CONFIG: CRMLoyaltyConfig = {
+  pointsPerThousandPkr: 10,
+  pkrPerPoint: 1,
+  silverThresholdPoints: 200,
+  goldThresholdPoints: 600,
+  vipThresholdPoints: 1500,
+  vipDiscountPercent: 5,
+  goldDiscountPercent: 3,
+  silverDiscountPercent: 1,
+  birthdayCouponAmount: 500,
+  reviewCouponAmount: 500,
+  repeatOrderCouponAmount: 300,
+  couponValidityDays: 30,
+};
+
+export const DEFAULT_CRM_AUTOMATION_RULES: CRMAutomationRule[] = [
+  {
+    id: 'rule_after_first_order',
+    triggerType: 'after_first_order',
+    name: 'After First Order Welcome',
+    description: 'Create onboarding welcome WhatsApp / call follow-up after a customer completes their first order.',
+    enabled: true,
+    isBulkAction: false,
+    requiresAdminApproval: false,
+    templateType: 'welcome',
+    actionMode: 'both',
+    delayDays: 0,
+    totalTriggeredCount: 0,
+  },
+  {
+    id: 'rule_after_delivery',
+    triggerType: 'after_delivery',
+    name: 'After Order Delivery Check-in',
+    description: 'Confirm safe parcel arrival and collect product satisfaction after COD order marks Delivered.',
+    enabled: true,
+    isBulkAction: false,
+    requiresAdminApproval: false,
+    templateType: 'delivery_confirmation',
+    actionMode: 'both',
+    delayDays: 1,
+    totalTriggeredCount: 0,
+  },
+  {
+    id: 'rule_review_request',
+    triggerType: 'review_request_after_delivery',
+    name: 'Review Request (Rs. 500 Reward Invite)',
+    description: 'Invite delivered buyers to share an authentic review on WhatsApp/Facebook/TikTok for a reward voucher.',
+    enabled: true,
+    isBulkAction: false,
+    requiresAdminApproval: false,
+    templateType: 'feedback_request',
+    actionMode: 'queue_whatsapp',
+    delayDays: 3,
+    totalTriggeredCount: 0,
+  },
+  {
+    id: 'rule_inactive_30',
+    triggerType: 'no_order_30_days',
+    name: '30 Days No Order Reminder',
+    description: 'Trigger repeat purchase reminder for customers inactive for 30+ days.',
+    enabled: true,
+    isBulkAction: true,
+    requiresAdminApproval: true,
+    templateType: 'repeat_purchase_reminder',
+    actionMode: 'both',
+    delayDays: 30,
+    totalTriggeredCount: 0,
+  },
+  {
+    id: 'rule_inactive_60',
+    triggerType: 'no_order_60_days',
+    name: '60 Days Recovery Offer',
+    description: 'Prepare recovery discount reminder for customers inactive for 60+ days.',
+    enabled: true,
+    isBulkAction: true,
+    requiresAdminApproval: true,
+    templateType: 'inactive_recovery',
+    actionMode: 'both',
+    delayDays: 60,
+    totalTriggeredCount: 0,
+  },
+  {
+    id: 'rule_inactive_90',
+    triggerType: 'no_order_90_days',
+    name: '90 Days Win-Back Campaign',
+    description: 'Flag lost-risk customers (90+ days inactive) for win-back follow-up call or offer.',
+    enabled: true,
+    isBulkAction: true,
+    requiresAdminApproval: true,
+    templateType: 'inactive_recovery',
+    actionMode: 'create_task',
+    delayDays: 90,
+    totalTriggeredCount: 0,
+  },
+  {
+    id: 'rule_payment_due_soon',
+    triggerType: 'payment_due_soon',
+    name: 'Credit Payment Due Soon (3 Days)',
+    description: 'Create polite payment collection follow-up when a credit balance due date is within 3 days.',
+    enabled: true,
+    isBulkAction: false,
+    requiresAdminApproval: false,
+    templateType: 'payment_reminder',
+    actionMode: 'both',
+    delayDays: 3,
+    totalTriggeredCount: 0,
+  },
+  {
+    id: 'rule_payment_overdue',
+    triggerType: 'payment_overdue',
+    name: 'Overdue Khata Payment Escalation',
+    description: 'Create urgent payment recovery task when credit balance is past due date.',
+    enabled: true,
+    isBulkAction: false,
+    requiresAdminApproval: false,
+    templateType: 'payment_reminder',
+    actionMode: 'create_task',
+    delayDays: 1,
+    totalTriggeredCount: 0,
+  },
+  {
+    id: 'rule_abandoned_cart',
+    triggerType: 'abandoned_cart',
+    name: 'Abandoned Cart / Product Inquiry Follow-Up',
+    description: 'Follow up on logged cart abandonments or product inquiries that have not converted into an order.',
+    enabled: true,
+    isBulkAction: false,
+    requiresAdminApproval: false,
+    templateType: 'abandoned_cart',
+    actionMode: 'both',
+    delayDays: 1,
+    totalTriggeredCount: 0,
+  },
+  {
+    id: 'rule_vip_reached',
+    triggerType: 'vip_threshold_reached',
+    name: 'VIP Customer Milestone Celebration',
+    description: 'Auto-tag VIP threshold customers (>= Rs. 25,000 lifetime purchases) and prepare VIP offer.',
+    enabled: true,
+    isBulkAction: false,
+    requiresAdminApproval: false,
+    templateType: 'vip_offer',
+    actionMode: 'both',
+    thresholdValue: 25000,
+    totalTriggeredCount: 0,
+  },
+  {
+    id: 'rule_cod_returns',
+    triggerType: 'frequent_cod_returns',
+    name: 'Frequent COD Returns Risk Alert',
+    description: 'Alert store manager with verification task when a customer has 2+ returned COD parcels.',
+    enabled: true,
+    isBulkAction: false,
+    requiresAdminApproval: false,
+    templateType: 'order_confirmation',
+    actionMode: 'create_task',
+    thresholdValue: 2,
+    totalTriggeredCount: 0,
+  },
+  {
+    id: 'rule_birthday',
+    triggerType: 'birthday_or_anniversary',
+    name: 'Birthday / Anniversary Reward',
+    description: 'Issue seasonal celebration coupon reminder for customers with birthday matching today.',
+    enabled: true,
+    isBulkAction: false,
+    requiresAdminApproval: false,
+    templateType: 'discount_offer',
+    actionMode: 'both',
+    totalTriggeredCount: 0,
+  },
+  {
+    id: 'rule_back_in_stock',
+    triggerType: 'back_in_stock_for_interested',
+    name: 'Back-in-Stock / New Arrival Alert',
+    description: 'Notify customers who inquired about products that now have available stock.',
+    enabled: true,
+    isBulkAction: true,
+    requiresAdminApproval: true,
+    templateType: 'new_arrivals',
+    actionMode: 'both',
+    totalTriggeredCount: 0,
+  },
+];
+
+export function computeLoyaltyTier(pointsEarned: number, cfg: CRMLoyaltyConfig = DEFAULT_CRM_LOYALTY_CONFIG): CRMLoyaltyTier {
+  if (pointsEarned >= cfg.vipThresholdPoints) return 'VIP Platinum';
+  if (pointsEarned >= cfg.goldThresholdPoints) return 'Gold';
+  if (pointsEarned >= cfg.silverThresholdPoints) return 'Silver';
+  return 'Bronze';
+}
+
+export function getCrmLoyaltyConfig(db = getDb()): CRMLoyaltyConfig {
+  return getCollectionValue<CRMLoyaltyConfig>(db, 'crm_loyalty_config', DEFAULT_CRM_LOYALTY_CONFIG);
+}
+
+export function saveCrmLoyaltyConfig(db: DatabaseSync, config: CRMLoyaltyConfig) {
+  saveCollectionValue(db, 'crm_loyalty_config', config);
+}
+
+export function seedCrmDefaultsIfEmpty(db: DatabaseSync) {
+  const existingCfg = db.prepare("SELECT collection_key FROM app_collections WHERE collection_key = 'crm_loyalty_config'").get();
+  if (!existingCfg) {
+    saveCollectionValue(db, 'crm_loyalty_config', DEFAULT_CRM_LOYALTY_CONFIG);
+  }
+
+  const ruleCount = Number((db.prepare('SELECT COUNT(*) as c FROM crm_automation_rules').get() as { c: number }).c);
+  if (ruleCount === 0) {
+    const stmt = db.prepare(`
+      INSERT OR IGNORE INTO crm_automation_rules (id, trigger_type, enabled, last_run_at, total_triggered_count, data_json)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `);
+    for (const rule of DEFAULT_CRM_AUTOMATION_RULES) {
+      stmt.run(rule.id, rule.triggerType, rule.enabled ? 1 : 0, rule.lastRunAt || null, rule.totalTriggeredCount || 0, JSON.stringify(rule));
+    }
+  }
+
+  // Initialize loyalty accounts non-destructively from existing historical customer spend
+  const loyaltyCount = Number((db.prepare('SELECT COUNT(*) as c FROM crm_loyalty_accounts').get() as { c: number }).c);
+  if (loyaltyCount === 0) {
+    const custs = getAllCustomersFromDb(db);
+    const now = new Date().toISOString();
+    for (const c of custs) {
+      const earned = Math.max(0, Math.floor(Number(c.totalPurchases || 0) / 1000) * DEFAULT_CRM_LOYALTY_CONFIG.pointsPerThousandPkr);
+      const tier = computeLoyaltyTier(earned, DEFAULT_CRM_LOYALTY_CONFIG);
+      db.prepare(`
+        INSERT OR IGNORE INTO crm_loyalty_accounts (customer_id, points_balance, lifetime_points_earned, lifetime_points_redeemed, tier, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(c.id, earned, earned, 0, tier, now);
+      if (earned > 0) {
+        db.prepare(`
+          INSERT OR IGNORE INTO crm_loyalty_ledger (id, customer_id, type, points, notes, created_at)
+          VALUES (?, ?, ?, ?, ?, ?)
+        `).run(`lyl_seed_${c.id}`, c.id, 'earned', earned, 'Historical purchase loyalty points sync', now);
+      }
+    }
+  }
+}
+
+export function getAllCrmFollowUps(db = getDb()): CRMFollowUpTask[] {
+  const rows = db.prepare('SELECT data_json FROM crm_follow_ups ORDER BY follow_up_date ASC, created_at DESC').all() as Array<{ data_json: string }>;
+  return rows.map((r) => JSON.parse(r.data_json) as CRMFollowUpTask);
+}
+
+export function upsertCrmFollowUp(db: DatabaseSync, task: CRMFollowUpTask): CRMFollowUpTask {
+  const now = new Date().toISOString();
+  const saved: CRMFollowUpTask = {
+    ...task,
+    createdAt: task.createdAt || now,
+    updatedAt: now,
+    completedAt: task.status === 'Completed' ? task.completedAt || now : task.completedAt,
+  };
+  db.prepare(`
+    INSERT INTO crm_follow_ups (id, customer_id, lead_id, assigned_employee_id, follow_up_date, priority, status, created_at, updated_at, data_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      customer_id = excluded.customer_id,
+      lead_id = excluded.lead_id,
+      assigned_employee_id = excluded.assigned_employee_id,
+      follow_up_date = excluded.follow_up_date,
+      priority = excluded.priority,
+      status = excluded.status,
+      updated_at = excluded.updated_at,
+      data_json = excluded.data_json
+  `).run(
+    saved.id,
+    saved.customerId || null,
+    saved.leadId || null,
+    saved.assignedEmployeeId || null,
+    saved.followUpDate,
+    saved.priority,
+    saved.status,
+    saved.createdAt,
+    now,
+    JSON.stringify(saved)
+  );
+  return saved;
+}
+
+export function deleteCrmFollowUp(db: DatabaseSync, id: string) {
+  db.prepare('DELETE FROM crm_follow_ups WHERE id = ?').run(id);
+}
+
+export function getAllCrmLeads(db = getDb()): CRMLead[] {
+  const rows = db.prepare('SELECT data_json FROM crm_leads ORDER BY updated_at DESC, created_at DESC').all() as Array<{ data_json: string }>;
+  return rows.map((r) => JSON.parse(r.data_json) as CRMLead);
+}
+
+export function upsertCrmLead(db: DatabaseSync, lead: CRMLead): CRMLead {
+  const now = new Date().toISOString();
+  const saved: CRMLead = {
+    ...lead,
+    createdAt: lead.createdAt || now,
+    updatedAt: now,
+  };
+  db.prepare(`
+    INSERT INTO crm_leads (id, phone, stage, source, assigned_salesperson_id, converted_customer_id, created_at, updated_at, data_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      phone = excluded.phone,
+      stage = excluded.stage,
+      source = excluded.source,
+      assigned_salesperson_id = excluded.assigned_salesperson_id,
+      converted_customer_id = excluded.converted_customer_id,
+      updated_at = excluded.updated_at,
+      data_json = excluded.data_json
+  `).run(
+    saved.id,
+    saved.phone,
+    saved.stage,
+    saved.source,
+    saved.assignedSalespersonId || null,
+    saved.convertedCustomerId || null,
+    saved.createdAt,
+    now,
+    JSON.stringify(saved)
+  );
+  return saved;
+}
+
+export function getAllCrmCampaigns(db = getDb()): CRMCampaign[] {
+  const rows = db.prepare('SELECT data_json FROM crm_campaigns ORDER BY created_at DESC').all() as Array<{ data_json: string }>;
+  return rows.map((r) => JSON.parse(r.data_json) as CRMCampaign);
+}
+
+export function upsertCrmCampaign(db: DatabaseSync, campaign: CRMCampaign): CRMCampaign {
+  const now = new Date().toISOString();
+  const saved: CRMCampaign = {
+    ...campaign,
+    createdAt: campaign.createdAt || now,
+    updatedAt: now,
+  };
+  db.prepare(`
+    INSERT INTO crm_campaigns (id, status, created_at, updated_at, data_json)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      status = excluded.status,
+      updated_at = excluded.updated_at,
+      data_json = excluded.data_json
+  `).run(saved.id, saved.status, saved.createdAt, now, JSON.stringify(saved));
+  return saved;
+}
+
+export function getAllCrmTickets(db = getDb()): CRMSupportTicket[] {
+  const rows = db.prepare('SELECT data_json FROM crm_support_tickets ORDER BY created_at DESC').all() as Array<{ data_json: string }>;
+  return rows.map((r) => JSON.parse(r.data_json) as CRMSupportTicket);
+}
+
+export function upsertCrmTicket(db: DatabaseSync, ticket: CRMSupportTicket): CRMSupportTicket {
+  const now = new Date().toISOString();
+  const saved: CRMSupportTicket = {
+    ...ticket,
+    createdAt: ticket.createdAt || now,
+    updatedAt: now,
+    resolvedAt:
+      ticket.status === 'Resolved' || ticket.status === 'Closed'
+        ? ticket.resolvedAt || now
+        : ticket.resolvedAt,
+  };
+  db.prepare(`
+    INSERT INTO crm_support_tickets (id, ticket_number, customer_id, order_id, category, priority, status, assigned_employee_id, due_at, created_at, updated_at, data_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      customer_id = excluded.customer_id,
+      order_id = excluded.order_id,
+      category = excluded.category,
+      priority = excluded.priority,
+      status = excluded.status,
+      assigned_employee_id = excluded.assigned_employee_id,
+      due_at = excluded.due_at,
+      updated_at = excluded.updated_at,
+      data_json = excluded.data_json
+  `).run(
+    saved.id,
+    saved.ticketNumber,
+    saved.customerId || null,
+    saved.orderId || null,
+    saved.category,
+    saved.priority,
+    saved.status,
+    saved.assignedEmployeeId || null,
+    saved.dueAt,
+    saved.createdAt,
+    now,
+    JSON.stringify(saved)
+  );
+  return saved;
+}
+
+export function getAllCrmLoyaltyAccounts(db = getDb()): CRMLoyaltyAccount[] {
+  const rows = db.prepare('SELECT * FROM crm_loyalty_accounts ORDER BY lifetime_points_earned DESC').all() as Array<Record<string, unknown>>;
+  return rows.map((r) => ({
+    customerId: String(r.customer_id),
+    pointsBalance: Number(r.points_balance || 0),
+    lifetimePointsEarned: Number(r.lifetime_points_earned || 0),
+    lifetimePointsRedeemed: Number(r.lifetime_points_redeemed || 0),
+    tier: String(r.tier || 'Bronze') as CRMLoyaltyTier,
+    updatedAt: String(r.updated_at),
+  }));
+}
+
+export function getAllCrmLoyaltyLedger(db = getDb(), customerId?: string): CRMLoyaltyLedgerEntry[] {
+  const rows = (
+    customerId
+      ? db.prepare('SELECT * FROM crm_loyalty_ledger WHERE customer_id = ? ORDER BY created_at DESC LIMIT 200').all(customerId)
+      : db.prepare('SELECT * FROM crm_loyalty_ledger ORDER BY created_at DESC LIMIT 300').all()
+  ) as Array<Record<string, unknown>>;
+  return rows.map((r) => ({
+    id: String(r.id),
+    customerId: String(r.customer_id),
+    type: String(r.type) as CRMLoyaltyLedgerEntry['type'],
+    points: Number(r.points || 0),
+    orderNumber: r.order_number ? String(r.order_number) : undefined,
+    couponCode: r.coupon_code ? String(r.coupon_code) : undefined,
+    notes: r.notes ? String(r.notes) : undefined,
+    createdAt: String(r.created_at),
+  }));
+}
+
+export function adjustCustomerLoyaltyPoints(
+  db: DatabaseSync,
+  params: {
+    customerId: string;
+    pointsDelta: number;
+    type: CRMLoyaltyLedgerEntry['type'];
+    orderNumber?: string;
+    couponCode?: string;
+    notes?: string;
+  }
+): CRMLoyaltyAccount {
+  const cfg = getCrmLoyaltyConfig(db);
+  const now = new Date().toISOString();
+  const existing = db.prepare('SELECT * FROM crm_loyalty_accounts WHERE customer_id = ?').get(params.customerId) as Record<string, unknown> | undefined;
+  const curBal = Number(existing?.points_balance || 0);
+  const curEarned = Number(existing?.lifetime_points_earned || 0);
+  const curRedeemed = Number(existing?.lifetime_points_redeemed || 0);
+
+  const nextBal = Math.max(0, curBal + params.pointsDelta);
+  const nextEarned = params.pointsDelta > 0 ? curEarned + params.pointsDelta : curEarned;
+  const nextRedeemed = params.pointsDelta < 0 ? curRedeemed + Math.abs(params.pointsDelta) : curRedeemed;
+  const nextTier = computeLoyaltyTier(nextEarned, cfg);
+
+  db.prepare(`
+    INSERT INTO crm_loyalty_accounts (customer_id, points_balance, lifetime_points_earned, lifetime_points_redeemed, tier, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(customer_id) DO UPDATE SET
+      points_balance = excluded.points_balance,
+      lifetime_points_earned = excluded.lifetime_points_earned,
+      lifetime_points_redeemed = excluded.lifetime_points_redeemed,
+      tier = excluded.tier,
+      updated_at = excluded.updated_at
+  `).run(params.customerId, nextBal, nextEarned, nextRedeemed, nextTier, now);
+
+  const entryId = `lyl_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+  db.prepare(`
+    INSERT INTO crm_loyalty_ledger (id, customer_id, type, points, order_number, coupon_code, notes, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    entryId,
+    params.customerId,
+    params.type,
+    Math.abs(params.pointsDelta),
+    params.orderNumber || null,
+    params.couponCode || null,
+    params.notes || null,
+    now
+  );
+
+  return {
+    customerId: params.customerId,
+    pointsBalance: nextBal,
+    lifetimePointsEarned: nextEarned,
+    lifetimePointsRedeemed: nextRedeemed,
+    tier: nextTier,
+    updatedAt: now,
+  };
+}
+
+export function getAllCrmCoupons(db = getDb()): CRMLoyaltyCoupon[] {
+  const rows = db.prepare('SELECT data_json FROM crm_coupons ORDER BY created_at DESC').all() as Array<{ data_json: string }>;
+  return rows.map((r) => JSON.parse(r.data_json) as CRMLoyaltyCoupon);
+}
+
+export function upsertCrmCoupon(db: DatabaseSync, coupon: CRMLoyaltyCoupon): CRMLoyaltyCoupon {
+  const saved: CRMLoyaltyCoupon = {
+    ...coupon,
+    code: coupon.code.trim().toUpperCase(),
+    createdAt: coupon.createdAt || new Date().toISOString(),
+  };
+  db.prepare(`
+    INSERT INTO crm_coupons (id, code, customer_id, status, expires_at, created_at, data_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      code = excluded.code,
+      customer_id = excluded.customer_id,
+      status = excluded.status,
+      expires_at = excluded.expires_at,
+      data_json = excluded.data_json
+  `).run(
+    saved.id,
+    saved.code,
+    saved.customerId || null,
+    saved.status,
+    saved.expiresAt || null,
+    saved.createdAt,
+    JSON.stringify(saved)
+  );
+  return saved;
+}
+
+export function getAllCrmCustomSegments(db = getDb()): CRMCustomSegmentRule[] {
+  const rows = db.prepare('SELECT data_json FROM crm_custom_segments ORDER BY created_at DESC').all() as Array<{ data_json: string }>;
+  return rows.map((r) => JSON.parse(r.data_json) as CRMCustomSegmentRule);
+}
+
+export function upsertCrmCustomSegment(db: DatabaseSync, rule: CRMCustomSegmentRule): CRMCustomSegmentRule {
+  const now = new Date().toISOString();
+  const saved: CRMCustomSegmentRule = { ...rule, createdAt: rule.createdAt || now, updatedAt: now };
+  db.prepare(`
+    INSERT INTO crm_custom_segments (id, name, is_active, created_at, updated_at, data_json)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      name = excluded.name,
+      is_active = excluded.is_active,
+      updated_at = excluded.updated_at,
+      data_json = excluded.data_json
+  `).run(saved.id, saved.name, saved.isActive ? 1 : 0, saved.createdAt, now, JSON.stringify(saved));
+  return saved;
+}
+
+export function deleteCrmCustomSegment(db: DatabaseSync, id: string) {
+  db.prepare('DELETE FROM crm_custom_segments WHERE id = ?').run(id);
+}
+
+export function getAllCrmAutomationRules(db = getDb()): CRMAutomationRule[] {
+  const rows = db.prepare('SELECT data_json, enabled, last_run_at, total_triggered_count FROM crm_automation_rules').all() as Array<Record<string, unknown>>;
+  return rows.map((r) => {
+    const parsed = JSON.parse(String(r.data_json)) as CRMAutomationRule;
+    return {
+      ...parsed,
+      enabled: Boolean(r.enabled),
+      lastRunAt: r.last_run_at ? String(r.last_run_at) : parsed.lastRunAt,
+      totalTriggeredCount: Number(r.total_triggered_count ?? parsed.totalTriggeredCount ?? 0),
+    };
+  });
+}
+
+export function upsertCrmAutomationRule(db: DatabaseSync, rule: CRMAutomationRule): CRMAutomationRule {
+  db.prepare(`
+    INSERT INTO crm_automation_rules (id, trigger_type, enabled, last_run_at, total_triggered_count, data_json)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      enabled = excluded.enabled,
+      last_run_at = excluded.last_run_at,
+      total_triggered_count = excluded.total_triggered_count,
+      data_json = excluded.data_json
+  `).run(
+    rule.id,
+    rule.triggerType,
+    rule.enabled ? 1 : 0,
+    rule.lastRunAt || null,
+    rule.totalTriggeredCount || 0,
+    JSON.stringify(rule)
+  );
+  return rule;
+}
+
+export function getAllCrmAutomationLogs(db = getDb(), limit = 200): CRMAutomationLog[] {
+  const rows = db.prepare('SELECT data_json FROM crm_automation_logs ORDER BY created_at DESC LIMIT ?').all(limit) as Array<{ data_json: string }>;
+  return rows.map((r) => JSON.parse(r.data_json) as CRMAutomationLog);
+}
+
+export function insertCrmAutomationLog(db: DatabaseSync, log: CRMAutomationLog): boolean {
+  const info = db.prepare(`
+    INSERT OR IGNORE INTO crm_automation_logs (id, rule_id, trigger_type, customer_id, idempotency_key, status, created_at, data_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    log.id,
+    log.ruleId,
+    log.triggerType,
+    log.customerId,
+    log.idempotencyKey,
+    log.status,
+    log.createdAt,
+    JSON.stringify(log)
+  );
+  return Number(info.changes || 0) > 0;
+}
+
+export function hasCrmAutomationIdempotencyKey(db: DatabaseSync, key: string): boolean {
+  const row = db.prepare('SELECT id FROM crm_automation_logs WHERE idempotency_key = ?').get(key);
+  return Boolean(row);
+}
+
+export function insertCrmActivityEvent(db: DatabaseSync, event: Omit<CRMActivityEvent, 'id' | 'createdAt'> & { id?: string; createdAt?: string }): CRMActivityEvent {
+  const entry: CRMActivityEvent = {
+    ...event,
+    id: event.id || `act_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+    createdAt: event.createdAt || new Date().toISOString(),
+  };
+  db.prepare(`
+    INSERT INTO crm_activity_events (id, customer_id, phone, event_type, product_id, category, order_number, created_at, data_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    entry.id,
+    entry.customerId || null,
+    entry.phone || null,
+    entry.eventType,
+    entry.productId || null,
+    entry.category || null,
+    entry.orderNumber || null,
+    entry.createdAt,
+    JSON.stringify(entry)
+  );
+  return entry;
+}
+
+export function getAllCrmActivityEvents(db = getDb(), customerId?: string, limit = 500): CRMActivityEvent[] {
+  const rows = (
+    customerId
+      ? db.prepare('SELECT data_json FROM crm_activity_events WHERE customer_id = ? ORDER BY created_at DESC LIMIT ?').all(customerId, limit)
+      : db.prepare('SELECT data_json FROM crm_activity_events ORDER BY created_at DESC LIMIT ?').all(limit)
+  ) as Array<{ data_json: string }>;
+  return rows.map((r) => JSON.parse(r.data_json) as CRMActivityEvent);
+}
+
+function maskPhone(phone?: string): string {
+  const digits = (phone || '').replace(/\D/g, '');
+  if (digits.length < 4) return '****';
+  return `${digits.slice(0, 4)}***${digits.slice(-2)}`;
+}
+
 export function redactStateForRole(
   state: Record<string, unknown>,
-  actorRole?: string
+  actorOrRole?: ActorContext | string
 ): Record<string, unknown> {
-  const isPrivileged = actorRole === 'super_admin' || actorRole === 'admin';
-  if (isPrivileged) return state;
+  const actor: ActorContext =
+    typeof actorOrRole === 'string' ? { role: actorOrRole } : actorOrRole || {};
+  const role = actor.role;
+  const isAuthenticated = Boolean(actor.id && role);
+  const isAdmin = isAuthenticated && (role === 'super_admin' || role === 'admin');
+  const isManager = isAuthenticated && role === 'manager';
+  const isStaff = isAuthenticated && role === 'staff';
+  const isInternalOps = isAdmin || isManager || isStaff;
 
-  const cloned = { ...state };
+  const cloned: Record<string, unknown> = { ...state };
+
+  // Never expose adminPin or shipping API key over API
   if (cloned.business_profile && typeof cloned.business_profile === 'object') {
     const bp = { ...(cloned.business_profile as BusinessProfile) };
-    bp.adminPin = undefined;
+    delete bp.adminPin;
     if (bp.shippingPartner) {
       bp.shippingPartner = {
         ...bp.shippingPartner,
-        apiKey: '',
+        apiKey: isAdmin ? bp.shippingPartner.apiKey : '',
       };
     }
     cloned.business_profile = bp;
   }
 
+  // Never expose credential hashes, salts, reset tokens, or suggested default PINs
   if (Array.isArray(cloned.user_accounts)) {
-    cloned.user_accounts = (cloned.user_accounts as UserAccount[]).map((u) => ({
-      ...u,
-      passwordHash: undefined,
-      passwordSalt: undefined,
-      resetToken: undefined,
-      suggestedDefaultPin: undefined,
+    if (isAdmin) {
+      cloned.user_accounts = (cloned.user_accounts as UserAccount[]).map((u) => {
+        const clean = { ...u };
+        delete clean.passwordHash;
+        delete clean.passwordSalt;
+        delete clean.resetToken;
+        delete clean.resetTokenExpiresAt;
+        delete clean.suggestedDefaultPin;
+        return clean;
+      });
+    } else {
+      cloned.user_accounts = [];
+    }
+  }
+
+  // Strip costPrice & margin metrics from products unless Admin/Manager/Investor
+  if (Array.isArray(cloned.products) && !isAdmin && !isManager && role !== 'investor') {
+    cloned.products = (cloned.products as ProductItem[]).map((p) => ({
+      ...p,
+      costPrice: 0,
+      totalProfit: 0,
+      totalRevenue: 0,
     }));
+  }
+
+  if (isInternalOps) {
+    // Strip PINs from customer/reseller lists even for staff/managers
+    if (Array.isArray(cloned.customers)) {
+      cloned.customers = (cloned.customers as Customer[]).map((c) => {
+        const clean = { ...c };
+        delete clean.pin;
+        return clean;
+      });
+    }
+    if (Array.isArray(cloned.resellers)) {
+      cloned.resellers = (cloned.resellers as Reseller[]).map((r) => {
+        const clean = { ...r };
+        delete clean.pin;
+        return clean;
+      });
+    }
+    if (!isAdmin) {
+      cloned.investors = [];
+      cloned.investor_transactions = [];
+      cloned.login_audits = [];
+      cloned.admin_audit_logs = [];
+    }
+    if (isStaff) {
+      cloned.monthly_expenses = [];
+    }
+    return cloned;
+  }
+
+  // Scoped visibility for Customer / Reseller / Investor / Unauthenticated Guest
+  const normPhone = (val?: string) => (val || '').replace(/\D/g, '');
+  const actorPhoneDigits = normPhone(actor.phone);
+
+  const allCustomers = Array.isArray(cloned.customers) ? (cloned.customers as Customer[]) : [];
+  const allTxs = Array.isArray(cloned.transactions) ? (cloned.transactions as Transaction[]) : [];
+  const allCodOrders = Array.isArray(cloned.cod_orders) ? (cloned.cod_orders as CODOrder[]) : [];
+  const allResellers = Array.isArray(cloned.resellers) ? (cloned.resellers as Reseller[]) : [];
+  const allInvestors = Array.isArray(cloned.investors) ? (cloned.investors as Array<Record<string, unknown>>) : [];
+  const allInvestorTxs = Array.isArray(cloned.investor_transactions)
+    ? (cloned.investor_transactions as Array<Record<string, unknown>>)
+    : [];
+  const allReviews = Array.isArray(cloned.review_rewards)
+    ? (cloned.review_rewards as ReviewRewardSubmission[])
+    : [];
+  const allDraws = Array.isArray(cloned.lucky_draws) ? (cloned.lucky_draws as Array<Record<string, unknown>>) : [];
+
+  // Default zero-leak private collections
+  const privateKeys = [
+    'customers',
+    'transactions',
+    'cod_orders',
+    'wasal_settlements',
+    'investors',
+    'investor_transactions',
+    'resellers',
+    'user_accounts',
+    'branches',
+    'walkin_customers',
+    'walkin_sales',
+    'salesperson_referrals',
+    'commission_records',
+    'employees',
+    'attendance',
+    'recurring_invoices',
+    'notifications',
+    'product_broadcasts',
+    'broadcast_contacts',
+    'saved_broadcasts',
+    'login_audits',
+    'import_logs',
+    'monthly_expenses',
+    'admin_audit_logs',
+  ];
+  for (const k of privateKeys) {
+    cloned[k] = [];
+  }
+
+  // Public lucky draws: mask winner phone digits
+  cloned.lucky_draws = allDraws.map((d) => ({
+    ...d,
+    winners: Array.isArray(d.winners)
+      ? d.winners.map((w: Record<string, unknown>) => ({
+          ...w,
+          phone: maskPhone(String(w.phone || '')),
+        }))
+      : [],
+    topBuyersSnapshot: Array.isArray(d.topBuyersSnapshot)
+      ? d.topBuyersSnapshot.map((b: Record<string, unknown>) => ({
+          ...b,
+          phone: maskPhone(String(b.phone || '')),
+        }))
+      : [],
+  }));
+
+  // Public reviews: approved only + masked phone
+  cloned.review_rewards = allReviews
+    .filter((r) => r.status === 'approved' || (isAuthenticated && r.customerId === actor.customerId))
+    .map((r) => ({ ...r, phone: isAuthenticated && r.customerId === actor.customerId ? r.phone : maskPhone(r.phone) }));
+
+  if (!isAuthenticated) {
+    return cloned;
+  }
+
+  if (role === 'customer') {
+    const matchedCusts = allCustomers.filter(
+      (c) =>
+        (actor.customerId && c.id === actor.customerId) ||
+        (actorPhoneDigits && normPhone(c.phone) === actorPhoneDigits)
+    );
+    const ownedCustIds = new Set(matchedCusts.map((c) => c.id));
+    if (actor.customerId) ownedCustIds.add(actor.customerId);
+
+    cloned.customers = matchedCusts.map((c) => {
+      const clean = { ...c };
+      delete clean.pin;
+      return clean;
+    });
+    cloned.transactions = allTxs.filter((t) => ownedCustIds.has(t.customerId));
+    cloned.cod_orders = allCodOrders.filter(
+      (o) =>
+        (o.customerId && ownedCustIds.has(o.customerId)) ||
+        (actorPhoneDigits && normPhone(o.phone) === actorPhoneDigits)
+    );
+  } else if (role === 'reseller') {
+    cloned.resellers = allResellers
+      .filter(
+        (r) =>
+          (actor.resellerCode && r.referralCode === actor.resellerCode) ||
+          r.id === actor.id ||
+          (actorPhoneDigits && normPhone(r.phone) === actorPhoneDigits)
+      )
+      .map((r) => {
+        const clean = { ...r };
+        delete clean.pin;
+        return clean;
+      });
+    cloned.cod_orders = allCodOrders.filter(
+      (o) => actor.resellerCode && o.resellerCode === actor.resellerCode
+    );
+  } else if (role === 'investor') {
+    const ownInvestors = allInvestors.filter(
+      (inv) =>
+        (actor.investorId && String(inv.id) === actor.investorId) ||
+        (actorPhoneDigits && normPhone(String(inv.phone || '')) === actorPhoneDigits)
+    );
+    const ownedInvIds = new Set(ownInvestors.map((i) => String(i.id)));
+    cloned.investors = ownInvestors;
+    cloned.investor_transactions = allInvestorTxs.filter((tx) =>
+      ownedInvIds.has(String(tx.investorId || ''))
+    );
   }
 
   return cloned;
 }
 
-export function getFullSyncState(actorRole?: string): Record<string, unknown> {
+export function getFullSyncState(actorOrRole?: ActorContext | string): Record<string, unknown> {
   const db = getDb();
   const cities = getAllCitiesFromDb(db);
   const categories = getAllCategoriesFromDb(db);
@@ -1422,7 +2494,7 @@ export function getFullSyncState(actorRole?: string): Record<string, unknown> {
     state[key] = getCollectionValue(db, key, fallback);
   }
 
-  return redactStateForRole(state, actorRole);
+  return redactStateForRole(state, actorOrRole);
 }
 
 /**

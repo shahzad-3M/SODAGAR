@@ -993,7 +993,6 @@ export const defaultBusinessProfile: BusinessProfile = {
   },
   deliveryCities: defaultDeliveryCities,
   defaultCityCenterDeliveryCharge: 50,
-  adminPin: '580987', // USER DIRECTIVE: Owner default pin is 580987 and resettable in backend
 };
 
 // USER DIRECTIVE: Single pristine demo item with full pictures, sizes, specs & details, plus viral upcoming item
@@ -1783,7 +1782,6 @@ export const defaultUserAccounts: UserAccount[] = [
     role: 'super_admin',
     status: 'active',
     canAuthorizeCreditSale: true,
-    passwordHash: '580987', // Legacy PIN supported, seamlessly salted on password change
     createdAt: '2026-01-01',
     lastLoginAt: '2026-03-02T09:15:00Z',
     loginCount: 142,
