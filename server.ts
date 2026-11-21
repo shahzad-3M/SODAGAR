@@ -75,6 +75,7 @@ import {
   getDatabaseHealthSummary,
   getDb,
   getFullSyncState,
+  getOrCreateServerSessionSecret,
   getSyncVersion,
   hasCrmAutomationIdempotencyKey,
   hashServerSecret,
@@ -136,7 +137,9 @@ const envPort =
     : undefined;
 const PORT = Number(cliPort || envPort || process.env.DEFAULT_APP_PORT || 3000);
 const HOST = readCliArg('--host') || process.env.npm_config_host || process.env.HOST || '0.0.0.0';
-const SESSION_SECRET = process.env.SESSION_SECRET || crypto.createHash('sha256').update(`100dagar_${process.cwd()}`).digest('hex');
+function getSessionSecret(): string {
+  return process.env.SESSION_SECRET?.trim() || getOrCreateServerSessionSecret();
+}
 
 interface SessionClaims {
   userId: string;
@@ -151,14 +154,14 @@ function signSessionToken(claims: Omit<SessionClaims, 'exp'>): string {
     exp: Date.now() + 1000 * 60 * 60 * 24 * 7, // 7 days
   };
   const encoded = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
-  const sig = crypto.createHmac('sha256', SESSION_SECRET).update(encoded).digest('base64url');
+  const sig = crypto.createHmac('sha256', getSessionSecret()).update(encoded).digest('base64url');
   return `${encoded}.${sig}`;
 }
 
 function verifySessionToken(token?: string | null): SessionClaims | null {
   if (!token || !token.includes('.')) return null;
   const [encoded, sig] = token.split('.');
-  const expected = crypto.createHmac('sha256', SESSION_SECRET).update(encoded).digest('base64url');
+  const expected = crypto.createHmac('sha256', getSessionSecret()).update(encoded).digest('base64url');
   if (sig !== expected) return null;
   try {
     const parsed = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8')) as SessionClaims;
@@ -320,7 +323,11 @@ function resolveActor(req: Request): ResolvedActor {
   }
 
   const accounts = getCollectionValue<UserAccount[]>(db, 'user_accounts', []);
-  const account = accounts.find((u) => u.id === claims.userId);
+  const account =
+    accounts.find((u) => u.id === claims.userId) ||
+    (claims.role === 'super_admin'
+      ? accounts.find((u) => u.role === 'super_admin' && u.status === 'active')
+      : undefined);
   if (account) {
     if (account.status !== 'active') {
       return { role: undefined };
@@ -470,7 +477,12 @@ async function startServer() {
   app.get('/api/sync/state', (req, res) => {
     const actor = resolveActor(req);
     const state = getFullSyncState(actor);
-    res.json(state);
+    res.json({
+      ...state,
+      authenticatedActor: actor.id
+        ? { id: actor.id, role: actor.role, name: actor.name }
+        : null,
+    });
   });
 
   app.post('/api/sync/migrate-local', (req, res) => {
@@ -1042,6 +1054,10 @@ async function startServer() {
 
   app.post('/api/products', (req, res) => {
     const actor = resolveActor(req);
+    if (!actor.id) {
+      res.status(401).json({ error: 'Session expired or missing authentication token. Please sign in again.' });
+      return;
+    }
     if (actor.role !== 'super_admin' && actor.role !== 'admin' && actor.role !== 'manager') {
       res.status(403).json({ error: 'Only admins or store managers can create products.' });
       return;
@@ -1059,6 +1075,10 @@ async function startServer() {
 
   app.put('/api/products/:id', (req, res) => {
     const actor = resolveActor(req);
+    if (!actor.id) {
+      res.status(401).json({ error: 'Session expired or missing authentication token. Please sign in again.' });
+      return;
+    }
     if (
       actor.role !== 'super_admin' &&
       actor.role !== 'admin' &&
@@ -1230,6 +1250,12 @@ async function startServer() {
   app.post('/api/products/scrape-url', async (req, res) => {
     try {
       const actor = resolveActor(req);
+      if (!actor.id) {
+        res.status(401).json({
+          error: 'Session expired or missing authentication token. Please sign in again as Super Admin, Admin, or Manager.',
+        });
+        return;
+      }
       if (
         actor.role !== 'super_admin' &&
         actor.role !== 'admin' &&
@@ -1269,6 +1295,10 @@ async function startServer() {
   app.post('/api/media/cache', async (req, res) => {
     try {
       const actor = resolveActor(req);
+      if (!actor.id) {
+        res.status(401).json({ error: 'Session expired or missing authentication token. Please sign in again.' });
+        return;
+      }
       if (
         actor.role !== 'super_admin' &&
         actor.role !== 'admin' &&

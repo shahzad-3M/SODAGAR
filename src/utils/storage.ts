@@ -217,6 +217,7 @@ function getAuthHeaders(): Record<string, string> {
   const token = getSessionToken();
   if (token) {
     headers['Authorization'] = `Bearer ${token}`;
+    headers['x-session-token'] = token;
   }
   return headers;
 }
@@ -330,6 +331,17 @@ function saveToStorage<T>(key: string, value: T, skipRemotePush = false): void {
 
 function applyServerStateSnapshot(state: Record<string, unknown>) {
   if (!state || typeof state !== 'object') return;
+  if ('authenticatedActor' in state && state.authenticatedActor === null) {
+    setSessionToken(null);
+    memoryStore.set(STORAGE_KEYS.CURRENT_USER, defaultGuestUser);
+    memoryStore.set(STORAGE_KEYS.ACTIVE_ROLE, 'customer');
+    try {
+      localStorage.setItem(STORAGE_KEYS.CURRENT_USER, JSON.stringify(defaultGuestUser));
+      localStorage.setItem(STORAGE_KEYS.ACTIVE_ROLE, JSON.stringify('customer'));
+    } catch {
+      // ignore storage errors
+    }
+  }
   if (typeof state.syncVersion === 'string') {
     currentSyncVersion = state.syncVersion;
   }
@@ -577,6 +589,24 @@ export async function apiScrapeProductUrl(
     if (res.status === 502 || res.status === 503 || res.status === 504) {
       await new Promise((r) => setTimeout(r, 700));
       res = await attemptServerScrape();
+    }
+
+    if (res.status === 401) {
+      setSessionToken(null);
+      memoryStore.set(STORAGE_KEYS.CURRENT_USER, defaultGuestUser);
+      memoryStore.set(STORAGE_KEYS.ACTIVE_ROLE, 'customer');
+      try {
+        localStorage.setItem(STORAGE_KEYS.CURRENT_USER, JSON.stringify(defaultGuestUser));
+        localStorage.setItem(STORAGE_KEYS.ACTIVE_ROLE, JSON.stringify('customer'));
+      } catch {
+        // ignore storage errors
+      }
+      notifyListeners();
+      return {
+        ok: false,
+        error:
+          'Your session expired or needs a fresh sign-in after the security upgrade. Please sign in again as Super Admin, Admin, or Manager.',
+      };
     }
 
     if (res.status === 403) {

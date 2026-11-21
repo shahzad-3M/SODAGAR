@@ -422,6 +422,16 @@ export default function App() {
     setActiveRole(actRole);
     setCurrentUser(curUser);
     setViewMode(actRole === 'customer' ? 'customer' : 'merchant');
+    if (!curUser?.isAuthenticated) {
+      setCurrentTab((prevTab) => {
+        if (prevTab !== 'store' && prevTab !== 'lucky_draw') {
+          setIsWebsiteImportModalOpen(false);
+          setIsRoleModalOpen(true);
+          return 'store';
+        }
+        return prevTab;
+      });
+    }
   }, []);
 
   // Live Cross-Device Server Sync (SSE + focus + polling fallback)

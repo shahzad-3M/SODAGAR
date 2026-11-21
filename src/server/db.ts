@@ -163,6 +163,40 @@ export function getDb(): DatabaseSync {
   return dbInstance;
 }
 
+let cachedFallbackSessionSecret: string | null = null;
+
+export function getOrCreateServerSessionSecret(dbArg?: DatabaseSync): string {
+  if (process.env.SESSION_SECRET && process.env.SESSION_SECRET.trim()) {
+    return process.env.SESSION_SECRET.trim();
+  }
+  if (cachedFallbackSessionSecret) return cachedFallbackSessionSecret;
+  const db = dbArg || getDb();
+  const row = db
+    .prepare('SELECT data_json FROM app_collections WHERE collection_key = ?')
+    .get('server_session_secret') as { data_json: string } | undefined;
+  if (row?.data_json) {
+    try {
+      const parsed = JSON.parse(row.data_json) as { secret?: string };
+      if (parsed?.secret && typeof parsed.secret === 'string' && parsed.secret.length >= 32) {
+        cachedFallbackSessionSecret = parsed.secret;
+        return cachedFallbackSessionSecret;
+      }
+    } catch {
+      // regenerate below
+    }
+  }
+  const generated = crypto.randomBytes(32).toString('hex');
+  db.prepare(`
+    INSERT INTO app_collections (collection_key, data_json, updated_at)
+    VALUES (?, ?, ?)
+    ON CONFLICT(collection_key) DO UPDATE SET
+      data_json = excluded.data_json,
+      updated_at = excluded.updated_at
+  `).run('server_session_secret', JSON.stringify({ secret: generated }), new Date().toISOString());
+  cachedFallbackSessionSecret = generated;
+  return generated;
+}
+
 export function createVerifiedBackup(reason: string): BackupMetadata {
   ensureDirectories();
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
