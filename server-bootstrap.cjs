@@ -8,5 +8,8 @@ if (!process.execArgv.includes('--experimental-sqlite')) {
   process.exit(result.status ?? 1);
 }
 
+const { DatabaseSync } = require('node:sqlite');
+global.DatabaseSync = DatabaseSync;
+
 require('tsx/cjs');
 require('./server.ts');
