@@ -1,11 +1,13 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-const sourceRoot = path.resolve('src');
+const projectRoot = path.resolve('.');
+const ignoredDirectories = new Set(['node_modules', 'dist', '.git']);
 
 function collectFiles(directory) {
   const files = [];
   for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+    if (ignoredDirectories.has(entry.name)) continue;
     const fullPath = path.join(directory, entry.name);
     if (entry.isDirectory()) files.push(...collectFiles(fullPath));
     else if (/\.(ts|tsx)$/.test(entry.name)) files.push(fullPath);
@@ -32,9 +34,9 @@ function normalizeSpecifier(filePath, specifier) {
   return specifier;
 }
 
-for (const filePath of collectFiles(sourceRoot)) {
+for (const filePath of collectFiles(projectRoot)) {
   const original = fs.readFileSync(filePath, 'utf8');
-  const updated = original.replace(/((?:from|import)\\s*[(]?[\\s]*['"])(\\.[^'"]+)(['"])/g, (match, prefix, specifier, suffix) => {
+  const updated = original.replace(/((?:from|import)\s*[(]?[\s]*['"])(\.[^'"]+)(['"])/g, (match, prefix, specifier, suffix) => {
     return `${prefix}${normalizeSpecifier(filePath, specifier)}${suffix}`;
   });
   if (updated !== original) fs.writeFileSync(filePath, updated);
