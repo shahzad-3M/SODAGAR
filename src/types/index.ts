@@ -105,6 +105,18 @@ export interface ProductVariation {
 export type DeliverySpeedCategory = 'express' | 'standard';
 export type ProductDeliveryFeeType = 'default' | 'free' | 'custom';
 
+export interface ProductSizeChartRow {
+  label: string;
+  values: string[];
+}
+
+export interface ProductSizeChart {
+  columns: string[]; // e.g. ['Small (S)', 'Medium (M)', 'Large (L)', 'XL']
+  rows: ProductSizeChartRow[]; // e.g. [{ label: 'Chest', values: ['36 in', '38 in', '40 in', '42 in'] }]
+  unit?: string; // e.g. 'in' | 'cm'
+  note?: string;
+}
+
 export interface ProductItem {
   id: string;
   name: string;
@@ -136,6 +148,7 @@ export interface ProductItem {
   imageUrl?: string;
   pictures?: string[]; // Multiple high-res images / gallery
   sizes?: string[]; // Available sizes or dimensions (e.g. Standard, Small, Medium, Large)
+  sizeChart?: ProductSizeChart; // Structured multi-size measurement chart
   selectedSize?: string;
   variations?: ProductVariation[]; // Extracted & editable variations (size, color, SKU, price, stock, image, details)
   shortDescription?: string;

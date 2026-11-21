@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import {
   X,
   Globe,
@@ -26,8 +26,9 @@ import {
   Zap,
   Truck,
   Check,
+  Ruler,
 } from 'lucide-react';
-import { ProductItem, ProductVariation, ProductImportLog, CategoryRecord } from '../types';
+import { ProductItem, ProductVariation, ProductImportLog, CategoryRecord, ProductSizeChart } from '../types';
 import {
   getCategories,
   addCategory,
@@ -44,6 +45,7 @@ import {
   getCategoryBreadcrumb,
 } from '../utils/locationCategoryHelpers';
 import { CategoryCascadingSelect } from './CategoryCascadingSelect';
+import { ProductSpecSizingShowcase } from './ProductSpecSizingShowcase';
 
 interface ProductImporterModalProps {
   isOpen: boolean;
@@ -142,9 +144,26 @@ export const ProductImporterModal: React.FC<ProductImporterModalProps> = ({
   const [newSpecValue, setNewSpecValue] = useState('');
   const [newFeatureText, setNewFeatureText] = useState('');
   const [newTagText, setNewTagText] = useState('');
+  const [specsTabMode, setSpecsTabMode] = useState<'edit' | 'preview'>('edit');
+  const [newSizeColInput, setNewSizeColInput] = useState('');
+  const [newSizeRowInput, setNewSizeRowInput] = useState('');
 
   // Import logs
   const [logs, setLogs] = useState<ProductImportLog[]>(getProductImportLogs);
+
+  useEffect(() => {
+    if (isOpen) {
+      setImportError(null);
+      setProgressStep('');
+      setProgressPercent(0);
+      setScrapeStatsSummary(null);
+      setDuplicateMatch(null);
+      setOverwriteConfirmed(false);
+      setSpecsTabMode('edit');
+      setLogs(getProductImportLogs());
+      setCategoryRecords(getCategoryRecords());
+    }
+  }, [isOpen]);
 
   if (!isOpen) return null;
 
@@ -161,27 +180,38 @@ export const ProductImporterModal: React.FC<ProductImporterModalProps> = ({
   };
 
   const handleStartImport = async (urlToFetch: string, overrideHtml?: string) => {
-    const normalizedUrl = overrideHtml
-      ? normalizeInputUrl(urlToFetch) || 'https://madinamarket.pk/products/imported-item'
-      : normalizeInputUrl(urlToFetch);
+    const hasOverrideHtml = Boolean(overrideHtml && overrideHtml.trim().length > 0);
+    let normalizedUrl = normalizeInputUrl(urlToFetch);
 
-    if (!normalizedUrl) {
-      setImportError('Please enter a valid website product URL.');
-      return;
-    }
-
-    try {
-      const parsedCheck = new URL(normalizedUrl);
-      if (parsedCheck.protocol !== 'http:' && parsedCheck.protocol !== 'https:') {
-        setImportError('Only http:// and https:// website links are supported.');
+    if (hasOverrideHtml) {
+      try {
+        if (normalizedUrl) {
+          new URL(normalizedUrl);
+        } else {
+          normalizedUrl = 'https://madinamarket.pk/products/imported-item';
+        }
+      } catch {
+        normalizedUrl = 'https://madinamarket.pk/products/imported-item';
+      }
+    } else {
+      if (!normalizedUrl) {
+        setImportError('Please enter a valid website product URL.');
         return;
       }
-    } catch {
-      setImportError('Invalid URL format. Example: https://store.com/products/item-name');
-      return;
+
+      try {
+        const parsedCheck = new URL(normalizedUrl);
+        if (parsedCheck.protocol !== 'http:' && parsedCheck.protocol !== 'https:') {
+          setImportError('Only http:// and https:// website links are supported.');
+          return;
+        }
+      } catch {
+        setImportError('Invalid URL format. Example: https://store.com/products/item-name');
+        return;
+      }
     }
 
-    if (!overrideHtml && normalizedUrl !== importUrl) {
+    if (!hasOverrideHtml && normalizedUrl !== importUrl) {
       setImportUrl(normalizedUrl);
     }
 
@@ -191,11 +221,12 @@ export const ProductImporterModal: React.FC<ProductImporterModalProps> = ({
     setExtractedProduct(null);
     setDuplicateMatch(null);
     setOverwriteConfirmed(false);
+    setSpecsTabMode('edit');
     setProgressPercent(25);
     setProgressStep(
-      overrideHtml
-        ? 'Parsing pasted HTML source (JSON-LD, OpenGraph, images, variants, video)...'
-        : 'Fetching live product page & extracting JSON-LD, OpenGraph, images, specs, variants & video...'
+      hasOverrideHtml
+        ? 'Parsing pasted HTML source (JSON-LD, OpenGraph, images, size charts, variants, video)...'
+        : 'Fetching live product page & extracting JSON-LD, OpenGraph, images, size charts, specs, variants & video...'
     );
 
     const res = await apiScrapeProductUrl(normalizedUrl, overrideHtml);
@@ -486,9 +517,129 @@ export const ProductImporterModal: React.FC<ProductImporterModalProps> = ({
     });
   };
 
+  // SIZE CHART MANAGEMENT
+  const handleInitSizeChart = () => {
+    if (!extractedProduct) return;
+    const defaultCols = ['Small (S)', 'Medium (M)', 'Large (L)', 'XL'];
+    const emptyVals = defaultCols.map(() => '');
+    const initialChart: ProductSizeChart = {
+      unit: 'in',
+      columns: defaultCols,
+      rows: [
+        { label: 'Chest', values: [...emptyVals] },
+        { label: 'Length', values: [...emptyVals] },
+      ],
+    };
+    setExtractedProduct({ ...extractedProduct, sizeChart: initialChart });
+  };
+
+  const handleUpdateSizeChartUnit = (unit: 'in' | 'cm') => {
+    if (!extractedProduct?.sizeChart) return;
+    setExtractedProduct({
+      ...extractedProduct,
+      sizeChart: { ...extractedProduct.sizeChart, unit },
+    });
+  };
+
+  const handleAddSizeChartColumn = () => {
+    const col = newSizeColInput.trim();
+    if (!col || !extractedProduct) return;
+    const chart: ProductSizeChart = extractedProduct.sizeChart || {
+      unit: 'in',
+      columns: [],
+      rows: [{ label: 'Chest', values: [] }],
+    };
+    if (chart.columns.some((c) => c.toLowerCase() === col.toLowerCase())) {
+      setNewSizeColInput('');
+      return;
+    }
+    const nextCols = [...chart.columns, col];
+    const nextRows = chart.rows.map((r) => ({
+      ...r,
+      values: [...r.values, ''],
+    }));
+    setExtractedProduct({
+      ...extractedProduct,
+      sizeChart: { ...chart, columns: nextCols, rows: nextRows },
+    });
+    setNewSizeColInput('');
+  };
+
+  const handleRemoveSizeChartColumn = (colIdx: number) => {
+    if (!extractedProduct?.sizeChart) return;
+    const nextCols = extractedProduct.sizeChart.columns.filter((_, idx) => idx !== colIdx);
+    const nextRows = extractedProduct.sizeChart.rows.map((r) => ({
+      ...r,
+      values: r.values.filter((_, idx) => idx !== colIdx),
+    }));
+    setExtractedProduct({
+      ...extractedProduct,
+      sizeChart: nextCols.length > 0 ? { ...extractedProduct.sizeChart, columns: nextCols, rows: nextRows } : undefined,
+    });
+  };
+
+  const handleAddSizeChartRow = () => {
+    const label = newSizeRowInput.trim();
+    if (!label || !extractedProduct?.sizeChart) return;
+    const emptyVals = extractedProduct.sizeChart.columns.map(() => '');
+    setExtractedProduct({
+      ...extractedProduct,
+      sizeChart: {
+        ...extractedProduct.sizeChart,
+        rows: [...extractedProduct.sizeChart.rows, { label, values: emptyVals }],
+      },
+    });
+    setNewSizeRowInput('');
+  };
+
+  const handleRemoveSizeChartRow = (rowIdx: number) => {
+    if (!extractedProduct?.sizeChart) return;
+    const nextRows = extractedProduct.sizeChart.rows.filter((_, i) => i !== rowIdx);
+    setExtractedProduct({
+      ...extractedProduct,
+      sizeChart: { ...extractedProduct.sizeChart, rows: nextRows },
+    });
+  };
+
+  const handleUpdateSizeChartCell = (rowIdx: number, colIdx: number, val: string) => {
+    if (!extractedProduct?.sizeChart) return;
+    const colCount = extractedProduct.sizeChart.columns.length;
+    const nextRows = extractedProduct.sizeChart.rows.map((row, idx) => {
+      if (idx !== rowIdx) return row;
+      const padded = Array.from({ length: colCount }, (_, i) => row.values[i] || '');
+      padded[colIdx] = val;
+      return { ...row, values: padded };
+    });
+    setExtractedProduct({
+      ...extractedProduct,
+      sizeChart: { ...extractedProduct.sizeChart, rows: nextRows },
+    });
+  };
+
+  const handleUpdateSizeChartRowLabel = (rowIdx: number, nextLabel: string) => {
+    if (!extractedProduct?.sizeChart) return;
+    const nextRows = extractedProduct.sizeChart.rows.map((row, idx) =>
+      idx === rowIdx ? { ...row, label: nextLabel } : row
+    );
+    setExtractedProduct({
+      ...extractedProduct,
+      sizeChart: { ...extractedProduct.sizeChart, rows: nextRows },
+    });
+  };
+
   // SAVE & APPROVE
   const handleApproveAndSave = (publishImmediately: boolean) => {
     if (!extractedProduct) return;
+
+    const cleanName = extractedProduct.name.trim();
+    if (!cleanName) {
+      setImportError('Product title cannot be empty before saving.');
+      return;
+    }
+    if (!Number.isFinite(Number(extractedProduct.ourPrice)) || Number(extractedProduct.ourPrice) < 0) {
+      setImportError('Please provide a valid store price before saving.');
+      return;
+    }
 
     const freshRecords = getCategoryRecords();
     let finalParentId: string | undefined = selectedMainCatId || undefined;
@@ -506,7 +657,7 @@ export const ProductImporterModal: React.FC<ProductImporterModalProps> = ({
       const leafName = newCategoryName.trim() || 'General Wholesale';
       const parentName = parentCategory.trim();
       if (parentName) {
-        const pRes = addCategory(parentName);
+        addCategory(parentName);
         const pRec = getCategoryRecords().find((r) => !r.parentCategoryId && r.name.toLowerCase() === parentName.toLowerCase());
         const cRes = addCategory(leafName, pRec?.id);
         finalParentId = pRec?.id;
@@ -523,8 +674,60 @@ export const ProductImporterModal: React.FC<ProductImporterModalProps> = ({
       addCategory(fullCat);
     }
 
+    // Deduplicate derived sizes case-insensitively while preserving order
+    const rawSizes =
+      extractedProduct.variations && extractedProduct.variations.length > 0
+        ? extractedProduct.variations
+            .map((v) => v.title || [v.size, v.color].filter(Boolean).join(' · ') || v.sku || '')
+            .filter(Boolean)
+        : extractedProduct.sizes || [];
+    const seenSizeKeys = new Set<string>();
+    const dedupedSizes: string[] = [];
+    for (const s of rawSizes) {
+      const cleanS = s.trim();
+      if (!cleanS) continue;
+      const key = cleanS.toLowerCase();
+      if (!seenSizeKeys.has(key)) {
+        seenSizeKeys.add(key);
+        dedupedSizes.push(cleanS);
+      }
+    }
+
+    // Clean specifications (remove empty keys/values)
+    const cleanedSpecs: Record<string, string> = {};
+    if (extractedProduct.specifications) {
+      for (const [k, v] of Object.entries(extractedProduct.specifications)) {
+        if (k.trim() && String(v || '').trim()) {
+          cleanedSpecs[k.trim()] = String(v).trim();
+        }
+      }
+    }
+
+    // Normalize size chart if present
+    const normalizedSizeChart =
+      extractedProduct.sizeChart &&
+      extractedProduct.sizeChart.columns.length > 0 &&
+      extractedProduct.sizeChart.rows.some((r) => r.label.trim())
+        ? {
+            ...extractedProduct.sizeChart,
+            rows: extractedProduct.sizeChart.rows.filter((r) => r.label.trim()),
+          }
+        : undefined;
+
+    const isOverwrite = Boolean(duplicateMatch && overwriteConfirmed);
+
     const productToSave: ProductItem = {
       ...extractedProduct,
+      ...(isOverwrite && duplicateMatch
+        ? {
+            id: duplicateMatch.id,
+            salesCount: duplicateMatch.salesCount,
+            totalRevenue: duplicateMatch.totalRevenue,
+            totalProfit: duplicateMatch.totalProfit,
+            createdAt: duplicateMatch.createdAt,
+          }
+        : {}),
+      name: cleanName,
       category: fullCat,
       parentCategoryId: finalParentId,
       subcategoryId: finalSubId,
@@ -539,12 +742,9 @@ export const ProductImporterModal: React.FC<ProductImporterModalProps> = ({
       upcomingStatus: isUpcomingItem ? 'coming_soon' : 'available',
       expectedArrivalDate: isUpcomingItem ? (upcomingArrivalDate.trim() || extractedProduct.expectedArrivalDate) : undefined,
       stockQty: isUpcomingItem ? 0 : extractedProduct.stockQty,
-      sizes:
-        extractedProduct.variations && extractedProduct.variations.length > 0
-          ? extractedProduct.variations
-              .map((v) => v.title || [v.size, v.color].filter(Boolean).join(' · ') || v.sku || '')
-              .filter(Boolean)
-          : extractedProduct.sizes,
+      sizes: dedupedSizes,
+      specifications: cleanedSpecs,
+      sizeChart: normalizedSizeChart,
       videoUrl: extractedProduct.videoUrl?.trim() || undefined,
       status: publishImmediately ? 'published' : (isDraft ? 'draft' : 'published'),
       updatedAt: new Date().toISOString(),
@@ -1701,168 +1901,380 @@ export const ProductImporterModal: React.FC<ProductImporterModalProps> = ({
                     )}
                   </div>
 
-                  {/* 6. DESCRIPTIONS, SPECIFICATIONS & FEATURES */}
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    {/* Descriptions */}
-                    <div className="space-y-3">
+                  {/* 6. SPECS, SIZING CHART & DESCRIPTION STUDIO */}
+                  <div className="bg-slate-50/70 dark:bg-slate-950/60 border border-slate-200 dark:border-slate-800 rounded-xl p-4 space-y-4">
+                    <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 dark:border-slate-800 pb-3">
                       <div>
-                        <label className="text-xs font-bold text-slate-700 dark:text-slate-300 block mb-1">
-                          Short Description (Highlights)
-                        </label>
-                        <textarea
-                          rows={2}
-                          value={extractedProduct.shortDescription || ''}
-                          onChange={(e) =>
-                            setExtractedProduct({ ...extractedProduct, shortDescription: e.target.value })
-                          }
-                          className="w-full px-3 py-2 text-xs bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg text-slate-900 dark:text-white"
-                        />
+                        <h4 className="text-xs font-extrabold text-slate-900 dark:text-white uppercase tracking-wider flex items-center gap-1.5">
+                          <Ruler className="w-4 h-4 text-amber-500" />
+                          6. Specs, Sizing Chart &amp; Description Studio
+                        </h4>
+                        <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                          Edit garment measurement matrices, structured specs &amp; copy, or preview the live Customer Dossier.
+                        </p>
                       </div>
 
-                      <div>
-                        <label className="text-xs font-bold text-slate-700 dark:text-slate-300 block mb-1">
-                          Full Product Details &amp; Description
-                        </label>
-                        <textarea
-                          rows={4}
-                          value={extractedProduct.details || ''}
-                          onChange={(e) =>
-                            setExtractedProduct({ ...extractedProduct, details: e.target.value })
-                          }
-                          className="w-full px-3 py-2 text-xs bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg text-slate-900 dark:text-white"
-                        />
+                      <div className="inline-flex rounded-lg bg-slate-200 dark:bg-slate-800 p-0.5 text-xs">
+                        <button
+                          type="button"
+                          onClick={() => setSpecsTabMode('edit')}
+                          className={`px-3 py-1.5 rounded-md font-bold transition-all cursor-pointer ${
+                            specsTabMode === 'edit'
+                              ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-white shadow-2xs'
+                              : 'text-slate-600 dark:text-slate-400 hover:text-slate-900'
+                          }`}
+                        >
+                          Edit Fields
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setSpecsTabMode('preview')}
+                          className={`px-3 py-1.5 rounded-md font-bold transition-all cursor-pointer flex items-center gap-1.5 ${
+                            specsTabMode === 'preview'
+                              ? 'bg-slate-900 dark:bg-amber-500 text-white dark:text-slate-950 shadow-2xs'
+                              : 'text-slate-600 dark:text-slate-400 hover:text-slate-900'
+                          }`}
+                        >
+                          <Eye className="w-3.5 h-3.5" />
+                          Preview Customer Dossier
+                        </button>
                       </div>
                     </div>
 
-                    {/* Specifications */}
-                    <div className="space-y-3">
-                      <label className="text-xs font-bold text-slate-700 dark:text-slate-300 block">
-                        Product Specifications (Key-Value)
-                      </label>
-                      <div className="space-y-1.5 max-h-36 overflow-y-auto pr-1">
-                        {extractedProduct.specifications &&
-                          Object.entries(extractedProduct.specifications).map(([k, v]) => (
-                            <div
-                              key={k}
-                              className="flex items-center justify-between gap-2 p-1.5 bg-slate-50 dark:bg-slate-800 rounded text-xs border border-slate-200 dark:border-slate-700"
-                            >
-                              <span className="font-semibold text-slate-700 dark:text-slate-300">{k}:</span>
-                              <span className="font-mono text-slate-500 truncate max-w-xs">{v}</span>
+                    {specsTabMode === 'preview' ? (
+                      <div className="bg-white dark:bg-slate-900 rounded-xl p-4 sm:p-5 border border-slate-200 dark:border-slate-800">
+                        <ProductSpecSizingShowcase product={extractedProduct} />
+                      </div>
+                    ) : (
+                      <div className="space-y-5">
+                        {/* EXTRACTED SIZE & MEASUREMENT CHART EDITOR */}
+                        <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-3.5 space-y-3">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div className="flex items-center gap-2">
+                              <span className="text-xs font-bold text-slate-800 dark:text-slate-200 flex items-center gap-1.5">
+                                <Ruler className="w-3.5 h-3.5 text-amber-500" />
+                                Size &amp; Measurement Chart
+                              </span>
+                              {extractedProduct.sizeChart ? (
+                                <span className="text-[11px] font-mono text-slate-500">
+                                  {extractedProduct.sizeChart.rows.length} rows × {extractedProduct.sizeChart.columns.length} sizes
+                                </span>
+                              ) : (
+                                <span className="text-[11px] text-slate-400">
+                                  No structured chart detected on page
+                                </span>
+                              )}
+                            </div>
+
+                            {extractedProduct.sizeChart ? (
+                              <div className="flex items-center gap-2">
+                                <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Unit:</span>
+                                <div className="inline-flex rounded-md border border-slate-200 dark:border-slate-700 overflow-hidden text-[11px]">
+                                  <button
+                                    type="button"
+                                    onClick={() => handleUpdateSizeChartUnit('in')}
+                                    className={`px-2 py-0.5 font-mono font-bold cursor-pointer ${
+                                      (extractedProduct.sizeChart.unit || 'in') === 'in'
+                                        ? 'bg-slate-900 dark:bg-amber-500 text-white dark:text-slate-950'
+                                        : 'bg-slate-50 dark:bg-slate-800 text-slate-600 dark:text-slate-300'
+                                    }`}
+                                  >
+                                    INCHES
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => handleUpdateSizeChartUnit('cm')}
+                                    className={`px-2 py-0.5 font-mono font-bold cursor-pointer ${
+                                      extractedProduct.sizeChart.unit === 'cm'
+                                        ? 'bg-slate-900 dark:bg-amber-500 text-white dark:text-slate-950'
+                                        : 'bg-slate-50 dark:bg-slate-800 text-slate-600 dark:text-slate-300'
+                                    }`}
+                                  >
+                                    CM
+                                  </button>
+                                </div>
+                              </div>
+                            ) : (
                               <button
                                 type="button"
-                                onClick={() => handleRemoveSpecification(k)}
-                                className="text-red-500 hover:text-red-700 p-0.5 cursor-pointer shrink-0"
+                                onClick={handleInitSizeChart}
+                                className="px-2.5 py-1 rounded-md bg-slate-900 dark:bg-amber-500 text-white dark:text-slate-950 text-[11px] font-bold cursor-pointer flex items-center gap-1"
                               >
-                                <Trash2 className="w-3 h-3" />
+                                <Plus className="w-3 h-3" />
+                                Initialize Size Chart
+                              </button>
+                            )}
+                          </div>
+
+                          {extractedProduct.sizeChart && (
+                            <div className="space-y-3">
+                              <div className="overflow-x-auto border border-slate-200 dark:border-slate-700 rounded-lg">
+                                <table className="w-full text-left border-collapse text-xs">
+                                  <thead>
+                                    <tr className="bg-slate-50 dark:bg-slate-800/80 border-b border-slate-200 dark:border-slate-700">
+                                      <th className="py-2 px-2.5 text-[11px] font-bold text-slate-600 dark:text-slate-300 min-w-[130px]">
+                                        Measurement
+                                      </th>
+                                      {extractedProduct.sizeChart.columns.map((col, cIdx) => (
+                                        <th key={`${col}_${cIdx}`} className="py-1.5 px-2 text-center min-w-[90px]">
+                                          <div className="inline-flex items-center gap-1 font-mono font-bold text-slate-800 dark:text-slate-200">
+                                            <span>{col}</span>
+                                            <button
+                                              type="button"
+                                              onClick={() => handleRemoveSizeChartColumn(cIdx)}
+                                              title={`Remove ${col}`}
+                                              className="text-red-400 hover:text-red-600 cursor-pointer"
+                                            >
+                                              <X className="w-3 h-3" />
+                                            </button>
+                                          </div>
+                                        </th>
+                                      ))}
+                                      <th className="py-1.5 px-2 w-8" />
+                                    </tr>
+                                  </thead>
+                                  <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
+                                    {extractedProduct.sizeChart.rows.map((row, rIdx) => (
+                                      <tr key={`sc_row_${rIdx}`}>
+                                        <td className="p-1.5">
+                                          <input
+                                            type="text"
+                                            value={row.label}
+                                            onChange={(e) => handleUpdateSizeChartRowLabel(rIdx, e.target.value)}
+                                            className="w-full px-2 py-1 text-xs font-semibold bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded"
+                                          />
+                                        </td>
+                                        {extractedProduct.sizeChart?.columns.map((col, cIdx) => (
+                                          <td key={`${rIdx}_${col}_${cIdx}`} className="p-1.5">
+                                            <input
+                                              type="text"
+                                              value={row.values[cIdx] || ''}
+                                              onChange={(e) => handleUpdateSizeChartCell(rIdx, cIdx, e.target.value)}
+                                              placeholder="—"
+                                              className="w-full px-2 py-1 text-xs font-mono text-center bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded"
+                                            />
+                                          </td>
+                                        ))}
+                                        <td className="p-1.5 text-center">
+                                          <button
+                                            type="button"
+                                            onClick={() => handleRemoveSizeChartRow(rIdx)}
+                                            className="text-red-500 hover:text-red-700 p-1 cursor-pointer"
+                                          >
+                                            <Trash2 className="w-3 h-3" />
+                                          </button>
+                                        </td>
+                                      </tr>
+                                    ))}
+                                  </tbody>
+                                </table>
+                              </div>
+
+                              <div className="flex flex-wrap gap-2">
+                                <div className="flex items-center gap-1.5 flex-1 min-w-[200px]">
+                                  <input
+                                    type="text"
+                                    value={newSizeRowInput}
+                                    onChange={(e) => setNewSizeRowInput(e.target.value)}
+                                    placeholder="Add measurement row (e.g. Shoulder)..."
+                                    className="flex-1 px-2.5 py-1.5 text-xs bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded"
+                                  />
+                                  <button
+                                    type="button"
+                                    onClick={handleAddSizeChartRow}
+                                    className="px-2.5 py-1.5 bg-slate-900 dark:bg-slate-700 text-white rounded text-xs font-bold cursor-pointer"
+                                  >
+                                    + Row
+                                  </button>
+                                </div>
+                                <div className="flex items-center gap-1.5 flex-1 min-w-[200px]">
+                                  <input
+                                    type="text"
+                                    value={newSizeColInput}
+                                    onChange={(e) => setNewSizeColInput(e.target.value)}
+                                    placeholder="Add size column (e.g. XXL)..."
+                                    className="flex-1 px-2.5 py-1.5 text-xs bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded"
+                                  />
+                                  <button
+                                    type="button"
+                                    onClick={handleAddSizeChartColumn}
+                                    className="px-2.5 py-1.5 bg-slate-900 dark:bg-slate-700 text-white rounded text-xs font-bold cursor-pointer"
+                                  >
+                                    + Size
+                                  </button>
+                                </div>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                          {/* Descriptions */}
+                          <div className="space-y-3">
+                            <div>
+                              <label className="text-xs font-bold text-slate-700 dark:text-slate-300 block mb-1">
+                                Short Description (Lead Editorial Summary)
+                              </label>
+                              <textarea
+                                rows={2}
+                                value={extractedProduct.shortDescription || ''}
+                                onChange={(e) =>
+                                  setExtractedProduct({ ...extractedProduct, shortDescription: e.target.value })
+                                }
+                                className="w-full px-3 py-2 text-xs bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg text-slate-900 dark:text-white"
+                              />
+                            </div>
+
+                            <div>
+                              <label className="text-xs font-bold text-slate-700 dark:text-slate-300 block mb-1">
+                                Full Product Details &amp; Structured Description
+                              </label>
+                              <textarea
+                                rows={6}
+                                value={extractedProduct.details || ''}
+                                onChange={(e) =>
+                                  setExtractedProduct({ ...extractedProduct, details: e.target.value })
+                                }
+                                className="w-full px-3 py-2 text-xs leading-relaxed bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg text-slate-900 dark:text-white"
+                              />
+                            </div>
+                          </div>
+
+                          {/* Specifications */}
+                          <div className="space-y-3">
+                            <label className="text-xs font-bold text-slate-700 dark:text-slate-300 block">
+                              Product Specifications (Key-Value Ledger)
+                            </label>
+                            <div className="space-y-1.5 max-h-48 overflow-y-auto pr-1">
+                              {extractedProduct.specifications &&
+                                Object.entries(extractedProduct.specifications).map(([k, v]) => (
+                                  <div
+                                    key={k}
+                                    className="flex items-center justify-between gap-2 p-1.5 bg-white dark:bg-slate-800 rounded text-xs border border-slate-200 dark:border-slate-700"
+                                  >
+                                    <span className="font-semibold text-slate-700 dark:text-slate-300 shrink-0">{k}:</span>
+                                    <span className="font-mono text-slate-500 truncate max-w-xs">{v}</span>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleRemoveSpecification(k)}
+                                      className="text-red-500 hover:text-red-700 p-0.5 cursor-pointer shrink-0"
+                                    >
+                                      <Trash2 className="w-3 h-3" />
+                                    </button>
+                                  </div>
+                                ))}
+                            </div>
+
+                            <div className="flex gap-1.5">
+                              <input
+                                type="text"
+                                value={newSpecKey}
+                                onChange={(e) => setNewSpecKey(e.target.value)}
+                                placeholder="Spec (e.g. Material)"
+                                className="w-1/2 px-2.5 py-1.5 text-xs bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded"
+                              />
+                              <input
+                                type="text"
+                                value={newSpecValue}
+                                onChange={(e) => setNewSpecValue(e.target.value)}
+                                placeholder="Value (e.g. Micro Velvet)"
+                                className="w-1/2 px-2.5 py-1.5 text-xs bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded"
+                              />
+                              <button
+                                type="button"
+                                onClick={handleAddSpecification}
+                                className="px-2.5 py-1.5 bg-slate-900 dark:bg-slate-700 text-white rounded text-xs font-bold cursor-pointer"
+                              >
+                                +
                               </button>
                             </div>
-                          ))}
-                      </div>
-
-                      <div className="flex gap-1.5">
-                        <input
-                          type="text"
-                          value={newSpecKey}
-                          onChange={(e) => setNewSpecKey(e.target.value)}
-                          placeholder="Spec (e.g. Material)"
-                          className="w-1/2 px-2.5 py-1.5 text-xs bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded"
-                        />
-                        <input
-                          type="text"
-                          value={newSpecValue}
-                          onChange={(e) => setNewSpecValue(e.target.value)}
-                          placeholder="Value (e.g. Tourmaline Ceramic)"
-                          className="w-1/2 px-2.5 py-1.5 text-xs bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded"
-                        />
-                        <button
-                          type="button"
-                          onClick={handleAddSpecification}
-                          className="px-2.5 py-1.5 bg-slate-900 dark:bg-slate-700 text-white rounded text-xs font-bold cursor-pointer"
-                        >
-                          +
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* 7. FEATURES & TAGS */}
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    {/* Features */}
-                    <div className="space-y-2">
-                      <label className="text-xs font-bold text-slate-700 dark:text-slate-300 block">
-                        Bullet Features &amp; Selling Points
-                      </label>
-                      <div className="space-y-1 max-h-28 overflow-y-auto">
-                        {extractedProduct.features?.map((feat, idx) => (
-                          <div key={idx} className="flex items-center justify-between text-xs p-1.5 bg-slate-50 dark:bg-slate-800 rounded">
-                            <span className="truncate">✓ {feat}</span>
-                            <button
-                              type="button"
-                              onClick={() => handleRemoveFeature(idx)}
-                              className="text-red-500 p-0.5"
-                            >
-                              <X className="w-3 h-3" />
-                            </button>
                           </div>
-                        ))}
-                      </div>
-                      <div className="flex gap-2">
-                        <input
-                          type="text"
-                          value={newFeatureText}
-                          onChange={(e) => setNewFeatureText(e.target.value)}
-                          placeholder="Add bullet feature..."
-                          className="flex-1 px-2.5 py-1.5 text-xs bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded"
-                        />
-                        <button
-                          type="button"
-                          onClick={handleAddFeature}
-                          className="px-3 py-1.5 bg-slate-900 text-white rounded text-xs font-bold"
-                        >
-                          Add
-                        </button>
-                      </div>
-                    </div>
+                        </div>
 
-                    {/* Tags */}
-                    <div className="space-y-2">
-                      <label className="text-xs font-bold text-slate-700 dark:text-slate-300 block">
-                        Product Search Tags
-                      </label>
-                      <div className="flex flex-wrap gap-1 max-h-28 overflow-y-auto">
-                        {extractedProduct.tags?.map((t, idx) => (
-                          <span
-                            key={idx}
-                            className="inline-flex items-center gap-1 bg-amber-100 dark:bg-amber-950/60 text-amber-800 dark:text-amber-300 px-2 py-0.5 rounded text-[11px] font-bold"
-                          >
-                            #{t}
-                            <button
-                              type="button"
-                              onClick={() => handleRemoveTag(idx)}
-                              className="hover:text-red-600"
-                            >
-                              <X className="w-2.5 h-2.5" />
-                            </button>
-                          </span>
-                        ))}
+                        {/* FEATURES & TAGS */}
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-2 border-t border-slate-200 dark:border-slate-800">
+                          {/* Features */}
+                          <div className="space-y-2">
+                            <label className="text-xs font-bold text-slate-700 dark:text-slate-300 block">
+                              Key Highlights (Numbered in Customer Dossier)
+                            </label>
+                            <div className="space-y-1 max-h-28 overflow-y-auto">
+                              {extractedProduct.features?.map((feat, idx) => (
+                                <div key={idx} className="flex items-center justify-between text-xs p-1.5 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded">
+                                  <span className="truncate font-medium">
+                                    <span className="font-mono text-amber-600 mr-1.5">{String(idx + 1).padStart(2, '0')}.</span>
+                                    {feat}
+                                  </span>
+                                  <button
+                                    type="button"
+                                    onClick={() => handleRemoveFeature(idx)}
+                                    className="text-red-500 p-0.5 cursor-pointer"
+                                  >
+                                    <X className="w-3 h-3" />
+                                  </button>
+                                </div>
+                              ))}
+                            </div>
+                            <div className="flex gap-2">
+                              <input
+                                type="text"
+                                value={newFeatureText}
+                                onChange={(e) => setNewFeatureText(e.target.value)}
+                                placeholder="Add numbered highlight point..."
+                                className="flex-1 px-2.5 py-1.5 text-xs bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded"
+                              />
+                              <button
+                                type="button"
+                                onClick={handleAddFeature}
+                                className="px-3 py-1.5 bg-slate-900 text-white rounded text-xs font-bold cursor-pointer"
+                              >
+                                Add
+                              </button>
+                            </div>
+                          </div>
+
+                          {/* Tags */}
+                          <div className="space-y-2">
+                            <label className="text-xs font-bold text-slate-700 dark:text-slate-300 block">
+                              Product Search Tags
+                            </label>
+                            <div className="flex flex-wrap gap-1 max-h-28 overflow-y-auto">
+                              {extractedProduct.tags?.map((t, idx) => (
+                                <span
+                                  key={idx}
+                                  className="inline-flex items-center gap-1 bg-amber-100 dark:bg-amber-950/60 text-amber-800 dark:text-amber-300 px-2 py-0.5 rounded text-[11px] font-bold"
+                                >
+                                  #{t}
+                                  <button
+                                    type="button"
+                                    onClick={() => handleRemoveTag(idx)}
+                                    className="hover:text-red-600 cursor-pointer"
+                                  >
+                                    <X className="w-2.5 h-2.5" />
+                                  </button>
+                                </span>
+                              ))}
+                            </div>
+                            <div className="flex gap-2">
+                              <input
+                                type="text"
+                                value={newTagText}
+                                onChange={(e) => setNewTagText(e.target.value)}
+                                placeholder="Add tag (e.g. velvet, winter)..."
+                                className="flex-1 px-2.5 py-1.5 text-xs bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded"
+                              />
+                              <button
+                                type="button"
+                                onClick={handleAddTag}
+                                className="px-3 py-1.5 bg-slate-900 text-white rounded text-xs font-bold cursor-pointer"
+                              >
+                                Add
+                              </button>
+                            </div>
+                          </div>
+                        </div>
                       </div>
-                      <div className="flex gap-2">
-                        <input
-                          type="text"
-                          value={newTagText}
-                          onChange={(e) => setNewTagText(e.target.value)}
-                          placeholder="Add tag (e.g. wholesale, beauty)..."
-                          className="flex-1 px-2.5 py-1.5 text-xs bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded"
-                        />
-                        <button
-                          type="button"
-                          onClick={handleAddTag}
-                          className="px-3 py-1.5 bg-slate-900 text-white rounded text-xs font-bold"
-                        >
-                          Add
-                        </button>
-                      </div>
-                    </div>
+                    )}
                   </div>
                 </div>
               )}

@@ -22,8 +22,10 @@ import {
   Pencil,
   Link2,
   PlusCircle,
+  Ruler,
 } from 'lucide-react';
 import { AppUser, BusinessProfile, Customer, Investor, ProductItem } from '../types';
+import { ProductSpecSizingShowcase } from './ProductSpecSizingShowcase';
 import {
   buildAddMyProductInvestorMessage,
   buildDirectProductWhatsAppMessage,
@@ -643,10 +645,24 @@ export const ProductDetailsModal: React.FC<ProductDetailsModalProps> = ({
               {/* VARIATION SELECTOR (Sizes, Colors, Options + Separate Details) */}
               {product.variations && product.variations.length > 0 ? (
                 <div className="space-y-2.5">
-                  <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 flex items-center gap-1">
-                    <Tag className="w-3.5 h-3.5 text-amber-500" />
-                    <span>Select Variation / Option (ویریئنٹ منتخب کریں):</span>
-                  </label>
+                  <div className="flex items-center justify-between gap-2">
+                    <label className="text-xs font-bold text-slate-700 dark:text-slate-300 flex items-center gap-1">
+                      <Tag className="w-3.5 h-3.5 text-amber-500" />
+                      <span>Select Variation / Option (ویریئنٹ منتخب کریں):</span>
+                    </label>
+                    {(product.sizeChart || (product.sizes && product.sizes.length > 0)) && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          document.getElementById('product-dossier-section')?.scrollIntoView({ behavior: 'smooth' });
+                        }}
+                        className="inline-flex items-center gap-1 text-[11px] font-bold text-amber-700 dark:text-amber-400 hover:underline cursor-pointer shrink-0"
+                      >
+                        <Ruler className="w-3 h-3" />
+                        <span>Size Guide</span>
+                      </button>
+                    )}
+                  </div>
                   <div className="grid grid-cols-2 gap-2">
                     {product.variations.map((v, vIdx) => {
                       const isSelected = selectedVariationIndex === vIdx;
@@ -1278,65 +1294,32 @@ export const ProductDetailsModal: React.FC<ProductDetailsModalProps> = ({
             </div>
           </div>
 
-          {/* SPECIFICATIONS & FEATURES TABS / SECTION */}
-          <div className="pt-4 border-t border-slate-200 dark:border-slate-800 space-y-4">
-            {/* Features Bullet List */}
-            {product.features && product.features.length > 0 && (
-              <div>
-                <h3 className="text-xs font-bold text-slate-900 dark:text-white uppercase tracking-wider mb-2">
-                  Key Features &amp; Highlights (اہم خصوصیات):
-                </h3>
-                <ul className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs text-slate-700 dark:text-slate-300">
-                  {product.features.map((feat, idx) => (
-                    <li key={idx} className="flex items-start gap-2 bg-slate-50 dark:bg-slate-800/40 p-2 rounded-lg border border-slate-100 dark:border-slate-800">
-                      <Check className="w-3.5 h-3.5 text-emerald-600 shrink-0 mt-0.5" />
-                      <span>{feat}</span>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
-
-            {/* Specifications Table */}
-            {product.specifications && Object.keys(product.specifications).length > 0 && (
-              <div>
-                <h3 className="text-xs font-bold text-slate-900 dark:text-white uppercase tracking-wider mb-2">
-                  Technical Specifications (تفصیلات و پیمائش):
-                </h3>
-                <div className="overflow-hidden border border-slate-200 dark:border-slate-800 rounded-xl">
-                  <table className="w-full text-xs text-left">
-                    <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
-                      {Object.entries(product.specifications).map(([key, val], idx) => (
-                        <tr
-                          key={key}
-                          className={idx % 2 === 0 ? 'bg-white dark:bg-slate-900' : 'bg-slate-50 dark:bg-slate-800/50'}
-                        >
-                          <td className="py-2 px-3 font-semibold text-slate-600 dark:text-slate-400 w-1/3 border-r border-slate-100 dark:border-slate-800">
-                            {key}
-                          </td>
-                          <td className="py-2 px-3 text-slate-900 dark:text-white font-medium">
-                            {val}
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-            )}
-
-            {/* Detailed Description */}
-            {(product.details || product.description) && (
-              <div>
-                <h3 className="text-xs font-bold text-slate-900 dark:text-white uppercase tracking-wider mb-1.5">
-                  Detailed Description (مکمل تفصیل):
-                </h3>
-                <p className="text-xs text-slate-600 dark:text-slate-300 leading-relaxed bg-slate-50 dark:bg-slate-800/30 p-3 rounded-xl border border-slate-100 dark:border-slate-800">
-                  {product.details || product.description}
-                </p>
-              </div>
-            )}
-          </div>
+          {/* ARCHITECTURAL SPECS, INTERACTIVE SIZING CHART & EDITORIAL DESCRIPTION */}
+          <ProductSpecSizingShowcase
+            product={product}
+            selectedSize={selectedSize}
+            activeVariation={activeVariation}
+            onSelectSizeOrVariant={(sizeLabel) => {
+              const targetKey = normalizeTextKey(sizeLabel.replace(/\s*\([^)]*\)/g, ''));
+              const parenCode = sizeLabel.match(/\(([^)]+)\)/)?.[1];
+              const codeKey = parenCode ? normalizeTextKey(parenCode) : '';
+              if (product.variations && product.variations.length > 0) {
+                const matchIdx = product.variations.findIndex((v) => {
+                  const vKeys = [v.size, v.title].filter(Boolean).map((s) => normalizeTextKey(String(s)));
+                  return vKeys.some(
+                    (k) => k === targetKey || k.includes(targetKey) || (codeKey && k === codeKey)
+                  );
+                });
+                if (matchIdx >= 0) {
+                  setSelectedVariationIndex(matchIdx);
+                  setSelectedSize(getVariationLabel(product.variations[matchIdx]));
+                  setManualGalleryOverride(false);
+                  return;
+                }
+              }
+              setSelectedSize(sizeLabel);
+            }}
+          />
         </div>
       </div>
     </div>

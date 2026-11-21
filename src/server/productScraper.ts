@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
-import { CategoryRecord, ProductItem, ProductVariation } from '../types';
+import { CategoryRecord, ProductItem, ProductSizeChart, ProductSizeChartRow, ProductVariation } from '../types';
 import { normalizeTextKey, UPCOMING_CATEGORY_ID } from '../utils/locationCategoryHelpers';
 
 export const IMPORTED_MEDIA_DIR = path.resolve(process.cwd(), 'data', 'imported-media');
@@ -76,6 +76,72 @@ function stripHtmlTags(html: string): string {
     .replace(/[ \t]+/g, ' ')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
+}
+
+function formatStructuredDescriptionFromHtml(html: string): string {
+  if (!html) return '';
+  const cleaned = html
+    .replace(/<script[\s\S]*?<\/script>/gi, '')
+    .replace(/<style[\s\S]*?<\/style>/gi, '')
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, '')
+    .replace(/<table[\s\S]*?<\/table>/gi, '\n')
+    .replace(/<(h[1-6])[^>]*>([\s\S]*?)<\/\1>/gi, (_m, _t, inner) => `\n\n${inner.replace(/<[^>]+>/g, ' ').trim()}\n`)
+    .replace(/<li[^>]*>([\s\S]*?)<\/li>/gi, (_m, inner) => `\n• ${inner.replace(/<[^>]+>/g, ' ').trim()}`)
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/(p|div|section|article|blockquote|ul|ol)>/gi, '\n\n')
+    .replace(/<[^>]+>/g, ' ');
+  return decodeHtmlEntities(cleaned)
+    .replace(/[ \t]+/g, ' ')
+    .replace(/ *\n */g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function extractBalancedElementInnerHtml(
+  html: string,
+  tagName: 'div' | 'section' | 'article',
+  openAttrPattern: RegExp
+): string | null {
+  const openRegex = new RegExp(`<${tagName}\\b([^>]*)>`, 'gi');
+  const tokenRegex = new RegExp(`<(\\/?)${tagName}\\b[^>]*>`, 'gi');
+  let match: RegExpExecArray | null;
+  while ((match = openRegex.exec(html)) !== null) {
+    const attrText = match[1] || '';
+    if (!openAttrPattern.test(attrText)) continue;
+    const contentStart = match.index + match[0].length;
+    tokenRegex.lastIndex = contentStart;
+    let depth = 1;
+    let tok: RegExpExecArray | null;
+    while ((tok = tokenRegex.exec(html)) !== null) {
+      if (tok[1] === '/') {
+        depth--;
+        if (depth === 0) {
+          const inner = html.slice(contentStart, tok.index);
+          if (stripHtmlTags(inner).length >= 30) {
+            return inner;
+          }
+          break;
+        }
+      } else {
+        depth++;
+      }
+      if (tok.index - contentStart > 60000) break;
+    }
+  }
+  return null;
+}
+
+function cleanSpecLabel(raw: string): string {
+  const cleaned = decodeHtmlEntities(raw)
+    .replace(/^[\u{1F300}-\u{1FAFF}\u2600-\u27BF\uFE0F\u200D\s]+/gu, '')
+    .replace(/:$/, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!cleaned) return '';
+  if (/^[a-z]/i.test(cleaned) && cleaned === cleaned.toLowerCase()) {
+    return cleaned.replace(/\b\w/g, (c) => c.toUpperCase());
+  }
+  return cleaned;
 }
 
 function isBlockedHostOrIp(hostname: string): boolean {
@@ -642,10 +708,41 @@ function tryExtractShopifyJsonFromHtml(html: string): ShopifyProductJson | null 
   return null;
 }
 
+function extractWooAttributeLabelMap(html: string): Map<string, Map<string, string>> {
+  const attrMap = new Map<string, Map<string, string>>();
+  const selectRegex = /<select\b([^>]*)>([\s\S]*?)<\/select>/gi;
+  let selMatch: RegExpExecArray | null;
+  while ((selMatch = selectRegex.exec(html)) !== null) {
+    const attrs = parseAttributes(`<select ${selMatch[1]}>`);
+    const rawName = (attrs['data-attribute_name'] || attrs.name || '').toLowerCase().trim();
+    if (!rawName.includes('attribute_') && !/(size|color|colour|option|variant)/i.test(rawName)) {
+      continue;
+    }
+    const cleanKey = rawName.replace(/^attribute_(pa_)?/i, '').replace(/[-_]/g, ' ').trim();
+    const valToLabel = new Map<string, string>();
+    const optRegex = /<option\b([^>]*)>([\s\S]*?)<\/option>/gi;
+    let optMatch: RegExpExecArray | null;
+    while ((optMatch = optRegex.exec(selMatch[2])) !== null) {
+      const optAttrs = parseAttributes(`<option ${optMatch[1]}>`);
+      const label = stripHtmlTags(optMatch[2]).trim();
+      const val = (optAttrs.value || '').trim();
+      if (val && label && !/choose|select\s+an?\s+option/i.test(label)) {
+        valToLabel.set(val.toLowerCase(), label);
+      }
+    }
+    if (valToLabel.size > 0) {
+      attrMap.set(rawName, valToLabel);
+      if (cleanKey) attrMap.set(cleanKey, valToLabel);
+    }
+  }
+  return attrMap;
+}
+
 function extractWooVariationsFromHtml(html: string, finalUrl: string): ProductVariation[] {
   const match = html.match(/data-product_variations=["']([\s\S]*?)["']/i);
   if (!match?.[1]) return [];
   try {
+    const labelMaps = extractWooAttributeLabelMap(html);
     const raw = decodeHtmlEntities(match[1]);
     const list = JSON.parse(raw) as Array<{
       variation_id?: number | string;
@@ -666,8 +763,14 @@ function extractWooVariationsFromHtml(html: string, finalUrl: string): ProductVa
       if (v.attributes) {
         Object.entries(v.attributes).forEach(([k, val]) => {
           if (val) {
-            const cleanKey = k.replace(/^attribute_(pa_)?/i, '').replace(/[-_]/g, ' ').trim();
-            attrs[cleanKey || `Option ${idx + 1}`] = String(val);
+            const rawAttrKey = k.toLowerCase().trim();
+            const cleanKeyRaw = k.replace(/^attribute_(pa_)?/i, '').replace(/[-_]/g, ' ').trim();
+            const cleanKey = cleanKeyRaw
+              ? cleanKeyRaw.replace(/\b\w/g, (c) => c.toUpperCase())
+              : `Option ${idx + 1}`;
+            const map = labelMaps.get(rawAttrKey) || labelMaps.get(cleanKeyRaw.toLowerCase());
+            const mappedVal = map?.get(String(val).toLowerCase().trim()) || String(val).replace(/[-_]+/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase()).trim();
+            attrs[cleanKey] = mappedVal;
           }
         });
       }
@@ -707,6 +810,169 @@ function extractWooVariationsFromHtml(html: string, finalUrl: string): ProductVa
     });
   } catch {
     return [];
+  }
+}
+
+function extractTablesAndSizeChart(html: string): {
+  sizeChart?: ProductSizeChart;
+  tableSpecs: Record<string, string>;
+  detectedSizes: string[];
+} {
+  const tableSpecs: Record<string, string> = {};
+  let sizeChart: ProductSizeChart | undefined;
+  const detectedSizes: string[] = [];
+
+  const tableRegex = /<table\b([^>]*)>([\s\S]*?)<\/table>/gi;
+  let tMatch: RegExpExecArray | null;
+  while ((tMatch = tableRegex.exec(html)) !== null) {
+    const tableAttrs = (tMatch[1] || '').toLowerCase();
+    const tableBody = tMatch[2] || '';
+    if (
+      tableAttrs.includes('variations') ||
+      tableAttrs.includes('shop_table') ||
+      tableAttrs.includes('cart') ||
+      /<select\b|<input\b/i.test(tableBody)
+    ) {
+      continue;
+    }
+
+    const parsedRows: string[][] = [];
+    const trRegex = /<tr\b[^>]*>([\s\S]*?)<\/tr>/gi;
+    let rMatch: RegExpExecArray | null;
+    while ((rMatch = trRegex.exec(tableBody)) !== null && parsedRows.length < 25) {
+      const cells: string[] = [];
+      const cellRegex = /<(?:th|td)\b[^>]*>([\s\S]*?)<\/(?:th|td)>/gi;
+      let cMatch: RegExpExecArray | null;
+      while ((cMatch = cellRegex.exec(rMatch[1])) !== null && cells.length < 12) {
+        const text = stripHtmlTags(cMatch[1]).replace(/\s+/g, ' ').trim();
+        cells.push(text);
+      }
+      if (cells.length >= 2 && cells.some((c) => c.length > 0)) {
+        parsedRows.push(cells);
+      }
+    }
+
+    if (parsedRows.length === 0) continue;
+
+    // Multi-column matrix (e.g. Size Chart: Measurement | Small (S) | Medium (M) | Large (L) | XL)
+    const maxCols = Math.max(...parsedRows.map((r) => r.length));
+    if (maxCols >= 3 && parsedRows.length >= 2 && !sizeChart) {
+      const headerRow = parsedRows[0];
+      const bodyRows = parsedRows.slice(1).filter((r) => r.length >= 2);
+      const headerLooksSize = headerRow.some((h) =>
+        /size|small|medium|large|\bxs\b|\bs\b|\bm\b|\bl\b|\bxl\b|\bxxl\b|chest|length|waist|shoulder|measurement|age|uk|us|eu/i.test(h)
+      );
+      const bodyLooksMeasure = bodyRows.some((r) =>
+        /chest|length|sleeve|trouser|waist|hip|shoulder|width|height|bust|inseam|weight|\bin\b|\bcm\b/i.test(r.join(' '))
+      );
+      if (headerLooksSize || bodyLooksMeasure) {
+        const columns = headerRow.slice(1).map((c, idx) => c || `Option ${idx + 1}`);
+        const chartRows: ProductSizeChartRow[] = bodyRows
+          .map((r) => ({
+            label: cleanSpecLabel(r[0]) || 'Measurement',
+            values: columns.map((_, cIdx) => (r[cIdx + 1] || '—').trim()),
+          }))
+          .filter((r) => r.label && r.values.some((v) => v && v !== '—'));
+
+        if (columns.length >= 2 && chartRows.length >= 1) {
+          const joinedVals = chartRows.flatMap((r) => r.values).join(' ').toLowerCase();
+          const unit = /\bcm\b/i.test(joinedVals) ? 'cm' : /\bin\b|inches/i.test(joinedVals) ? 'in' : undefined;
+          sizeChart = {
+            columns,
+            rows: chartRows,
+            unit,
+          };
+          columns.forEach((c) => {
+            if (c && !/measurement|attribute|detail|feature/i.test(c) && !detectedSizes.includes(c)) {
+              detectedSizes.push(c);
+            }
+          });
+          continue;
+        }
+      }
+    }
+
+    // Standard 2-column specification table
+    for (const row of parsedRows) {
+      if (row.length !== 2) continue;
+      const rawKey = cleanSpecLabel(row[0]);
+      const rawVal = cleanSpecLabel(row[1]).replace(/\s*,\s*/g, ', ');
+      if (!rawKey || !rawVal || rawKey.length > 48 || rawVal.length > 220) continue;
+      if (/^(attribute|feature|property|specification)$/i.test(rawKey) && /^(details?|value)$/i.test(rawVal)) {
+        continue;
+      }
+      if (/total|subtotal|shipping|tax/i.test(rawKey)) continue;
+      const existingMatchKey = Object.keys(tableSpecs).find(
+        (k) => k.toLowerCase() === rawKey.toLowerCase()
+      );
+      if (!existingMatchKey) {
+        tableSpecs[rawKey] = rawVal;
+      }
+    }
+  }
+
+  return { sizeChart, tableSpecs, detectedSizes };
+}
+
+async function tryFetchWooStoreProduct(parsedUrl: URL): Promise<{
+  name?: string;
+  description?: string;
+  shortDescription?: string;
+  sku?: string;
+  salePrice?: number;
+  regularPrice?: number;
+  currency?: string;
+  images: string[];
+  categories: string[];
+  inStock?: boolean;
+} | null> {
+  if (!/\/product\//i.test(parsedUrl.pathname)) return null;
+  const slug = parsedUrl.pathname.split('/').filter(Boolean).pop();
+  if (!slug) return null;
+  const apiUrl = `${parsedUrl.origin}/wp-json/wc/store/v1/products?slug=${encodeURIComponent(slug)}`;
+  try {
+    const res = await fetchUrlText(
+      apiUrl,
+      {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        Accept: 'application/json',
+      },
+      6000
+    );
+    if (res.status < 200 || res.status >= 400) return null;
+    const trimmed = res.text.trim();
+    if (!trimmed || trimmed.startsWith('<')) return null;
+    const arr = JSON.parse(trimmed) as Array<Record<string, unknown>>;
+    const item = Array.isArray(arr) ? arr[0] : null;
+    if (!item || typeof item.name !== 'string') return null;
+
+    const prices = (item.prices && typeof item.prices === 'object' ? item.prices : {}) as Record<string, unknown>;
+    const minorUnit = Number(prices.currency_minor_unit ?? 0);
+    const divisor = Number.isFinite(minorUnit) && minorUnit > 0 ? Math.pow(10, minorUnit) : 1;
+    const sale = prices.sale_price ? Number(prices.sale_price) / divisor : prices.price ? Number(prices.price) / divisor : undefined;
+    const regular = prices.regular_price ? Number(prices.regular_price) / divisor : undefined;
+
+    const images = Array.isArray(item.images)
+      ? (item.images as Array<{ src?: string }>).map((i) => i.src || '').filter(Boolean)
+      : [];
+    const categories = Array.isArray(item.categories)
+      ? (item.categories as Array<{ name?: string }>).map((c) => c.name || '').filter(Boolean)
+      : [];
+
+    return {
+      name: decodeHtmlEntities(item.name),
+      description: typeof item.description === 'string' ? formatStructuredDescriptionFromHtml(item.description) : undefined,
+      shortDescription: typeof item.short_description === 'string' ? stripHtmlTags(item.short_description) : undefined,
+      sku: typeof item.sku === 'string' ? item.sku : undefined,
+      salePrice: sale && Number.isFinite(sale) && sale > 0 ? Math.round(sale) : undefined,
+      regularPrice: regular && Number.isFinite(regular) && regular > 0 ? Math.round(regular) : undefined,
+      currency: typeof prices.currency_code === 'string' ? prices.currency_code : undefined,
+      images,
+      categories,
+      inStock: item.is_in_stock !== false,
+    };
+  } catch {
+    return null;
   }
 }
 
@@ -911,12 +1177,16 @@ export async function scrapeProductFromUrl(
       html = fetched.html;
       finalUrl = fetched.finalUrl;
     } catch (fetchErr) {
-      // Before failing, if URL looks like a Shopify /products/ URL, try direct .json endpoint
+      // Before failing, try Shopify .json or WooCommerce Store JSON API if applicable
       if (parsedUrl.pathname.toLowerCase().includes('/products/')) {
         directShopifyProd = await tryFetchShopifyProductJson(parsedUrl, '', true);
       }
-      if (!directShopifyProd) {
+      const directWooProd = !directShopifyProd ? await tryFetchWooStoreProduct(parsedUrl) : null;
+      if (!directShopifyProd && !directWooProd) {
         throw fetchErr;
+      }
+      if (directWooProd) {
+        html = `<html><head><title>${directWooProd.name || ''}</title></head><body><h1>${directWooProd.name || ''}</h1></body></html>`;
       }
     }
   }
@@ -935,6 +1205,7 @@ export async function scrapeProductFromUrl(
   let marketPriceRaw: number | null = null;
   let stockQty = 50;
   let videoUrl = '';
+  let sizeChart: ProductSizeChart | undefined;
   const imageSet = new Set<string>();
   const specifications: Record<string, string> = {};
   const features: string[] = [];
@@ -1208,26 +1479,57 @@ export async function scrapeProductFromUrl(
     shortDescription = stripHtmlTags(shortDescription).slice(0, 320);
   }
 
+  // Extract full balanced HTML descriptions (never cut off prematurely on nested </div>)
+  const fullDescInner =
+    extractBalancedElementInnerHtml(html, 'div', /id=["']tab-description["']|class=["'][^"']*(?:woocommerce-Tabs-panel--description|product__description|pdp-product-desc|product-description|entry-content)[^"']*["']/i) ||
+    extractBalancedElementInnerHtml(html, 'div', /id=["'](?:productDescription|description|product-details)["']/i) ||
+    extractBalancedElementInnerHtml(html, 'section', /id=["'][^"']*(?:description|details)[^"']*["']|class=["'][^"']*(?:product-description|details)[^"']*["']/i);
+  if (fullDescInner) {
+    const formattedDesc = formatStructuredDescriptionFromHtml(fullDescInner);
+    if (formattedDesc.length > details.length) {
+      details = formattedDesc.slice(0, 3200);
+      strategiesUsed.push('Balanced HTML Description');
+    }
+  }
+
   if (!details) {
-    const descBlocks = [
-      /<div[^>]*(?:id|class)=["'][^"']*(?:product[-_ ]?description|woocommerce-product-details__short-description|tab-description|pdp-product-desc|product-details)[^"']*["'][^>]*>([\s\S]{30,5000}?)<\/div>/i,
-      /<section[^>]*(?:id|class)=["'][^"']*(?:description|details)[^"']*["'][^>]*>([\s\S]{30,5000}?)<\/section>/i,
-    ];
-    for (const pat of descBlocks) {
-      const m = html.match(pat);
-      if (m && m[1]) {
-        const text = stripHtmlTags(m[1]);
-        if (text.length > 35) {
-          details = text.slice(0, 2000);
-          strategiesUsed.push('HTML Product Description');
-          break;
-        }
+    const shortDescInner = extractBalancedElementInnerHtml(
+      html,
+      'div',
+      /class=["'][^"']*woocommerce-product-details__short-description[^"']*["']/i
+    );
+    if (shortDescInner) {
+      const formattedShort = formatStructuredDescriptionFromHtml(shortDescInner);
+      if (formattedShort.length > 25) {
+        details = formattedShort.slice(0, 2200);
+        strategiesUsed.push('HTML Product Description');
       }
     }
     if (!details) details = shortDescription || `Imported product from ${domain}`;
+  } else if (details && !details.includes('\n')) {
+    // Preserve readable formatting even if extracted from plain JSON-LD description
+    details = details.replace(/\.\s+(?=[A-Z])/g, '.\n\n').slice(0, 3200);
   }
   if (!shortDescription && details) {
-    shortDescription = details.slice(0, 260);
+    shortDescription = details.split('\n')[0].slice(0, 260);
+  }
+
+  // WooCommerce Store API supplement when URL has /product/ and fields are still sparse
+  if (!htmlOverride && /\/product\//i.test(finalUrl) && (!salePriceRaw || imageSet.size === 0 || details.length < 80)) {
+    const wooStore = await tryFetchWooStoreProduct(new URL(finalUrl));
+    if (wooStore) {
+      strategiesUsed.push('WooCommerce Store API');
+      if (!name && wooStore.name) name = wooStore.name;
+      if (!sku && wooStore.sku) sku = wooStore.sku;
+      if (!salePriceRaw && wooStore.salePrice) salePriceRaw = wooStore.salePrice;
+      if (!marketPriceRaw && wooStore.regularPrice) marketPriceRaw = wooStore.regularPrice;
+      if (wooStore.currency) currencyDetected = wooStore.currency.toUpperCase();
+      if (wooStore.inStock === false) stockQty = 0;
+      if (wooStore.description && wooStore.description.length > details.length) details = wooStore.description;
+      if (!shortDescription && wooStore.shortDescription) shortDescription = wooStore.shortDescription;
+      wooStore.images.forEach((img) => addImageUrl(img));
+      wooStore.categories.forEach((cat) => categoryHints.push(cat));
+    }
   }
 
   // Price extraction fallbacks
@@ -1315,23 +1617,28 @@ export async function scrapeProductFromUrl(
   }
   if (videoUrl) strategiesUsed.push('Video Link Extracted');
 
-  // Specifications Table & <dl> Extraction
-  const tableRowRegex = /<tr[^>]*>\s*<(?:th|td)[^>]*>([\s\S]*?)<\/(?:th|td)>\s*<td[^>]*>([\s\S]*?)<\/td>\s*<\/tr>/gi;
-  let rowMatch: RegExpExecArray | null;
-  while ((rowMatch = tableRowRegex.exec(html)) !== null && Object.keys(specifications).length < 18) {
-    const k = stripHtmlTags(rowMatch[1]).replace(/:$/, '').trim();
-    const v = stripHtmlTags(rowMatch[2]).trim();
-    if (k && v && k.length <= 45 && v.length <= 180 && !k.toLowerCase().includes('total')) {
+  // Structured Size Chart & Technical Specifications Extraction (Multi-column Matrix + Key-Value Specs)
+  const { sizeChart: parsedSizeChart, tableSpecs, detectedSizes } = extractTablesAndSizeChart(html);
+  if (parsedSizeChart) {
+    sizeChart = parsedSizeChart;
+    strategiesUsed.push('Structured Size Chart');
+  }
+  for (const [k, v] of Object.entries(tableSpecs)) {
+    if (Object.keys(specifications).length >= 20) break;
+    const dup = Object.keys(specifications).find((ex) => ex.toLowerCase() === k.toLowerCase());
+    if (!dup) {
       specifications[k] = v;
     }
   }
+
   const dlRegex = /<dt[^>]*>([\s\S]*?)<\/dt>\s*<dd[^>]*>([\s\S]*?)<\/dd>/gi;
   let dlMatch: RegExpExecArray | null;
-  while ((dlMatch = dlRegex.exec(html)) !== null && Object.keys(specifications).length < 18) {
-    const k = stripHtmlTags(dlMatch[1]).replace(/:$/, '').trim();
+  while ((dlMatch = dlRegex.exec(html)) !== null && Object.keys(specifications).length < 20) {
+    const k = cleanSpecLabel(dlMatch[1]);
     const v = stripHtmlTags(dlMatch[2]).trim();
     if (k && v && k.length <= 45 && v.length <= 180) {
-      specifications[k] = v;
+      const dup = Object.keys(specifications).find((ex) => ex.toLowerCase() === k.toLowerCase());
+      if (!dup) specifications[k] = v;
     }
   }
 
@@ -1493,6 +1800,20 @@ export async function scrapeProductFromUrl(
       .forEach((w) => tagSet.add(w.replace(/[^a-z0-9]/g, '')));
   }
 
+  const uniqueSizes: string[] = [];
+  const seenSizeKeys = new Set<string>();
+  const registerSize = (s?: string) => {
+    const clean = (s || '').trim();
+    if (!clean) return;
+    const key = clean.toLowerCase();
+    if (!seenSizeKeys.has(key)) {
+      seenSizeKeys.add(key);
+      uniqueSizes.push(clean);
+    }
+  };
+  detectedSizes.forEach(registerSize);
+  normalizedVariations.forEach((v) => registerSize(v.size || v.title || v.attributes?.Variant));
+
   const product: ProductItem = {
     id: `prod_imp_${Date.now()}`,
     name,
@@ -1526,7 +1847,8 @@ export async function scrapeProductFromUrl(
     features,
     tags: Array.from(tagSet).filter(Boolean),
     variations: normalizedVariations,
-    sizes: normalizedVariations.map((v) => v.size || v.title || v.attributes?.Variant || '').filter(Boolean),
+    sizes: uniqueSizes,
+    sizeChart,
     status: 'draft',
     createdAt: new Date().toISOString().split('T')[0],
   };

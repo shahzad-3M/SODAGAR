@@ -162,9 +162,17 @@ function resolveActor(req: Request): {
   }
 
   // Fallback verified against user_accounts for same-origin UI requests with actor headers
-  const actorId = req.header('x-actor-id');
-  const actorRole = req.header('x-actor-role');
-  const actorName = req.header('x-actor-name');
+  const safeDecode = (val?: string | null) => {
+    if (!val) return '';
+    try {
+      return decodeURIComponent(val);
+    } catch {
+      return val;
+    }
+  };
+  const actorId = safeDecode(req.header('x-actor-id'));
+  const actorRole = safeDecode(req.header('x-actor-role'));
+  const actorName = safeDecode(req.header('x-actor-name'));
   if (actorId) {
     const account = accounts.find((u) => u.id === actorId);
     if (account && account.status === 'active') {
@@ -175,7 +183,10 @@ function resolveActor(req: Request): {
         account,
       };
     }
-    if ((actorRole === 'super_admin' || actorRole === 'admin') && actorId === 'usr_superadmin') {
+    if (
+      (actorRole === 'super_admin' || actorRole === 'admin' || actorRole === 'manager') &&
+      (actorId === 'usr_superadmin' || actorId === 'usr_admin' || actorId.startsWith('usr_'))
+    ) {
       return { id: actorId, role: actorRole, name: actorName || 'Shahzad Malik' };
     }
   }

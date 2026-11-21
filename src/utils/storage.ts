@@ -201,9 +201,9 @@ function getAuthHeaders(): Record<string, string> {
   }
   const user = getCurrentUser();
   if (user && user.isAuthenticated) {
-    headers['x-actor-id'] = user.id;
-    headers['x-actor-role'] = user.role;
-    headers['x-actor-name'] = user.name;
+    headers['x-actor-id'] = encodeURIComponent(user.id || '');
+    headers['x-actor-role'] = encodeURIComponent(user.role || '');
+    headers['x-actor-name'] = encodeURIComponent(user.name || '');
   }
   return headers;
 }
@@ -583,6 +583,31 @@ export async function apiScrapeProductUrl(
     return { ok: true, product: data.product, diagnostics: data.diagnostics };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : 'Network error during URL scrape' };
+  }
+}
+
+export async function apiSaveProduct(
+  product: ProductItem,
+  isUpdate: boolean
+): Promise<{ ok: boolean; product?: ProductItem; error?: string }> {
+  try {
+    const endpoint = isUpdate ? `/api/products/${encodeURIComponent(product.id)}` : '/api/products';
+    const res = await fetch(endpoint, {
+      method: isUpdate ? 'PUT' : 'POST',
+      headers: getAuthHeaders(),
+      cache: 'no-store',
+      body: JSON.stringify(product),
+    });
+    const parsed = await safeParseJsonResponse<{ ok?: boolean; product?: ProductItem; error?: string }>(res);
+    if (!parsed.ok || !parsed.data?.ok) {
+      return {
+        ok: false,
+        error: parsed.data?.error || parsed.error || 'Could not save product to server.',
+      };
+    }
+    return { ok: true, product: parsed.data.product || product };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Network error saving product' };
   }
 }
 

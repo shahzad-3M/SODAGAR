@@ -79,6 +79,7 @@ import {
   apiSubmitCheckoutOrder,
   apiUpdateCODOrderStatus,
   apiAuditAndRepairOrders,
+  apiSaveProduct,
   getCartItems,
   saveCartItems,
   getMonthlyExpenses,
@@ -1262,6 +1263,13 @@ export default function App() {
     }
     setProducts(updated);
     saveProducts(updated);
+    void apiSaveProduct(product, exists).then((res) => {
+      if (!res.ok) {
+        pushToast(res.error || `Product "${product.name}" saved locally, server sync pending.`, 'info');
+      } else if (res.product) {
+        setProducts((prev) => prev.map((p) => (p.id === res.product!.id ? res.product! : p)));
+      }
+    });
     pushToast(`Product "${product.name}" saved to catalog.`, 'success');
   };
 
