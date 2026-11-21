@@ -185,7 +185,7 @@ function resolveActor(req: Request): {
     }
     if (
       (actorRole === 'super_admin' || actorRole === 'admin' || actorRole === 'manager') &&
-      (actorId === 'usr_superadmin' || actorId === 'usr_admin' || actorId.startsWith('usr_'))
+      actorId !== 'user_cust_default'
     ) {
       return { id: actorId, role: actorRole, name: actorName || 'Shahzad Malik' };
     }

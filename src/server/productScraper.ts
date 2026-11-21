@@ -1818,7 +1818,7 @@ export async function scrapeProductFromUrl(
     id: `prod_imp_${Date.now()}`,
     name,
     urduName: '',
-    category: matchedCat?.name || categoryHints[0] || 'General Wholesale',
+    category: decodeHtmlEntities(matchedCat?.name || categoryHints[0] || 'General Wholesale'),
     parentCategoryId: matchedCat?.parentCategoryId ? undefined : matchedCat?.id,
     subcategoryId: matchedCat?.parentCategoryId ? matchedCat.id : undefined,
     deliveryType: 'standard',

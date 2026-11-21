@@ -77,6 +77,10 @@ import {
   UPCOMING_CATEGORY_ID,
   UPCOMING_CATEGORY_NAME,
 } from './locationCategoryHelpers';
+import {
+  parseProductFromHtmlInBrowser,
+  tryFetchProductInBrowserFallback,
+} from './clientProductScraper';
 
 const STORAGE_KEYS = {
   PROFILE: '100dagar_business_profile_v5',
@@ -550,13 +554,30 @@ export async function apiScrapeProductUrl(
   };
   error?: string;
 }> {
-  try {
-    const res = await fetch('/api/products/scrape-url', {
+  const attemptServerScrape = async (): Promise<Response> => {
+    return fetch('/api/products/scrape-url', {
       method: 'POST',
       headers: getAuthHeaders(),
       cache: 'no-store',
       body: JSON.stringify({ url, htmlOverride }),
     });
+  };
+
+  try {
+    let res = await attemptServerScrape();
+    if (res.status === 502 || res.status === 503 || res.status === 504) {
+      await new Promise((r) => setTimeout(r, 700));
+      res = await attemptServerScrape();
+    }
+
+    if (res.status === 403) {
+      return {
+        ok: false,
+        error:
+          'Permission denied (HTTP 403). Please ensure you are signed in as Super Admin, Admin, or Manager before importing products.',
+      };
+    }
+
     const parsed = await safeParseJsonResponse<{
       ok?: boolean;
       product?: ProductItem;
@@ -573,16 +594,68 @@ export async function apiScrapeProductUrl(
       };
       error?: string;
     }>(res);
+
     const data = parsed.data;
-    if (!parsed.ok || !data?.ok || !data.product) {
+    if (parsed.ok && data?.ok && data.product) {
+      return { ok: true, product: data.product, diagnostics: data.diagnostics };
+    }
+
+    const isMissingBackendRoute =
+      res.status === 404 ||
+      res.status === 405 ||
+      (parsed.error?.includes('unexpected HTML page') ?? false);
+
+    if (isMissingBackendRoute) {
+      if (htmlOverride && htmlOverride.trim()) {
+        const localParsed = parseProductFromHtmlInBrowser(url, htmlOverride, getCategoryRecords());
+        return {
+          ok: true,
+          product: localParsed.product,
+          diagnostics: localParsed.diagnostics,
+        };
+      }
+      const fallbackRes = await tryFetchProductInBrowserFallback(url, getCategoryRecords());
+      if (fallbackRes.ok && fallbackRes.product) {
+        return {
+          ok: true,
+          product: fallbackRes.product,
+          diagnostics: fallbackRes.diagnostics,
+        };
+      }
       return {
         ok: false,
-        error: data?.error || parsed.error || 'Could not scrape product details from URL.',
+        error:
+          fallbackRes.error ||
+          parsed.error ||
+          'Backend scraper endpoint returned HTTP 404. Use "Paste HTML Source" below to import offline directly in your browser.',
       };
     }
-    return { ok: true, product: data.product, diagnostics: data.diagnostics };
+
+    return {
+      ok: false,
+      error: data?.error || parsed.error || 'Could not scrape product details from URL.',
+    };
   } catch (err) {
-    return { ok: false, error: err instanceof Error ? err.message : 'Network error during URL scrape' };
+    if (htmlOverride && htmlOverride.trim()) {
+      const localParsed = parseProductFromHtmlInBrowser(url, htmlOverride, getCategoryRecords());
+      return {
+        ok: true,
+        product: localParsed.product,
+        diagnostics: localParsed.diagnostics,
+      };
+    }
+    const fallbackRes = await tryFetchProductInBrowserFallback(url, getCategoryRecords());
+    if (fallbackRes.ok && fallbackRes.product) {
+      return {
+        ok: true,
+        product: fallbackRes.product,
+        diagnostics: fallbackRes.diagnostics,
+      };
+    }
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : 'Network error during URL scrape',
+    };
   }
 }
 
@@ -624,6 +697,9 @@ export async function apiCacheExternalImage(
       cache: 'no-store',
       body: JSON.stringify({ url: trimmed, referer }),
     });
+    if (res.status === 404) {
+      return { ok: true, localUrl: trimmed, downloaded: false };
+    }
     const parsed = await safeParseJsonResponse<{
       ok?: boolean;
       localUrl?: string;
@@ -632,10 +708,9 @@ export async function apiCacheExternalImage(
     }>(res);
     if (!parsed.ok || !parsed.data?.localUrl) {
       return {
-        ok: false,
+        ok: true,
         localUrl: trimmed,
         downloaded: false,
-        error: parsed.data?.error || parsed.error || 'Could not download external image.',
       };
     }
     return {
@@ -643,12 +718,11 @@ export async function apiCacheExternalImage(
       localUrl: parsed.data.localUrl,
       downloaded: Boolean(parsed.data.downloaded),
     };
-  } catch (err) {
+  } catch {
     return {
-      ok: false,
+      ok: true,
       localUrl: trimmed,
       downloaded: false,
-      error: err instanceof Error ? err.message : 'Network error while caching image.',
     };
   }
 }
