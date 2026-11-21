@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   X,
   Layers,
@@ -15,6 +15,7 @@ import {
   ChevronDown,
   Power,
   Check,
+  Search,
 } from 'lucide-react';
 import { CategoryRecord, ProductItem } from '../types/index.ts';
 import {
@@ -62,11 +63,50 @@ export const CategoryManagementModal: React.FC<CategoryManagementModalProps> = (
   const [editDesc, setEditDesc] = useState('');
   const [editParentId, setEditParentId] = useState('');
   const [isSaving, setIsSaving] = useState(false);
+  const [treeSearch, setTreeSearch] = useState('');
   const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
 
+  useEffect(() => {
+    if (isOpen) {
+      setCategories(getCategoryRecords());
+      setFeedback(null);
+    }
+  }, [isOpen]);
+
+  const matchingCategoryIds = useMemo(() => {
+    const q = treeSearch.trim().toLowerCase();
+    if (!q) return null;
+    const matched = new Set<string>();
+    const addAncestors = (cat: CategoryRecord) => {
+      matched.add(cat.id);
+      if (cat.parentCategoryId) {
+        const p = categories.find((c) => c.id === cat.parentCategoryId);
+        if (p) addAncestors(p);
+      }
+    };
+    const addDescendants = (parentId: string) => {
+      categories.forEach((c) => {
+        if (c.parentCategoryId === parentId && !matched.has(c.id)) {
+          matched.add(c.id);
+          addDescendants(c.id);
+        }
+      });
+    };
+    categories.forEach((c) => {
+      if (c.name.toLowerCase().includes(q) || (c.urduName && c.urduName.toLowerCase().includes(q))) {
+        addAncestors(c);
+        addDescendants(c.id);
+      }
+    });
+    return matched;
+  }, [categories, treeSearch]);
+
   const mainCategories = useMemo(
-    () => categories.filter((c) => !c.parentCategoryId),
-    [categories]
+    () =>
+      categories.filter(
+        (c) => !c.parentCategoryId && (!matchingCategoryIds || matchingCategoryIds.has(c.id))
+      ),
+    [categories, matchingCategoryIds]
   );
 
   // Eligible parents for Level 2 & Level 3 (Level 1 Main and Level 2 Subcategories, excluding Upcoming)
@@ -287,8 +327,10 @@ export const CategoryManagementModal: React.FC<CategoryManagementModalProps> = (
   };
 
   const renderCategoryRow = (cat: CategoryRecord, depth: number) => {
-    const children = categories.filter((c) => c.parentCategoryId === cat.id);
-    const isExpanded = expandedIds[cat.id] ?? true;
+    const children = categories.filter(
+      (c) => c.parentCategoryId === cat.id && (!matchingCategoryIds || matchingCategoryIds.has(c.id))
+    );
+    const isExpanded = treeSearch.trim() ? true : (expandedIds[cat.id] ?? false);
     const count = getProductCount(cat);
     const isUpcoming = Boolean(cat.isUpcoming || cat.id === UPCOMING_CATEGORY_ID);
     const isEditing = editingId === cat.id;
@@ -415,7 +457,7 @@ export const CategoryManagementModal: React.FC<CategoryManagementModalProps> = (
                     )}
                     {isUpcoming && (
                       <span className="px-1.5 py-0.5 text-[9px] font-mono font-bold bg-purple-100 text-purple-800 dark:bg-purple-950/60 dark:text-purple-300 rounded">
-                        Always Visible · Checkout Locked
+                        Coming Soon · Checkout Locked
                       </span>
                     )}
                     {!isActive && (
@@ -431,8 +473,19 @@ export const CategoryManagementModal: React.FC<CategoryManagementModalProps> = (
               </div>
 
               <div className="flex items-center gap-2 shrink-0">
-                <span className="text-[11px] font-mono font-semibold text-slate-500 dark:text-slate-400">
-                  {count} {count === 1 ? 'Item' : 'Items'}
+                <span
+                  className={`text-[10px] font-mono font-semibold px-1.5 py-0.5 rounded ${
+                    count > 0 && isActive
+                      ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300'
+                      : 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400'
+                  }`}
+                  title={
+                    count > 0 && isActive
+                      ? 'Visible on customer storefront'
+                      : 'Hidden on customer storefront until a product is assigned'
+                  }
+                >
+                  {count} {count === 1 ? 'Item' : 'Items'} · {count > 0 && isActive ? 'Live' : 'Hidden'}
                 </span>
 
                 {depth < 2 && !isUpcoming && (
@@ -654,16 +707,36 @@ export const CategoryManagementModal: React.FC<CategoryManagementModalProps> = (
           </form>
 
           {/* Hierarchical Category Tree */}
-          <div>
-            <h3 className="text-xs font-black text-slate-900 dark:text-white uppercase tracking-wider mb-2 flex items-center justify-between">
-              <span>Category Hierarchy ({categories.length} Total)</span>
-              <span className="text-[11px] font-normal text-slate-400">
-                Duplicate names blocked under same parent
-              </span>
-            </h3>
+          <div className="space-y-2.5">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+              <div>
+                <h3 className="text-xs font-black text-slate-900 dark:text-white uppercase tracking-wider">
+                  Category Hierarchy ({categories.length} Total)
+                </h3>
+                <span className="text-[11px] font-normal text-slate-400 block">
+                  0-item categories are hidden on the storefront until a product is added · Click chevron to expand
+                </span>
+              </div>
+              <div className="relative w-full sm:w-56">
+                <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
+                <input
+                  type="text"
+                  value={treeSearch}
+                  onChange={(e) => setTreeSearch(e.target.value)}
+                  placeholder="Filter categories..."
+                  className="w-full pl-8 pr-2.5 py-1.5 text-xs rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-hidden focus:ring-1 focus:ring-amber-400"
+                />
+              </div>
+            </div>
 
             <div className="border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden">
-              {mainCategories.map((cat) => renderCategoryRow(cat, 0))}
+              {mainCategories.length > 0 ? (
+                mainCategories.map((cat) => renderCategoryRow(cat, 0))
+              ) : (
+                <div className="p-6 text-center text-xs text-slate-400">
+                  No categories match "{treeSearch}".
+                </div>
+              )}
             </div>
           </div>
         </div>

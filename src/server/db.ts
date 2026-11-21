@@ -1103,6 +1103,37 @@ function runMigrations(db: DatabaseSync, hadExistingDb: boolean) {
       'Created CRM tables (leads, follow-ups, campaigns, tickets, loyalty, coupons, custom segments, automation, activity), seeded defaults, and hashed stored credentials via scrypt'
     );
   }
+
+  // MIGRATION 010: Non-destructive expansion of 3-level Categories, Subcategories & Major Child Categories
+  if (!hasMigration('010_expand_wholesale_categories_hierarchy')) {
+    if (hadExistingDb) {
+      createVerifiedBackup('pre_migration_010_categories_hierarchy');
+    }
+    const now = new Date().toISOString();
+    const insertCatIgnore = db.prepare(`
+      INSERT OR IGNORE INTO categories (id, name, urdu_name, parent_category_id, level, description, is_upcoming, is_active, display_order, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const c of defaultCategoryRecords) {
+      insertCatIgnore.run(
+        c.id,
+        c.name,
+        c.urduName || null,
+        c.parentCategoryId || null,
+        c.level || computeCategoryLevel(c, defaultCategoryRecords),
+        c.description || null,
+        c.isUpcoming ? 1 : 0,
+        c.isActive === false ? 0 : 1,
+        c.displayOrder || 0,
+        now,
+        now
+      );
+    }
+    recordMigration(
+      '010_expand_wholesale_categories_hierarchy',
+      'Non-destructively inserted expanded 3-level main categories, subcategories, and major child categories using INSERT OR IGNORE'
+    );
+  }
 }
 
 // ==========================================

@@ -1767,6 +1767,8 @@ export default function App() {
         onCategoryChange={(cat) => setSelectedCategory(cat)}
         categories={allCategories}
         categoryRecords={categoryRecords}
+        products={products}
+        onOpenCategoryModal={() => setIsCategoryModalOpen(true)}
         profile={profile}
         viewMode={viewMode}
         onToggleViewMode={setViewMode}
@@ -2010,6 +2012,7 @@ export default function App() {
             onDeleteProduct={handleDeleteProduct}
             isExternalImportOpen={isWebsiteImportModalOpen}
             onCloseExternalImport={() => setIsWebsiteImportModalOpen(false)}
+            onOpenCategoryModal={() => setIsCategoryModalOpen(true)}
           />
         )}
 

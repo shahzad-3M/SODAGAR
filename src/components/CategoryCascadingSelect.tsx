@@ -22,6 +22,7 @@ interface CategoryCascadingSelectProps {
     isUpcoming: boolean;
   }) => void;
   label?: string;
+  onManageCategories?: () => void;
 }
 
 export const CategoryCascadingSelect: React.FC<CategoryCascadingSelectProps> = ({
@@ -32,6 +33,7 @@ export const CategoryCascadingSelect: React.FC<CategoryCascadingSelectProps> = (
   excludeUpcoming = false,
   onChange,
   label = 'Category Hierarchy (Main → Subcategory → Child Subcategory)',
+  onManageCategories,
 }) => {
   const [searchTerm, setSearchTerm] = useState('');
 
@@ -123,10 +125,21 @@ export const CategoryCascadingSelect: React.FC<CategoryCascadingSelectProps> = (
   return (
     <div className="space-y-2.5">
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-        <label className="text-xs font-bold text-slate-700 dark:text-slate-300 flex items-center gap-1.5">
-          <FolderTree className="w-3.5 h-3.5 text-amber-500" />
-          <span>{label}</span>
-        </label>
+        <div className="flex flex-wrap items-center gap-2">
+          <label className="text-xs font-bold text-slate-700 dark:text-slate-300 flex items-center gap-1.5">
+            <FolderTree className="w-3.5 h-3.5 text-amber-500" />
+            <span>{label}</span>
+          </label>
+          {onManageCategories && (
+            <button
+              type="button"
+              onClick={onManageCategories}
+              className="px-2 py-0.5 text-[10px] font-bold rounded bg-amber-100 hover:bg-amber-200 dark:bg-amber-950/50 dark:hover:bg-amber-900 text-amber-800 dark:text-amber-300 cursor-pointer"
+            >
+              Edit / Manage Categories
+            </button>
+          )}
+        </div>
 
         <div className="relative w-full sm:w-56">
           <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2" />

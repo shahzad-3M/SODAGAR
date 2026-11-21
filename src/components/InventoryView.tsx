@@ -64,6 +64,7 @@ interface InventoryViewProps {
   onDeleteProduct: (productId: string) => void;
   isExternalImportOpen?: boolean;
   onCloseExternalImport?: () => void;
+  onOpenCategoryModal?: () => void;
 }
 
 export const InventoryView: React.FC<InventoryViewProps> = ({
@@ -79,6 +80,7 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
   onDeleteProduct,
   isExternalImportOpen = false,
   onCloseExternalImport,
+  onOpenCategoryModal,
 }) => {
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedCategory, setSelectedCategory] = useState('all');
@@ -669,6 +671,17 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
               <option value="standard">🚚 Standard Logistics (3–6 Working Days)</option>
             </select>
 
+            {onOpenCategoryModal && (
+              <button
+                type="button"
+                onClick={onOpenCategoryModal}
+                className="inline-flex items-center gap-1.5 px-3 py-2 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-800 dark:text-slate-200 font-bold text-xs rounded-lg border border-slate-200 dark:border-slate-700 shadow-2xs cursor-pointer transition-colors"
+              >
+                <Layers className="w-3.5 h-3.5 text-amber-500" />
+                <span>Manage Categories</span>
+              </button>
+            )}
+
             <button
               onClick={() => setIsImportModalOpen(true)}
               className="inline-flex items-center gap-1.5 px-3 py-2 bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900 font-bold text-xs rounded-lg shadow-2xs cursor-pointer hover:bg-slate-800 transition-colors"
@@ -970,6 +983,7 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
                     subcategoryId={formSubCatId}
                     childSubcategoryId={formChildCatId}
                     excludeUpcoming={false}
+                    onManageCategories={onOpenCategoryModal}
                     onChange={(sel) => {
                       setFormParentCatId(sel.parentCategoryId);
                       setFormSubCatId(sel.subcategoryId || '');
@@ -1743,6 +1757,7 @@ export const InventoryView: React.FC<InventoryViewProps> = ({
                 childSubcategoryId={arrivalChildCatId}
                 excludeUpcoming={true}
                 label="Target Storefront Category (Main → Subcategory → Child Subcategory)"
+                onManageCategories={onOpenCategoryModal}
                 onChange={(sel) => {
                   setArrivalMainCatId(sel.parentCategoryId);
                   setArrivalSubCatId(sel.subcategoryId);

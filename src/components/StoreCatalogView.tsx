@@ -196,8 +196,12 @@ export const StoreCatalogView: React.FC<StoreCatalogViewProps> = ({
 
   const selectedCatChildren = useMemo(() => {
     if (!selectedCatObj || selectedCatObj.isUpcoming) return [];
-    return activeCatRecords.filter((c) => c.parentCategoryId === selectedCatObj.id);
-  }, [activeCatRecords, selectedCatObj]);
+    return activeCatRecords.filter(
+      (c) =>
+        c.parentCategoryId === selectedCatObj.id &&
+        products.some((p) => doesProductMatchCategoryFilter(p, c.id, effectiveCatRecords))
+    );
+  }, [activeCatRecords, selectedCatObj, products, effectiveCatRecords]);
 
   // Cart calculations
   const totalCartItems = cart.reduce((acc, it) => acc + it.quantity, 0);
@@ -688,22 +692,27 @@ export const StoreCatalogView: React.FC<StoreCatalogViewProps> = ({
             </button>
           </div>
 
-          {/* Manage Categories (Admin Only) */}
-          {(userRole === 'super_admin' || userRole === 'admin') && onOpenCategoryModal && (
-            <button
-              type="button"
-              onClick={onOpenCategoryModal}
-              className="w-full flex items-center justify-between py-1.5 px-2.5 rounded-lg text-xs font-bold bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 text-slate-800 dark:text-slate-200 cursor-pointer"
-            >
-              <span className="flex items-center gap-1.5">
-                <FolderTree className="w-3.5 h-3.5 text-amber-500" />
-                Manage Categories
-              </span>
-              <span className="text-[10px] text-amber-600 dark:text-amber-400">Edit / Cleanup</span>
-            </button>
+          {/* Manage Categories (Admin & Manager On-Time Editing) */}
+          {(userRole === 'super_admin' || userRole === 'admin' || userRole === 'manager') && onOpenCategoryModal && (
+            <div className="space-y-1">
+              <button
+                type="button"
+                onClick={onOpenCategoryModal}
+                className="w-full flex items-center justify-between py-1.5 px-2.5 rounded-lg text-xs font-bold bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 text-slate-800 dark:text-slate-200 cursor-pointer"
+              >
+                <span className="flex items-center gap-1.5">
+                  <FolderTree className="w-3.5 h-3.5 text-amber-500" />
+                  Manage Categories
+                </span>
+                <span className="text-[10px] text-amber-600 dark:text-amber-400">Edit On Time</span>
+              </button>
+              <p className="text-[10px] text-slate-400 px-1 leading-snug">
+                Empty categories stay hidden to shoppers until a product is added.
+              </p>
+            </div>
           )}
 
-          {/* 3-Level Category Hierarchy + Always-Visible Upcoming Category */}
+          {/* 3-Level Category Hierarchy (Only Categories / Subcategories / Child Categories with >= 1 product are visible) */}
           <nav className="space-y-1 text-xs">
             <button
               onClick={() => onCategoryChange('All Categories')}
@@ -719,30 +728,43 @@ export const StoreCatalogView: React.FC<StoreCatalogViewProps> = ({
               </span>
             </button>
 
-            {/* Always-Visible Dedicated Upcoming Viral Products | Coming Soon Category */}
-            <button
-              onClick={() => onCategoryChange(UPCOMING_CATEGORY_NAME)}
-              className={`w-full flex items-center justify-between py-1.5 px-2 rounded-lg text-left transition-colors cursor-pointer ${
-                selectedCategory === UPCOMING_CATEGORY_NAME || selectedCategory === UPCOMING_CATEGORY_ID
-                  ? 'bg-purple-100 dark:bg-purple-950/60 text-purple-950 dark:text-purple-100 font-bold border-l-3 border-purple-500'
-                  : 'bg-purple-50/60 dark:bg-purple-950/20 text-purple-800 dark:text-purple-300 hover:bg-purple-100/70 dark:hover:bg-purple-950/40'
-              }`}
-            >
-              <span className="truncate flex items-center gap-1 font-semibold">
-                <Sparkles className="w-3 h-3 text-purple-500 shrink-0" />
-                <span className="truncate">{UPCOMING_CATEGORY_NAME}</span>
-              </span>
-              <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-purple-200/70 dark:bg-purple-900/60 text-purple-900 dark:text-purple-200 shrink-0">
-                {upcomingCount}
-              </span>
-            </button>
+            {/* Dedicated Upcoming Viral Products | Coming Soon Category (Visible only when upcoming products exist) */}
+            {upcomingCount > 0 && (
+              <button
+                onClick={() => onCategoryChange(UPCOMING_CATEGORY_NAME)}
+                className={`w-full flex items-center justify-between py-1.5 px-2 rounded-lg text-left transition-colors cursor-pointer ${
+                  selectedCategory === UPCOMING_CATEGORY_NAME || selectedCategory === UPCOMING_CATEGORY_ID
+                    ? 'bg-purple-100 dark:bg-purple-950/60 text-purple-950 dark:text-purple-100 font-bold border-l-3 border-purple-500'
+                    : 'bg-purple-50/60 dark:bg-purple-950/20 text-purple-800 dark:text-purple-300 hover:bg-purple-100/70 dark:hover:bg-purple-950/40'
+                }`}
+              >
+                <span className="truncate flex items-center gap-1 font-semibold">
+                  <Sparkles className="w-3 h-3 text-purple-500 shrink-0" />
+                  <span className="truncate">{UPCOMING_CATEGORY_NAME}</span>
+                </span>
+                <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-purple-200/70 dark:bg-purple-900/60 text-purple-900 dark:text-purple-200 shrink-0">
+                  {upcomingCount}
+                </span>
+              </button>
+            )}
 
-            {/* Level 1 -> Level 2 -> Level 3 Categories */}
+            {/* Level 1 -> Level 2 -> Level 3 Categories (Hidden if 0 matching products) */}
             {mainCategoryNodes.map((mainCat) => {
-              const subs = activeCatRecords.filter((c) => c.parentCategoryId === mainCat.id);
               const count = products.filter((p) =>
-                doesProductMatchCategoryFilter(p, mainCat.name, effectiveCatRecords)
+                doesProductMatchCategoryFilter(p, mainCat.id, effectiveCatRecords)
               ).length;
+              if (count === 0) return null;
+
+              const visibleSubs = activeCatRecords
+                .filter((c) => c.parentCategoryId === mainCat.id)
+                .map((sub) => ({
+                  sub,
+                  subCount: products.filter((p) =>
+                    doesProductMatchCategoryFilter(p, sub.id, effectiveCatRecords)
+                  ).length,
+                }))
+                .filter((item) => item.subCount > 0);
+
               const isSelected =
                 normalizeTextKey(selectedCategory) === normalizeTextKey(mainCat.name) ||
                 selectedCategory === mainCat.id;
@@ -751,7 +773,7 @@ export const StoreCatalogView: React.FC<StoreCatalogViewProps> = ({
               return (
                 <div key={mainCat.id} className="space-y-0.5">
                   <div className="flex items-center gap-0.5">
-                    {subs.length > 0 && (
+                    {visibleSubs.length > 0 && (
                       <button
                         type="button"
                         onClick={() =>
@@ -773,7 +795,7 @@ export const StoreCatalogView: React.FC<StoreCatalogViewProps> = ({
                     <button
                       onClick={() => {
                         onCategoryChange(mainCat.name);
-                        if (subs.length > 0) {
+                        if (visibleSubs.length > 0) {
                           setExpandedSidebarCats((prev) => ({ ...prev, [mainCat.id]: true }));
                         }
                       }}
@@ -790,14 +812,19 @@ export const StoreCatalogView: React.FC<StoreCatalogViewProps> = ({
                     </button>
                   </div>
 
-                  {/* Level 2 Subcategories */}
-                  {isExpanded && subs.length > 0 && (
+                  {/* Level 2 Subcategories (only visible when subCount > 0) */}
+                  {isExpanded && visibleSubs.length > 0 && (
                     <div className="pl-4 border-l border-slate-200 dark:border-slate-800 ml-2 space-y-0.5">
-                      {subs.map((sub) => {
-                        const childCats = activeCatRecords.filter((c) => c.parentCategoryId === sub.id);
-                        const subCount = products.filter((p) =>
-                          doesProductMatchCategoryFilter(p, sub.name, effectiveCatRecords)
-                        ).length;
+                      {visibleSubs.map(({ sub, subCount }) => {
+                        const visibleChildCats = activeCatRecords
+                          .filter((c) => c.parentCategoryId === sub.id)
+                          .map((ch) => ({
+                            ch,
+                            chCount: products.filter((p) =>
+                              doesProductMatchCategoryFilter(p, ch.id, effectiveCatRecords)
+                            ).length,
+                          }))
+                          .filter((item) => item.chCount > 0);
                         const isSubSelected =
                           normalizeTextKey(selectedCategory) === normalizeTextKey(sub.name) ||
                           selectedCategory === sub.id;
@@ -818,13 +845,10 @@ export const StoreCatalogView: React.FC<StoreCatalogViewProps> = ({
                               </span>
                             </button>
 
-                            {/* Level 3 Child Subcategories */}
-                            {childCats.length > 0 && (
+                            {/* Level 3 Child Subcategories (only visible when chCount > 0) */}
+                            {visibleChildCats.length > 0 && (
                               <div className="pl-3 space-y-0.5">
-                                {childCats.map((ch) => {
-                                  const chCount = products.filter((p) =>
-                                    doesProductMatchCategoryFilter(p, ch.name, effectiveCatRecords)
-                                  ).length;
+                                {visibleChildCats.map(({ ch, chCount }) => {
                                   const isChSelected =
                                     normalizeTextKey(selectedCategory) === normalizeTextKey(ch.name) ||
                                     selectedCategory === ch.id;

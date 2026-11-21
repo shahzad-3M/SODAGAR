@@ -1661,18 +1661,154 @@ export const defaultLoginAuditLogs: LoginAuditRecord[] = [
 
 // CENTRALIZED CATEGORY RECORDS (3-Level Hierarchy: Main -> Subcategory -> Child Subcategory + Upcoming)
 export const defaultCategoryRecords: CategoryRecord[] = [
+  // 1. Cosmetics & Personal Care
   { id: 'cat_cosmetics', name: 'Cosmetics & Personal Care', urduName: 'کاسمیٹکس و پرسنل کیئر', level: 1, isActive: true, displayOrder: 1 },
   { id: 'cat_cosmetics_hair', name: 'Hair Care & Styling', urduName: 'ہیئر کیئر و اسٹائلنگ', parentCategoryId: 'cat_cosmetics', level: 2, isActive: true, displayOrder: 11 },
+  { id: 'cat_cosmetics_hair_stylers', name: 'Hair Dryers & Stylers', urduName: 'ہیئر ڈرائر و اسٹائلر', parentCategoryId: 'cat_cosmetics_hair', level: 3, isActive: true, displayOrder: 111 },
+  { id: 'cat_cosmetics_hair_oils', name: 'Hair Oils & Shampoos', urduName: 'ہیئر آئل و شیمپو', parentCategoryId: 'cat_cosmetics_hair', level: 3, isActive: true, displayOrder: 112 },
+  { id: 'cat_cosmetics_hair_brushes', name: 'Brushes, Combs & Clips', urduName: 'برش، کنگھے و کلپس', parentCategoryId: 'cat_cosmetics_hair', level: 3, isActive: true, displayOrder: 113 },
+
+  { id: 'cat_cosmetics_skin', name: 'Skincare & Serums', urduName: 'اسکن کیئر و سیرمز', parentCategoryId: 'cat_cosmetics', level: 2, isActive: true, displayOrder: 12 },
+  { id: 'cat_cosmetics_skin_cleansers', name: 'Face Wash & Cleansers', urduName: 'فیس واش و کلینزر', parentCategoryId: 'cat_cosmetics_skin', level: 3, isActive: true, displayOrder: 121 },
+  { id: 'cat_cosmetics_skin_serums', name: 'Serums & Whitening Creams', urduName: 'سیرمز و کریمز', parentCategoryId: 'cat_cosmetics_skin', level: 3, isActive: true, displayOrder: 122 },
+  { id: 'cat_cosmetics_skin_sunblock', name: 'Sunblock & Moisturizers', urduName: 'سن بلاک و موئسچرائزر', parentCategoryId: 'cat_cosmetics_skin', level: 3, isActive: true, displayOrder: 123 },
+
+  { id: 'cat_cosmetics_makeup', name: 'Makeup & Fragrances', urduName: 'میک اپ و پرفیومز', parentCategoryId: 'cat_cosmetics', level: 2, isActive: true, displayOrder: 13 },
+  { id: 'cat_cosmetics_makeup_lips', name: 'Lipsticks, Gloss & Nails', urduName: 'لپ اسٹک و نیل پالش', parentCategoryId: 'cat_cosmetics_makeup', level: 3, isActive: true, displayOrder: 131 },
+  { id: 'cat_cosmetics_makeup_kits', name: 'Foundation & Makeup Kits', urduName: 'فاؤنڈیشن و میک اپ کٹس', parentCategoryId: 'cat_cosmetics_makeup', level: 3, isActive: true, displayOrder: 132 },
+  { id: 'cat_cosmetics_makeup_perfumes', name: 'Perfumes & Attar', urduName: 'پرفیومز و عطر', parentCategoryId: 'cat_cosmetics_makeup', level: 3, isActive: true, displayOrder: 133 },
+
+  { id: 'cat_cosmetics_grooming', name: 'Personal Hygiene & Grooming', urduName: 'پرسنل گرومنگ', parentCategoryId: 'cat_cosmetics', level: 2, isActive: true, displayOrder: 14 },
+  { id: 'cat_cosmetics_grooming_trimmers', name: 'Trimmers & Shavers', urduName: 'ٹریمر و شیور', parentCategoryId: 'cat_cosmetics_grooming', level: 3, isActive: true, displayOrder: 141 },
+  { id: 'cat_cosmetics_grooming_soaps', name: 'Soaps & Body Care', urduName: 'صابن و باڈی کیئر', parentCategoryId: 'cat_cosmetics_grooming', level: 3, isActive: true, displayOrder: 142 },
+
+  // 2. Electronics & Gadgets
   { id: 'cat_electronics', name: 'Electronics & Gadgets', urduName: 'الیکٹرانکس و گیجٹس', level: 1, isActive: true, displayOrder: 2 },
   { id: 'cat_electronics_watches', name: 'Smartwatches & Wearables', urduName: 'اسمارٹ واچز', parentCategoryId: 'cat_electronics', level: 2, isActive: true, displayOrder: 21 },
+  { id: 'cat_electronics_watches_amoled', name: 'AMOLED & Calling Watches', urduName: 'کالنگ اسمارٹ واچز', parentCategoryId: 'cat_electronics_watches', level: 3, isActive: true, displayOrder: 211 },
+  { id: 'cat_electronics_watches_straps', name: 'Watch Straps & Chargers', urduName: 'اسٹریپس و چارجرز', parentCategoryId: 'cat_electronics_watches', level: 3, isActive: true, displayOrder: 212 },
+
+  { id: 'cat_electronics_audio', name: 'Audio & Earbuds', urduName: 'آڈیو و ایئربڈز', parentCategoryId: 'cat_electronics', level: 2, isActive: true, displayOrder: 22 },
+  { id: 'cat_electronics_audio_tws', name: 'TWS Wireless Earbuds', urduName: 'وائرلیس ایئربڈز', parentCategoryId: 'cat_electronics_audio', level: 3, isActive: true, displayOrder: 221 },
+  { id: 'cat_electronics_audio_speakers', name: 'Bluetooth Speakers', urduName: 'بلوٹوتھ اسپیکرز', parentCategoryId: 'cat_electronics_audio', level: 3, isActive: true, displayOrder: 222 },
+  { id: 'cat_electronics_audio_handsfree', name: 'Neckbands & Handsfree', urduName: 'نیک بینڈ و ہینڈز فری', parentCategoryId: 'cat_electronics_audio', level: 3, isActive: true, displayOrder: 223 },
+
+  { id: 'cat_electronics_mobile', name: 'Mobile Accessories', urduName: 'موبائل اسیسریز', parentCategoryId: 'cat_electronics', level: 2, isActive: true, displayOrder: 23 },
+  { id: 'cat_electronics_mobile_chargers', name: 'Fast Chargers & Cables', urduName: 'فاسٹ چارجر و کیبلز', parentCategoryId: 'cat_electronics_mobile', level: 3, isActive: true, displayOrder: 231 },
+  { id: 'cat_electronics_mobile_powerbanks', name: 'Power Banks', urduName: 'پاور بینکس', parentCategoryId: 'cat_electronics_mobile', level: 3, isActive: true, displayOrder: 232 },
+  { id: 'cat_electronics_mobile_covers', name: 'Covers, Pouches & Glass', urduName: 'کور و پروٹیکٹر', parentCategoryId: 'cat_electronics_mobile', level: 3, isActive: true, displayOrder: 233 },
+
+  { id: 'cat_electronics_lighting', name: 'LED, Solar & Studio Gear', urduName: 'سولر و ایل ای ڈی', parentCategoryId: 'cat_electronics', level: 2, isActive: true, displayOrder: 24 },
+  { id: 'cat_electronics_lighting_solar', name: 'Solar & Emergency Lights', urduName: 'سولر و ایمرجنسی لائٹس', parentCategoryId: 'cat_electronics_lighting', level: 3, isActive: true, displayOrder: 241 },
+  { id: 'cat_electronics_lighting_studio', name: 'Ring Lights, Mics & Tripods', urduName: 'رنگ لائٹس و مائیک', parentCategoryId: 'cat_electronics_lighting', level: 3, isActive: true, displayOrder: 242 },
+
+  // 3. Fashion & Apparel
   { id: 'cat_fashion', name: 'Fashion & Apparel', urduName: 'فیشن و ملبوسات', level: 1, isActive: true, displayOrder: 3 },
   { id: 'cat_fashion_men', name: "Men's Fashion", urduName: 'مردانہ ملبوسات', parentCategoryId: 'cat_fashion', level: 2, isActive: true, displayOrder: 31 },
   { id: 'cat_fashion_men_kameez', name: 'Shalwar Kameez', urduName: 'شلوار قمیض', parentCategoryId: 'cat_fashion_men', level: 3, isActive: true, displayOrder: 311 },
   { id: 'cat_fashion_men_shirts', name: 'Shirts & Trousers', urduName: 'شرٹس و ٹراؤزرز', parentCategoryId: 'cat_fashion_men', level: 3, isActive: true, displayOrder: 312 },
+  { id: 'cat_fashion_men_tshirts', name: 'T-Shirts & Polos', urduName: 'ٹی شرٹس و پولو', parentCategoryId: 'cat_fashion_men', level: 3, isActive: true, displayOrder: 313 },
+  { id: 'cat_fashion_men_winter', name: 'Jackets, Hoodies & Shawls', urduName: 'جیکٹس، ہڈیز و شال', parentCategoryId: 'cat_fashion_men', level: 3, isActive: true, displayOrder: 314 },
+
   { id: 'cat_fashion_women', name: "Women's Fashion", urduName: 'خواتین ملبوسات', parentCategoryId: 'cat_fashion', level: 2, isActive: true, displayOrder: 32 },
+  { id: 'cat_fashion_women_unstitched', name: 'Unstitched Lawn & Linen', urduName: 'ان سٹچ لان و لیلن', parentCategoryId: 'cat_fashion_women', level: 3, isActive: true, displayOrder: 321 },
+  { id: 'cat_fashion_women_pret', name: 'Ready-to-Wear Kurtis & Suits', urduName: 'ریڈی ٹو ویئر سوٹس', parentCategoryId: 'cat_fashion_women', level: 3, isActive: true, displayOrder: 322 },
+  { id: 'cat_fashion_women_abayas', name: 'Abayas, Hijabs & Dupattas', urduName: 'عبایہ، حجاب و دوپٹہ', parentCategoryId: 'cat_fashion_women', level: 3, isActive: true, displayOrder: 323 },
+
+  { id: 'cat_fashion_kids', name: 'Kids & Baby Fashion', urduName: 'بچوں کے ملبوسات', parentCategoryId: 'cat_fashion', level: 2, isActive: true, displayOrder: 33 },
+  { id: 'cat_fashion_kids_boys', name: 'Boys Eastern & Western', urduName: 'لڑکوں کے سوٹس', parentCategoryId: 'cat_fashion_kids', level: 3, isActive: true, displayOrder: 331 },
+  { id: 'cat_fashion_kids_girls', name: 'Girls Frocks & Suits', urduName: 'لڑکیوں کے فراک و سوٹس', parentCategoryId: 'cat_fashion_kids', level: 3, isActive: true, displayOrder: 332 },
+  { id: 'cat_fashion_kids_newborn', name: 'Newborn & Infant Sets', urduName: 'نوزائیدہ بچوں کے سیٹ', parentCategoryId: 'cat_fashion_kids', level: 3, isActive: true, displayOrder: 333 },
+
+  { id: 'cat_fashion_footwear', name: 'Footwear & Slippers', urduName: 'جوتے و چپل', parentCategoryId: 'cat_fashion', level: 2, isActive: true, displayOrder: 34 },
+  { id: 'cat_fashion_footwear_men', name: "Men's Shoes & Peshawari", urduName: 'مردانہ جوتے و چپل', parentCategoryId: 'cat_fashion_footwear', level: 3, isActive: true, displayOrder: 341 },
+  { id: 'cat_fashion_footwear_women', name: 'Ladies Heels, Khussa & Flats', urduName: 'خواتین سینڈل و کھسہ', parentCategoryId: 'cat_fashion_footwear', level: 3, isActive: true, displayOrder: 342 },
+
+  // 4. Kitchen & Home
   { id: 'cat_kitchen', name: 'Kitchen & Home', urduName: 'کچن و گھریلو سامان', level: 1, isActive: true, displayOrder: 4 },
+  { id: 'cat_kitchen_cookware', name: 'Cookware & Pots', urduName: 'برتن و کک ویئر', parentCategoryId: 'cat_kitchen', level: 2, isActive: true, displayOrder: 41 },
+  { id: 'cat_kitchen_cookware_nonstick', name: 'Non-Stick & Marble Sets', urduName: 'نان اسٹک کک ویئر سیٹ', parentCategoryId: 'cat_kitchen_cookware', level: 3, isActive: true, displayOrder: 411 },
+  { id: 'cat_kitchen_cookware_cookers', name: 'Pressure Cookers & Karahi', urduName: 'پریشر ککر و کڑاہی', parentCategoryId: 'cat_kitchen_cookware', level: 3, isActive: true, displayOrder: 412 },
+
+  { id: 'cat_kitchen_tools', name: 'Kitchen Tools & Organizers', urduName: 'کچن آرگنائزرز و ٹولز', parentCategoryId: 'cat_kitchen', level: 2, isActive: true, displayOrder: 42 },
+  { id: 'cat_kitchen_tools_choppers', name: 'Choppers, Slicers & Knives', urduName: 'چاپر، سلائسر و چھریاں', parentCategoryId: 'cat_kitchen_tools', level: 3, isActive: true, displayOrder: 421 },
+  { id: 'cat_kitchen_tools_storage', name: 'Storage Jars, Racks & Flasks', urduName: 'اسٹوریج جار و ریک', parentCategoryId: 'cat_kitchen_tools', level: 3, isActive: true, displayOrder: 422 },
+
+  { id: 'cat_kitchen_appliances', name: 'Small Kitchen Appliances', urduName: 'کچن اپلائنسز', parentCategoryId: 'cat_kitchen', level: 2, isActive: true, displayOrder: 43 },
+  { id: 'cat_kitchen_appliances_blenders', name: 'Blenders, Juicers & Grinders', urduName: 'بلینڈر و جوسر', parentCategoryId: 'cat_kitchen_appliances', level: 3, isActive: true, displayOrder: 431 },
+  { id: 'cat_kitchen_appliances_kettles', name: 'Electric Kettles & Dispensers', urduName: 'الیکٹرک کیتلی و ڈسپنسر', parentCategoryId: 'cat_kitchen_appliances', level: 3, isActive: true, displayOrder: 432 },
+  { id: 'cat_kitchen_appliances_makers', name: 'Roti Makers, Toasters & Irons', urduName: 'روٹی میکر و ٹوسٹر', parentCategoryId: 'cat_kitchen_appliances', level: 3, isActive: true, displayOrder: 433 },
+
+  { id: 'cat_kitchen_crockery', name: 'Crockery & Dining', urduName: 'کراکوری و ڈائننگ', parentCategoryId: 'cat_kitchen', level: 2, isActive: true, displayOrder: 44 },
+  { id: 'cat_kitchen_crockery_dinner', name: 'Dinner & Serving Sets', urduName: 'ڈنر و سرونگ سیٹ', parentCategoryId: 'cat_kitchen_crockery', level: 3, isActive: true, displayOrder: 441 },
+  { id: 'cat_kitchen_crockery_tea', name: 'Tea Sets, Mugs & Thermos', urduName: 'ٹی سیٹ و تھرماس', parentCategoryId: 'cat_kitchen_crockery', level: 3, isActive: true, displayOrder: 442 },
+
+  { id: 'cat_kitchen_cleaning', name: 'Cleaning & Laundry', urduName: 'صفائی و لانڈری', parentCategoryId: 'cat_kitchen', level: 2, isActive: true, displayOrder: 45 },
+  { id: 'cat_kitchen_cleaning_mops', name: 'Spin Mops, Buckets & Brooms', urduName: 'اسپن موپ و بالٹیاں', parentCategoryId: 'cat_kitchen_cleaning', level: 3, isActive: true, displayOrder: 451 },
+  { id: 'cat_kitchen_cleaning_laundry', name: 'Laundry Baskets & Stands', urduName: 'لانڈری باسکٹ و اسٹینڈ', parentCategoryId: 'cat_kitchen_cleaning', level: 3, isActive: true, displayOrder: 452 },
+
+  // 5. Decorative Items
   { id: 'cat_decorative', name: 'Decorative Items', urduName: 'ڈیکوریشن و تحائف', level: 1, isActive: true, displayOrder: 5 },
+  { id: 'cat_decorative_wall', name: 'Wall Art & Islamic Calligraphy', urduName: 'وال آرٹ و اسلامی خطاطی', parentCategoryId: 'cat_decorative', level: 2, isActive: true, displayOrder: 51 },
+  { id: 'cat_decorative_wall_frames', name: '3D Acrylic & Wooden Frames', urduName: 'تھری ڈی فریمز', parentCategoryId: 'cat_decorative_wall', level: 3, isActive: true, displayOrder: 511 },
+  { id: 'cat_decorative_wall_clocks', name: 'Wall Clocks & Mirrors', urduName: 'وال کلاک و آئینے', parentCategoryId: 'cat_decorative_wall', level: 3, isActive: true, displayOrder: 512 },
+
+  { id: 'cat_decorative_lamps', name: 'Lamps, Crystal & Fairy Lights', urduName: 'لیمپس و فیئری لائٹس', parentCategoryId: 'cat_decorative', level: 2, isActive: true, displayOrder: 52 },
+  { id: 'cat_decorative_lamps_table', name: 'Table, Moon & Galaxy Lamps', urduName: 'ٹیبل و مون لیمپس', parentCategoryId: 'cat_decorative_lamps', level: 3, isActive: true, displayOrder: 521 },
+  { id: 'cat_decorative_lamps_strips', name: 'LED Strips & Chandeliers', urduName: 'ایل ای ڈی اسٹرپس و فانوس', parentCategoryId: 'cat_decorative_lamps', level: 3, isActive: true, displayOrder: 522 },
+
+  { id: 'cat_decorative_gifts', name: 'Plants, Vases & Gift Hampers', urduName: 'پودے، گلدستے و تحائف', parentCategoryId: 'cat_decorative', level: 2, isActive: true, displayOrder: 53 },
+  { id: 'cat_decorative_gifts_plants', name: 'Artificial Plants & Vases', urduName: 'مصنوعی پودے و گلدستے', parentCategoryId: 'cat_decorative_gifts', level: 3, isActive: true, displayOrder: 531 },
+  { id: 'cat_decorative_gifts_boxes', name: 'Gift Boxes & Wedding Hampers', urduName: 'گفٹ باکس و ہیمپرز', parentCategoryId: 'cat_decorative_gifts', level: 3, isActive: true, displayOrder: 532 },
+
+  // 6. Accessories
   { id: 'cat_accessories', name: 'Accessories', urduName: 'متفرق اسیسریز', level: 1, isActive: true, displayOrder: 6 },
+  { id: 'cat_accessories_bags', name: 'Bags, Wallets & Luggage', urduName: 'بیگز و بٹوے', parentCategoryId: 'cat_accessories', level: 2, isActive: true, displayOrder: 61 },
+  { id: 'cat_accessories_bags_ladies', name: 'Ladies Handbags & Clutches', urduName: 'لیڈیز ہینڈ بیگز', parentCategoryId: 'cat_accessories_bags', level: 3, isActive: true, displayOrder: 611 },
+  { id: 'cat_accessories_bags_travel', name: 'School, Laptop & Travel Bags', urduName: 'اسکول و ٹریول بیگز', parentCategoryId: 'cat_accessories_bags', level: 3, isActive: true, displayOrder: 612 },
+  { id: 'cat_accessories_bags_wallets', name: "Men's Wallets & Belts", urduName: 'مردانہ والٹ و بیلٹ', parentCategoryId: 'cat_accessories_bags', level: 3, isActive: true, displayOrder: 613 },
+
+  { id: 'cat_accessories_jewelry', name: 'Watches, Jewelry & Eyewear', urduName: 'جیولری و چشمے', parentCategoryId: 'cat_accessories', level: 2, isActive: true, displayOrder: 62 },
+  { id: 'cat_accessories_jewelry_sets', name: 'Artificial Jewelry & Sets', urduName: 'مصنوعی جیولری سیٹس', parentCategoryId: 'cat_accessories_jewelry', level: 3, isActive: true, displayOrder: 621 },
+  { id: 'cat_accessories_jewelry_eyewear', name: 'Sunglasses & Caps', urduName: 'دھوپ کے چشمے و ٹوپیاں', parentCategoryId: 'cat_accessories_jewelry', level: 3, isActive: true, displayOrder: 622 },
+
+  // 7. Home Textile & Bedding
+  { id: 'cat_home_textile', name: 'Home Textile & Bedding', urduName: 'ہوم ٹیکسٹائل و بیڈنگ', level: 1, isActive: true, displayOrder: 7 },
+  { id: 'cat_home_textile_bedding', name: 'Bedsheets & Comforters', urduName: 'بیڈ شیٹس و رضائیاں', parentCategoryId: 'cat_home_textile', level: 2, isActive: true, displayOrder: 71 },
+  { id: 'cat_home_textile_bedding_sheets', name: 'King & Queen Cotton Bedsheets', urduName: 'کاٹن بیڈ شیٹس', parentCategoryId: 'cat_home_textile_bedding', level: 3, isActive: true, displayOrder: 711 },
+  { id: 'cat_home_textile_bedding_comforters', name: 'Bridal & Blanket Sets', urduName: 'برائیڈل کمبل و رضائی سیٹ', parentCategoryId: 'cat_home_textile_bedding', level: 3, isActive: true, displayOrder: 712 },
+  { id: 'cat_home_textile_bath', name: 'Towels, Curtains & Mats', urduName: 'تولیے، پردے و میٹس', parentCategoryId: 'cat_home_textile', level: 2, isActive: true, displayOrder: 72 },
+  { id: 'cat_home_textile_bath_towels', name: 'Bath Towels & Prayer Mats', urduName: 'تولیے و جائے نماز', parentCategoryId: 'cat_home_textile_bath', level: 3, isActive: true, displayOrder: 721 },
+  { id: 'cat_home_textile_bath_curtains', name: 'Door Mats & Curtains', urduName: 'ڈور میٹس و پردے', parentCategoryId: 'cat_home_textile_bath', level: 3, isActive: true, displayOrder: 722 },
+
+  // 8. Toys, Kids & Baby Care
+  { id: 'cat_kids_baby', name: 'Toys, Kids & Baby Care', urduName: 'کھلونے و بے بی کیئر', level: 1, isActive: true, displayOrder: 8 },
+  { id: 'cat_kids_baby_toys', name: 'Kids Toys & Learning', urduName: 'بچوں کے کھلونے', parentCategoryId: 'cat_kids_baby', level: 2, isActive: true, displayOrder: 81 },
+  { id: 'cat_kids_baby_toys_rc', name: 'Remote Control & Cars', urduName: 'ریموٹ کنٹرول کھلونے', parentCategoryId: 'cat_kids_baby_toys', level: 3, isActive: true, displayOrder: 811 },
+  { id: 'cat_kids_baby_toys_edu', name: 'Educational & Magnetic Games', urduName: 'تعلیمی کھلونے', parentCategoryId: 'cat_kids_baby_toys', level: 3, isActive: true, displayOrder: 812 },
+  { id: 'cat_kids_baby_care', name: 'Baby Care & Feeding', urduName: 'بے بی کیئر و فیڈنگ', parentCategoryId: 'cat_kids_baby', level: 2, isActive: true, displayOrder: 82 },
+  { id: 'cat_kids_baby_care_gear', name: 'Strollers, Walkers & Cradles', urduName: 'اسٹرولر و جھولے', parentCategoryId: 'cat_kids_baby_care', level: 3, isActive: true, displayOrder: 821 },
+  { id: 'cat_kids_baby_care_feeding', name: 'Feeders & Diaper Bags', urduName: 'فیڈر و ڈائپر بیگز', parentCategoryId: 'cat_kids_baby_care', level: 3, isActive: true, displayOrder: 822 },
+
+  // 9. Hardware, Tools & Auto
+  { id: 'cat_tools_auto', name: 'Hardware, Tools & Auto', urduName: 'اوزار، ہارڈویئر و آٹو', level: 1, isActive: true, displayOrder: 9 },
+  { id: 'cat_tools_auto_hardware', name: 'Hand & Power Tools', urduName: 'ہینڈ و پاور ٹولز', parentCategoryId: 'cat_tools_auto', level: 2, isActive: true, displayOrder: 91 },
+  { id: 'cat_tools_auto_hardware_hand', name: 'Tool Kits & Screwdriver Sets', urduName: 'ٹول کٹس و پیچ کس', parentCategoryId: 'cat_tools_auto_hardware', level: 3, isActive: true, displayOrder: 911 },
+  { id: 'cat_tools_auto_hardware_power', name: 'Drills, Washers & Cutters', urduName: 'ڈرل مشین و پریشر واشر', parentCategoryId: 'cat_tools_auto_hardware', level: 3, isActive: true, displayOrder: 912 },
+  { id: 'cat_tools_auto_vehicle', name: 'Bike & Car Accessories', urduName: 'کار و بائیک اسیسریز', parentCategoryId: 'cat_tools_auto', level: 2, isActive: true, displayOrder: 92 },
+  { id: 'cat_tools_auto_vehicle_car', name: 'Car Vacuum, LED & Covers', urduName: 'کار ویکیوم و کورز', parentCategoryId: 'cat_tools_auto_vehicle', level: 3, isActive: true, displayOrder: 921 },
+  { id: 'cat_tools_auto_vehicle_bike', name: 'Helmets, Locks & Bike Gear', urduName: 'ہیلمٹ و بائیک لاکس', parentCategoryId: 'cat_tools_auto_vehicle', level: 3, isActive: true, displayOrder: 922 },
+
+  // 10. Sports, Fitness & Stationery
+  { id: 'cat_sports_stationery', name: 'Sports, Fitness & Stationery', urduName: 'کھیل، فٹنس و اسٹیشنری', level: 1, isActive: true, displayOrder: 10 },
+  { id: 'cat_sports_stationery_fitness', name: 'Gym & Fitness Gear', urduName: 'جم و فٹنس سامان', parentCategoryId: 'cat_sports_stationery', level: 2, isActive: true, displayOrder: 101 },
+  { id: 'cat_sports_stationery_fitness_gym', name: 'Dumbbells, Bands & Mats', urduName: 'ڈمبلز و یوگا میٹس', parentCategoryId: 'cat_sports_stationery_fitness', level: 3, isActive: true, displayOrder: 1011 },
+  { id: 'cat_sports_stationery_fitness_care', name: 'Massagers & Posture Braces', urduName: 'مساجر و پوسچر بیلٹ', parentCategoryId: 'cat_sports_stationery_fitness', level: 3, isActive: true, displayOrder: 1012 },
+  { id: 'cat_sports_stationery_office', name: 'School & Office Stationery', urduName: 'اسکول و آفس اسٹیشنری', parentCategoryId: 'cat_sports_stationery', level: 2, isActive: true, displayOrder: 102 },
+  { id: 'cat_sports_stationery_office_school', name: 'School Bottles & Lunch Boxes', urduName: 'واٹر بوتل و لنچ باکس', parentCategoryId: 'cat_sports_stationery_office', level: 3, isActive: true, displayOrder: 1021 },
+  { id: 'cat_sports_stationery_office_office', name: 'Calculators, Printers & Pens', urduName: 'کیلکولیٹر و آفس سامان', parentCategoryId: 'cat_sports_stationery_office', level: 3, isActive: true, displayOrder: 1022 },
+
+  // 11. Upcoming Viral Products | Coming Soon
   {
     id: 'cat_upcoming',
     name: 'Upcoming Viral Products | Coming Soon',
@@ -1681,7 +1817,7 @@ export const defaultCategoryRecords: CategoryRecord[] = [
     isUpcoming: true,
     isActive: true,
     description: 'Informational showcase of trending viral wholesale lots expected soon (Not yet purchasable)',
-    displayOrder: 7,
+    displayOrder: 99,
   },
 ];
 

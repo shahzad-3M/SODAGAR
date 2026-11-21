@@ -32,9 +32,15 @@ import {
   Tag,
   HeartHandshake,
 } from 'lucide-react';
-import { AppUser, BusinessProfile, CategoryRecord, UserRole } from '../types/index.ts';
+import { AppUser, BusinessProfile, CategoryRecord, ProductItem, UserRole } from '../types/index.ts';
 import { openWhatsAppDirect } from '../utils/whatsapp.ts';
-import { UPCOMING_CATEGORY_ID, UPCOMING_CATEGORY_NAME } from '../utils/locationCategoryHelpers.ts';
+import {
+  doesProductMatchCategoryFilter,
+  isProductPurchaseBlocked,
+  normalizeTextKey,
+  UPCOMING_CATEGORY_ID,
+  UPCOMING_CATEGORY_NAME,
+} from '../utils/locationCategoryHelpers.ts';
 
 export interface NavItem {
   id: string;
@@ -61,6 +67,8 @@ interface NavbarProps {
   onCategoryChange?: (cat: string) => void;
   categories?: string[];
   categoryRecords?: CategoryRecord[];
+  products?: ProductItem[];
+  onOpenCategoryModal?: () => void;
   profile: BusinessProfile;
   viewMode: 'customer' | 'merchant';
   onToggleViewMode: (mode: 'customer' | 'merchant') => void;
@@ -86,6 +94,8 @@ export const Navbar: React.FC<NavbarProps> = ({
   onCategoryChange,
   categories = [],
   categoryRecords = [],
+  products,
+  onOpenCategoryModal,
   profile,
   viewMode,
   onToggleViewMode,
@@ -247,18 +257,53 @@ export const Navbar: React.FC<NavbarProps> = ({
       ? resellerDropdownItems
       : customerDropdownItems;
 
-  // Build top categories bar from active Level-1 CategoryRecords + always include Upcoming Viral Products | Coming Soon
-  const topLevelRecordNames = categoryRecords
-    .filter((c) => c.isActive !== false && !c.parentCategoryId && !c.isUpcoming && c.id !== UPCOMING_CATEGORY_ID)
+  // Build visible top categories bar: show ONLY categories/subcategories/child categories that already have >= 1 product
+  const hasProductsList = Array.isArray(products);
+  const upcomingProductsCount = hasProductsList
+    ? products.filter((p) => isProductPurchaseBlocked(p)).length
+    : 0;
+  const activeTopRecords = categoryRecords.filter(
+    (c) => c.isActive !== false && !c.parentCategoryId && !c.isUpcoming && c.id !== UPCOMING_CATEGORY_ID
+  );
+  const visibleTopRecordNames = activeTopRecords
+    .filter((c) =>
+      hasProductsList
+        ? products.some((p) => doesProductMatchCategoryFilter(p, c.id, categoryRecords))
+        : true
+    )
     .map((c) => c.name.trim())
     .filter(Boolean);
+
+  const unmappedProductTopNames = hasProductsList
+    ? Array.from(
+        new Set(
+          products
+            .filter((p) => !isProductPurchaseBlocked(p))
+            .map((p) => (p.category || '').split('>')[0]?.trim())
+            .filter(
+              (topName): topName is string =>
+                Boolean(topName) &&
+                !activeTopRecords.some((c) => normalizeTextKey(c.name) === normalizeTextKey(topName))
+            )
+        )
+      )
+    : [];
+
   const displayCategories = Array.from(
-    new Set([
-      'All Categories',
-      UPCOMING_CATEGORY_NAME,
-      ...(topLevelRecordNames.length > 0 ? topLevelRecordNames : categories.map((c) => c.split('>')[0].trim())),
-    ].filter((c) => c && c !== 'All'))
+    new Set(
+      [
+        'All Categories',
+        ...(hasProductsList ? (upcomingProductsCount > 0 ? [UPCOMING_CATEGORY_NAME] : []) : [UPCOMING_CATEGORY_NAME]),
+        ...(hasProductsList
+          ? [...visibleTopRecordNames, ...unmappedProductTopNames]
+          : visibleTopRecordNames.length > 0
+          ? visibleTopRecordNames
+          : categories.map((c) => c.split('>')[0].trim())),
+      ].filter((c) => c && c !== 'All')
+    )
   );
+  const canEditCategoriesOnTime =
+    isAuthenticated && (userRole === 'super_admin' || userRole === 'admin' || userRole === 'manager') && Boolean(onOpenCategoryModal);
 
   return (
     <header className="sticky top-0 z-40 flex flex-col no-print shadow-xs bg-white dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800 transition-colors">
@@ -584,12 +629,26 @@ export const Navbar: React.FC<NavbarProps> = ({
                   </div>
                 )}
 
-                {/* Visible Store Categories & Subcategories inside More Services for ALL users */}
-                {displayCategories.length > 0 && (
+                {/* Visible Store Categories & Subcategories (Populated Only) + Edit On Time for Admin/Manager */}
+                {(displayCategories.length > 0 || canEditCategoriesOnTime) && (
                   <div className="border-t border-slate-100 dark:border-slate-800 mt-1 pt-1.5 pb-1">
-                    <div className="px-3 py-1 text-[10px] font-black uppercase tracking-wider text-amber-600 dark:text-amber-400 flex items-center justify-between">
+                    <div className="px-3 py-1 text-[10px] font-black uppercase tracking-wider text-amber-600 dark:text-amber-400 flex items-center justify-between gap-2">
                       <span>Store Categories (کیٹگریز)</span>
-                      <span className="font-mono text-[10px] text-slate-400">{displayCategories.length}</span>
+                      <div className="flex items-center gap-2">
+                        {canEditCategoriesOnTime && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setIsMoreOpen(false);
+                              onOpenCategoryModal?.();
+                            }}
+                            className="text-[10px] font-bold normal-case px-1.5 py-0.5 rounded bg-amber-100 dark:bg-amber-950/60 text-amber-800 dark:text-amber-300 hover:bg-amber-200 cursor-pointer"
+                          >
+                            Edit All
+                          </button>
+                        )}
+                        <span className="font-mono text-[10px] text-slate-400">{displayCategories.length}</span>
+                      </div>
                     </div>
                     <div className="space-y-0.5">
                       {displayCategories.map((cat) => {
@@ -598,11 +657,17 @@ export const Navbar: React.FC<NavbarProps> = ({
                           (r) =>
                             r.isActive !== false &&
                             !r.parentCategoryId &&
-                            r.name.trim().toLowerCase() === cat.trim().toLowerCase()
+                            normalizeTextKey(r.name) === normalizeTextKey(cat)
                         );
                         const childSubcats = matchingTopRecord
                           ? categoryRecords.filter(
-                              (sub) => sub.isActive !== false && sub.parentCategoryId === matchingTopRecord.id
+                              (sub) =>
+                                sub.isActive !== false &&
+                                sub.parentCategoryId === matchingTopRecord.id &&
+                                (!hasProductsList ||
+                                  products.some((p) =>
+                                    doesProductMatchCategoryFilter(p, sub.id, categoryRecords)
+                                  ))
                             )
                           : [];
 
@@ -629,22 +694,50 @@ export const Navbar: React.FC<NavbarProps> = ({
 
                             {childSubcats.length > 0 && (
                               <div className="pl-7 pr-3 pb-1 flex flex-wrap gap-1">
-                                {childSubcats.map((sub) => (
-                                  <button
-                                    key={sub.id}
-                                    type="button"
-                                    onClick={() => {
-                                      onCategoryChange?.(sub.name);
-                                      if (currentTab !== 'store') {
-                                        onTabChange('store');
-                                      }
-                                      setIsMoreOpen(false);
-                                    }}
-                                    className="px-2 py-0.5 text-[10px] rounded bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:bg-amber-100 dark:hover:bg-amber-950 cursor-pointer"
-                                  >
-                                    {sub.name}
-                                  </button>
-                                ))}
+                                {childSubcats.map((sub) => {
+                                  const leafChildren = categoryRecords.filter(
+                                    (ch) =>
+                                      ch.isActive !== false &&
+                                      ch.parentCategoryId === sub.id &&
+                                      (!hasProductsList ||
+                                        products.some((p) =>
+                                          doesProductMatchCategoryFilter(p, ch.id, categoryRecords)
+                                        ))
+                                  );
+                                  return (
+                                    <React.Fragment key={sub.id}>
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          onCategoryChange?.(sub.name);
+                                          if (currentTab !== 'store') {
+                                            onTabChange('store');
+                                          }
+                                          setIsMoreOpen(false);
+                                        }}
+                                        className="px-2 py-0.5 text-[10px] rounded bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:bg-amber-100 dark:hover:bg-amber-950 cursor-pointer"
+                                      >
+                                        {sub.name}
+                                      </button>
+                                      {leafChildren.map((ch) => (
+                                        <button
+                                          key={ch.id}
+                                          type="button"
+                                          onClick={() => {
+                                            onCategoryChange?.(ch.name);
+                                            if (currentTab !== 'store') {
+                                              onTabChange('store');
+                                            }
+                                            setIsMoreOpen(false);
+                                          }}
+                                          className="px-2 py-0.5 text-[10px] rounded bg-amber-50/70 dark:bg-amber-950/30 text-amber-800 dark:text-amber-300 hover:bg-amber-100 dark:hover:bg-amber-900/50 cursor-pointer"
+                                        >
+                                          • {ch.name}
+                                        </button>
+                                      ))}
+                                    </React.Fragment>
+                                  );
+                                })}
                               </div>
                             )}
                           </div>

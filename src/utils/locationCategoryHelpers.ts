@@ -217,6 +217,9 @@ export function doesProductMatchCategoryFilter(
     if (targetCat.isUpcoming || targetCat.id === UPCOMING_CATEGORY_ID) {
       return isProductPurchaseBlocked(product);
     }
+    if (isProductPurchaseBlocked(product)) {
+      return false;
+    }
 
     const descendantIds = getCategoryDescendantIds(allCategories, targetCat.id);
     const descendantNames = new Set<string>();
