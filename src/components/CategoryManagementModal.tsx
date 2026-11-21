@@ -16,7 +16,7 @@ import {
   Power,
   Check,
 } from 'lucide-react';
-import { CategoryRecord, ProductItem } from '../types';
+import { CategoryRecord, ProductItem } from '../types/index.ts';
 import {
   apiDeleteCategoryRecord,
   apiSaveCategoryRecord,
@@ -25,7 +25,7 @@ import {
   getCategoryRecords,
   saveCategoryRecords,
   saveProducts,
-} from '../utils/storage';
+} from '../utils/storage.ts';
 import {
   computeCategoryLevel,
   doesProductMatchCategoryFilter,
@@ -35,7 +35,7 @@ import {
   normalizeTextKey,
   slugifyId,
   UPCOMING_CATEGORY_ID,
-} from '../utils/locationCategoryHelpers';
+} from '../utils/locationCategoryHelpers.ts';
 
 interface CategoryManagementModalProps {
   isOpen: boolean;

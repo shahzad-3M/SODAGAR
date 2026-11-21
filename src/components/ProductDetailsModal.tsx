@@ -24,8 +24,8 @@ import {
   PlusCircle,
   Ruler,
 } from 'lucide-react';
-import { AppUser, BusinessProfile, Customer, Investor, ProductItem } from '../types';
-import { ProductSpecSizingShowcase } from './ProductSpecSizingShowcase';
+import { AppUser, BusinessProfile, Customer, Investor, ProductItem } from '../types/index.ts';
+import { ProductSpecSizingShowcase } from './ProductSpecSizingShowcase.tsx';
 import {
   buildAddMyProductInvestorMessage,
   buildDirectProductWhatsAppMessage,
@@ -38,9 +38,9 @@ import {
   openWhatsAppDirect,
   parseProductVideoUrl,
   resolveProductInvestorContact,
-} from '../utils/whatsapp';
-import { defaultDeliveryCities } from '../utils/defaultData';
-import { getInvestors } from '../utils/storage';
+} from '../utils/whatsapp.ts';
+import { defaultDeliveryCities } from '../utils/defaultData.ts';
+import { getInvestors } from '../utils/storage.ts';
 import {
   DEFAULT_CITY_CENTER_DELIVERY_CHARGE,
   ensureCityAreasShape,
@@ -53,7 +53,7 @@ import {
   normalizeTextKey,
   resolveExpressAreaAvailability,
   resolveProductOrCartDeliveryCharge,
-} from '../utils/locationCategoryHelpers';
+} from '../utils/locationCategoryHelpers.ts';
 
 interface ProductDetailsModalProps {
   product: ProductItem | null;

@@ -29,15 +29,15 @@ import {
   Truck,
   Lock,
 } from 'lucide-react';
-import { AppUser, BusinessProfile, CartItem, CategoryRecord, Customer, DeliverySpeedCategory, Investor, ProductItem } from '../types';
-import { ProductDetailsModal } from './ProductDetailsModal';
+import { AppUser, BusinessProfile, CartItem, CategoryRecord, Customer, DeliverySpeedCategory, Investor, ProductItem } from '../types/index.ts';
+import { ProductDetailsModal } from './ProductDetailsModal.tsx';
 import {
   buildDirectProductWhatsAppMessage,
   buildInvestorProductInquiryMessage,
   openWhatsAppDirect,
   resolveProductInvestorContact,
-} from '../utils/whatsapp';
-import { getCategoryRecords, getInvestors } from '../utils/storage';
+} from '../utils/whatsapp.ts';
+import { getCategoryRecords, getInvestors } from '../utils/storage.ts';
 import {
   UPCOMING_CATEGORY_ID,
   UPCOMING_CATEGORY_NAME,
@@ -45,7 +45,7 @@ import {
   getProductDeliveryMeta,
   isProductPurchaseBlocked,
   normalizeTextKey,
-} from '../utils/locationCategoryHelpers';
+} from '../utils/locationCategoryHelpers.ts';
 
 interface StoreCatalogViewProps {
   products: ProductItem[];

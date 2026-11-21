@@ -38,18 +38,18 @@ import {
   ProductItem,
   Reseller,
   Transaction,
-} from '../types';
+} from '../types/index.ts';
 import {
   getCommissionRecords,
   getWalkInSales,
   getWasalSettlements,
-} from '../utils/storage';
+} from '../utils/storage.ts';
 import {
   ConfirmDialogModal,
   ConfirmDialogState,
   ToastBanner,
   ToastMessage,
-} from './AppDialogs';
+} from './AppDialogs.tsx';
 
 interface FinancialMasterViewProps {
   transactions: Transaction[];

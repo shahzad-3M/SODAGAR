@@ -55,13 +55,13 @@ import {
   Customer,
   Customer360Profile,
   ProductItem,
-} from '../types';
+} from '../types/index.ts';
 import {
   ALL_AUTO_SEGMENTS,
   CRM_REPORT_CATALOG,
   CRM_WHATSAPP_TEMPLATES,
   renderCrmWhatsAppTemplate,
-} from '../utils/crmEngine';
+} from '../utils/crmEngine.ts';
 import {
   CRMStateBundle,
   apiConvertCrmLead,
@@ -84,8 +84,8 @@ import {
   apiSaveCrmTicket,
   apiUpdateCrmCustomer,
   downloadCrmReportFile,
-} from '../utils/storage';
-import { openWhatsAppDirect } from '../utils/whatsapp';
+} from '../utils/storage.ts';
+import { openWhatsAppDirect } from '../utils/whatsapp.ts';
 
 interface CRMWorkspaceViewProps {
   currentUser: AppUser;

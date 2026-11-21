@@ -15,14 +15,14 @@ import {
   Search,
   Pencil,
 } from 'lucide-react';
-import { BusinessProfile, Reseller } from '../types';
-import { openWhatsAppDirect } from '../utils/whatsapp';
+import { BusinessProfile, Reseller } from '../types/index.ts';
+import { openWhatsAppDirect } from '../utils/whatsapp.ts';
 import {
   ToastBanner,
   ToastMessage,
   InputPromptModal,
   InputPromptState,
-} from './AppDialogs';
+} from './AppDialogs.tsx';
 
 interface ResellersViewProps {
   resellers: Reseller[];

@@ -32,9 +32,9 @@ import {
   Tag,
   HeartHandshake,
 } from 'lucide-react';
-import { AppUser, BusinessProfile, CategoryRecord, UserRole } from '../types';
-import { openWhatsAppDirect } from '../utils/whatsapp';
-import { UPCOMING_CATEGORY_ID, UPCOMING_CATEGORY_NAME } from '../utils/locationCategoryHelpers';
+import { AppUser, BusinessProfile, CategoryRecord, UserRole } from '../types/index.ts';
+import { openWhatsAppDirect } from '../utils/whatsapp.ts';
+import { UPCOMING_CATEGORY_ID, UPCOMING_CATEGORY_NAME } from '../utils/locationCategoryHelpers.ts';
 
 export interface NavItem {
   id: string;

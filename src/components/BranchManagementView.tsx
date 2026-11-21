@@ -35,7 +35,7 @@ import {
   ManagerAuthorities,
   UserRole,
   AppUser,
-} from '../types';
+} from '../types/index.ts';
 import {
   getBranches,
   saveBranches,
@@ -50,9 +50,9 @@ import {
   saveCommissionRecords,
   getWalkInSales,
   calculateSalespersonCommission,
-} from '../utils/storage';
-import { createPasswordRecord } from '../utils/security';
-import { ToastBanner, ToastMessage } from './AppDialogs';
+} from '../utils/storage.ts';
+import { createPasswordRecord } from '../utils/security.ts';
+import { ToastBanner, ToastMessage } from './AppDialogs.tsx';
 
 interface BranchManagementViewProps {
   currentUserRole: UserRole;

@@ -20,8 +20,8 @@ import {
   Trash2,
   Minus,
 } from 'lucide-react';
-import { AppUser, BusinessProfile, CartItem, Customer, DeliveryCityConfig, PaymentMode, SalePaymentType } from '../types';
-import { defaultDeliveryCities } from '../utils/defaultData';
+import { AppUser, BusinessProfile, CartItem, Customer, DeliveryCityConfig, PaymentMode, SalePaymentType } from '../types/index.ts';
+import { defaultDeliveryCities } from '../utils/defaultData.ts';
 import {
   DEFAULT_CITY_CENTER_DELIVERY_CHARGE,
   ensureCityAreasShape,
@@ -34,9 +34,9 @@ import {
   resolveExpressAreaAvailability,
   resolveProductOrCartDeliveryCharge,
   slugifyId,
-} from '../utils/locationCategoryHelpers';
-import { apiAddCity, apiDeleteCity, apiToggleOtherCities, apiUpdateCity } from '../utils/storage';
-import { AddressFieldsGroup } from './AddressFieldsGroup';
+} from '../utils/locationCategoryHelpers.ts';
+import { apiAddCity, apiDeleteCity, apiToggleOtherCities, apiUpdateCity } from '../utils/storage.ts';
+import { AddressFieldsGroup } from './AddressFieldsGroup.tsx';
 
 export interface CheckoutSalePayload {
   customerId: string;

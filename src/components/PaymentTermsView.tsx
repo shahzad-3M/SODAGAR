@@ -14,8 +14,8 @@ import {
   ArrowRight,
   RefreshCw,
 } from 'lucide-react';
-import { BusinessProfile, Customer, ReminderTemplate, Transaction, WhatsAppNotification } from '../types';
-import { formatPaymentChannelsText, openWhatsAppDirect } from '../utils/whatsapp';
+import { BusinessProfile, Customer, ReminderTemplate, Transaction, WhatsAppNotification } from '../types/index.ts';
+import { formatPaymentChannelsText, openWhatsAppDirect } from '../utils/whatsapp.ts';
 
 interface PaymentTermsViewProps {
   transactions: Transaction[];

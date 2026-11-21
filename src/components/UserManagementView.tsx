@@ -24,7 +24,7 @@ import {
   Sparkles,
   Edit3,
 } from 'lucide-react';
-import { CRMPermissions, CRMRoleSpecialization, LoginFormConfig, LoginAuditRecord, UserAccount, UserRole } from '../types';
+import { CRMPermissions, CRMRoleSpecialization, LoginFormConfig, LoginAuditRecord, UserAccount, UserRole } from '../types/index.ts';
 import {
   createUserAccount,
   getLoginAudits,
@@ -34,8 +34,8 @@ import {
   saveLoginFormConfig,
   updateUserAccount,
   apiAdminResetPassword,
-} from '../utils/storage';
-import { createPasswordRecord } from '../utils/security';
+} from '../utils/storage.ts';
+import { createPasswordRecord } from '../utils/security.ts';
 
 const CRM_ROLE_LABELS: Array<{ value: CRMRoleSpecialization; label: string }> = [
   { value: 'administrator', label: 'Administrator (Full CRM Access)' },

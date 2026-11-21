@@ -29,9 +29,9 @@ import {
   ReminderTemplate,
   ReviewRewardSubmission,
   TopBuyer,
-} from '../types';
-import { buildLuckyDrawWinnerMessage, openWhatsAppDirect } from '../utils/whatsapp';
-import { conductLuckyDraw } from '../utils/automationEngine';
+} from '../types/index.ts';
+import { buildLuckyDrawWinnerMessage, openWhatsAppDirect } from '../utils/whatsapp.ts';
+import { conductLuckyDraw } from '../utils/automationEngine.ts';
 
 interface LuckyDrawViewProps {
   topBuyers: TopBuyer[];

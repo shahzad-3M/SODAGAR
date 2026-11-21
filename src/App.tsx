@@ -30,7 +30,7 @@ import {
   TransactionAuditEntry,
   UserRole,
   WhatsAppNotification,
-} from './types';
+} from './types/index.ts';
 import {
   defaultCustomerUser,
   getActiveRole,
@@ -85,14 +85,14 @@ import {
   getMonthlyExpenses,
   saveMonthlyExpenses,
   apiLogCrmActivity,
-} from './utils/storage';
-import { isProductPurchaseBlocked, normalizeTextKey } from './utils/locationCategoryHelpers';
+} from './utils/storage.ts';
+import { isProductPurchaseBlocked, normalizeTextKey } from './utils/locationCategoryHelpers.ts';
 import {
   buildCustomerPaymentReminderMessage,
   buildSaleInvoiceMessage,
   formatPaymentChannelsText,
   openWhatsAppDirect,
-} from './utils/whatsapp';
+} from './utils/whatsapp.ts';
 import {
   computeTopBuyers,
   generateMonthlyRemindersBatch,
@@ -101,40 +101,40 @@ import {
   generateSegmentedBroadcastBatch,
   generateWeeklyDueRemindersBatch,
   runRecurringInvoicesCheck,
-} from './utils/automationEngine';
-import { Navbar } from './components/Navbar';
-import { StoreCatalogView } from './components/StoreCatalogView';
-import { MonthlyStatementView } from './components/MonthlyStatementView';
-import { InventoryView } from './components/InventoryView';
-import { PaymentTermsView } from './components/PaymentTermsView';
-import { LuckyDrawView } from './components/LuckyDrawView';
-import { CODOrdersView } from './components/CODOrdersView';
-import { HRManagementView } from './components/HRManagementView';
-import { ResellersView } from './components/ResellersView';
-import { LoginRoleModal } from './components/LoginRoleModal';
-import { DashboardView } from './components/DashboardView';
-import { CustomersView } from './components/CustomersView';
-import { RecurringInvoicesView } from './components/RecurringInvoicesView';
-import { WhatsAppAutomationView } from './components/WhatsAppAutomationView';
-import { ReportsView } from './components/ReportsView';
-import { TransactionHistoryView } from './components/TransactionHistoryView';
-import { SettingsView } from './components/SettingsView';
-import { CheckoutModal, CheckoutSalePayload } from './components/CheckoutModal';
-import { AddTransactionModal } from './components/AddTransactionModal';
-import { AddCustomerModal } from './components/AddCustomerModal';
-import { ScheduleWhatsAppModal } from './components/ScheduleWhatsAppModal';
-import { AddRecurringInvoiceModal } from './components/AddRecurringInvoiceModal';
-import { ProductBroadcastModal } from './components/ProductBroadcastModal';
-import { InvoiceModal } from './components/InvoiceModal';
-import { UserManagementView } from './components/UserManagementView';
-import { InvestorManagementView } from './components/InvestorManagementView';
-import { CustomerPortalView } from './components/CustomerPortalView';
-import { CategoryManagementModal } from './components/CategoryManagementModal';
-import { BranchManagementView } from './components/BranchManagementView';
-import { WalkInSalesView } from './components/WalkInSalesView';
-import { ProductImporterModal } from './components/ProductImporterModal';
-import { FinancialMasterView } from './components/FinancialMasterView';
-import { CRMWorkspaceView } from './components/CRMWorkspaceView';
+} from './utils/automationEngine.ts';
+import { Navbar } from './components/Navbar.tsx';
+import { StoreCatalogView } from './components/StoreCatalogView.tsx';
+import { MonthlyStatementView } from './components/MonthlyStatementView.tsx';
+import { InventoryView } from './components/InventoryView.tsx';
+import { PaymentTermsView } from './components/PaymentTermsView.tsx';
+import { LuckyDrawView } from './components/LuckyDrawView.tsx';
+import { CODOrdersView } from './components/CODOrdersView.tsx';
+import { HRManagementView } from './components/HRManagementView.tsx';
+import { ResellersView } from './components/ResellersView.tsx';
+import { LoginRoleModal } from './components/LoginRoleModal.tsx';
+import { DashboardView } from './components/DashboardView.tsx';
+import { CustomersView } from './components/CustomersView.tsx';
+import { RecurringInvoicesView } from './components/RecurringInvoicesView.tsx';
+import { WhatsAppAutomationView } from './components/WhatsAppAutomationView.tsx';
+import { ReportsView } from './components/ReportsView.tsx';
+import { TransactionHistoryView } from './components/TransactionHistoryView.tsx';
+import { SettingsView } from './components/SettingsView.tsx';
+import { CheckoutModal, CheckoutSalePayload } from './components/CheckoutModal.tsx';
+import { AddTransactionModal } from './components/AddTransactionModal.tsx';
+import { AddCustomerModal } from './components/AddCustomerModal.tsx';
+import { ScheduleWhatsAppModal } from './components/ScheduleWhatsAppModal.tsx';
+import { AddRecurringInvoiceModal } from './components/AddRecurringInvoiceModal.tsx';
+import { ProductBroadcastModal } from './components/ProductBroadcastModal.tsx';
+import { InvoiceModal } from './components/InvoiceModal.tsx';
+import { UserManagementView } from './components/UserManagementView.tsx';
+import { InvestorManagementView } from './components/InvestorManagementView.tsx';
+import { CustomerPortalView } from './components/CustomerPortalView.tsx';
+import { CategoryManagementModal } from './components/CategoryManagementModal.tsx';
+import { BranchManagementView } from './components/BranchManagementView.tsx';
+import { WalkInSalesView } from './components/WalkInSalesView.tsx';
+import { ProductImporterModal } from './components/ProductImporterModal.tsx';
+import { FinancialMasterView } from './components/FinancialMasterView.tsx';
+import { CRMWorkspaceView } from './components/CRMWorkspaceView.tsx';
 import {
   ToastBanner,
   ToastMessage,
@@ -142,7 +142,7 @@ import {
   ConfirmDialogState,
   InputPromptModal,
   InputPromptState,
-} from './components/AppDialogs';
+} from './components/AppDialogs.tsx';
 
 export default function App() {
   // Main Data States

@@ -18,10 +18,10 @@ import {
   ChevronLeft,
   ChevronRight,
 } from 'lucide-react';
-import { BusinessProfile, Customer, Transaction } from '../types';
-import { defaultDeliveryCities } from '../utils/defaultData';
-import { AddressFieldsGroup } from './AddressFieldsGroup';
-import { openWhatsAppDirect, formatPaymentChannelsText } from '../utils/whatsapp';
+import { BusinessProfile, Customer, Transaction } from '../types/index.ts';
+import { defaultDeliveryCities } from '../utils/defaultData.ts';
+import { AddressFieldsGroup } from './AddressFieldsGroup.tsx';
+import { openWhatsAppDirect, formatPaymentChannelsText } from '../utils/whatsapp.ts';
 
 interface CustomersViewProps {
   customers: Customer[];

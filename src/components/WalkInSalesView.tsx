@@ -35,7 +35,7 @@ import {
   PaymentMode,
   SalespersonReferral,
   CommissionRecord,
-} from '../types';
+} from '../types/index.ts';
 import {
   getBranches,
   getWalkInCustomers,
@@ -48,10 +48,10 @@ import {
   saveCommissionRecords,
   calculateSalespersonCommission,
   apiLogCrmActivity,
-} from '../utils/storage';
-import { openWhatsAppDirect } from '../utils/whatsapp';
-import { isProductPurchaseBlocked } from '../utils/locationCategoryHelpers';
-import { ToastBanner, ToastMessage } from './AppDialogs';
+} from '../utils/storage.ts';
+import { openWhatsAppDirect } from '../utils/whatsapp.ts';
+import { isProductPurchaseBlocked } from '../utils/locationCategoryHelpers.ts';
+import { ToastBanner, ToastMessage } from './AppDialogs.tsx';
 
 interface WalkInSalesViewProps {
   products: ProductItem[];

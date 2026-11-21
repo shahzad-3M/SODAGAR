@@ -29,7 +29,7 @@ import {
   ReviewRewardSubmission,
   Transaction,
   UserAccount,
-} from '../types';
+} from '../types/index.ts';
 import {
   defaultAttendance,
   defaultBranches,
@@ -60,7 +60,7 @@ import {
   defaultWalkInSales,
   defaultWasalSettlements,
   defaultWhatsAppNotifications,
-} from '../utils/defaultData';
+} from '../utils/defaultData.ts';
 import {
   computeCategoryLevel,
   ensureCityAreasShape,
@@ -74,7 +74,7 @@ import {
   slugifyId,
   UPCOMING_CATEGORY_ID,
   UPCOMING_CATEGORY_NAME,
-} from '../utils/locationCategoryHelpers';
+} from '../utils/locationCategoryHelpers.ts';
 
 const DATA_DIR = path.resolve(process.cwd(), 'data');
 const BACKUP_DIR = path.join(DATA_DIR, 'backups');

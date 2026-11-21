@@ -4,7 +4,6 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import express, { NextFunction, Request, Response } from 'express';
-import { createServer as createViteServer } from 'vite';
 import {
   BusinessProfile,
   CategoryRecord,
@@ -49,7 +48,7 @@ import {
   UPCOMING_CATEGORY_NAME,
 } from './src/utils/locationCategoryHelpers';
 import {
-  ActorContext,
+  type ActorContext,
   adjustCustomerLoyaltyPoints,
   auditAndRepairOrderHistory,
   createVerifiedBackup,
@@ -110,7 +109,7 @@ import {
   computeProductCustomerIntelligence,
   CRM_REPORT_CATALOG,
   CRM_WHATSAPP_TEMPLATES,
-  CRMReportKey,
+  type CRMReportKey,
   generateCrmReportDataset,
   normalizeDigits as normalizePhoneDigits,
   renderCrmWhatsAppTemplate,
@@ -397,6 +396,7 @@ async function startServer() {
   getDb();
 
   const app = express();
+  app.set('trust proxy', 1);
   app.use(express.json({ limit: '25mb' }));
 
   // Serve downloaded & verified imported product images cleanly from local server storage
@@ -3759,13 +3759,27 @@ async function startServer() {
   });
 
   const httpServer = http.createServer(app);
-  let viteInstance: Awaited<ReturnType<typeof createViteServer>> | null = null;
+  let viteInstance: { close: () => Promise<void>; middlewares: express.RequestHandler } | null = null;
+
+  const distDirCandidates = [
+    path.resolve(process.cwd(), 'dist'),
+    path.resolve(__dirname, 'dist'),
+  ];
+  const distDir =
+    distDirCandidates.find((dir) => fs.existsSync(path.join(dir, 'index.html'))) || distDirCandidates[0];
+  const hasBuiltDist = fs.existsSync(path.join(distDir, 'index.html'));
+  const isProduction =
+    process.env.NODE_ENV === 'production' ||
+    Boolean(process.env.K_SERVICE) ||
+    (process.env.NODE_ENV !== 'development' && hasBuiltDist);
 
   // Frontend middleware / static dist serving
-  if (process.env.NODE_ENV !== 'production') {
+  if (!isProduction || !hasBuiltDist) {
+    const { createServer: createViteServer } = await import('vite');
     const vitePromise = createViteServer({
       server: {
         middlewareMode: true,
+        allowedHosts: true,
         hmr: process.env.DISABLE_HMR === 'true' ? false : { server: httpServer },
       },
       appType: 'spa',
@@ -3779,17 +3793,16 @@ async function startServer() {
         .catch(next);
     });
   } else {
-    const distDir = path.resolve(process.cwd(), 'dist');
-    if (fs.existsSync(distDir)) {
-      app.use(express.static(distDir));
-      app.get('*', (_req, res) => {
-        res.sendFile(path.join(distDir, 'index.html'));
-      });
-    }
+    app.use(express.static(distDir, { index: 'index.html' }));
+    app.get('*', (_req, res) => {
+      res.sendFile(path.join(distDir, 'index.html'));
+    });
   }
 
   httpServer.listen(PORT, HOST, () => {
-    console.log(`100DAGAR Full-Stack Server running on http://${HOST}:${PORT}`);
+    console.log(
+      `100DAGAR Full-Stack Server running on http://${HOST}:${PORT} (${isProduction && hasBuiltDist ? 'production-dist' : 'vite-dev'})`
+    );
   });
 
   const shutdown = () => {

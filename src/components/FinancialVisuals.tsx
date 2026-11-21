@@ -8,8 +8,8 @@ import {
   ArrowDownLeft,
   Calendar,
 } from 'lucide-react';
-import { BusinessProfile, Customer, Transaction } from '../types';
-import { calculateDaysOverdue } from '../utils/whatsapp';
+import { BusinessProfile, Customer, Transaction } from '../types/index.ts';
+import { calculateDaysOverdue } from '../utils/whatsapp.ts';
 
 interface FinancialVisualsProps {
   transactions: Transaction[];

@@ -23,10 +23,10 @@ import {
   ShieldCheck,
   Wallet,
 } from 'lucide-react';
-import { BusinessProfile, CODOrder, Customer, ProductItem, Transaction } from '../types';
-import { calculateDaysOverdue, openWhatsAppDirect, formatPaymentChannelsText } from '../utils/whatsapp';
-import { getWasalSettlements } from '../utils/storage';
-import { FinancialVisuals } from './FinancialVisuals';
+import { BusinessProfile, CODOrder, Customer, ProductItem, Transaction } from '../types/index.ts';
+import { calculateDaysOverdue, openWhatsAppDirect, formatPaymentChannelsText } from '../utils/whatsapp.ts';
+import { getWasalSettlements } from '../utils/storage.ts';
+import { FinancialVisuals } from './FinancialVisuals.tsx';
 
 interface ReportsViewProps {
   transactions: Transaction[];

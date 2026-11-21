@@ -1,8 +1,8 @@
 import React, { useState } from 'react';
 import { X, UserPlus, Phone } from 'lucide-react';
-import { BusinessProfile, Customer, CustomerType } from '../types';
-import { defaultDeliveryCities } from '../utils/defaultData';
-import { AddressFieldsGroup } from './AddressFieldsGroup';
+import { BusinessProfile, Customer, CustomerType } from '../types/index.ts';
+import { defaultDeliveryCities } from '../utils/defaultData.ts';
+import { AddressFieldsGroup } from './AddressFieldsGroup.tsx';
 
 interface AddCustomerModalProps {
   isOpen: boolean;

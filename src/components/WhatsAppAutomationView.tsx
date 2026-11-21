@@ -25,9 +25,9 @@ import {
   ReminderTemplate,
   SavedBroadcastCampaign,
   WhatsAppNotification,
-} from '../types';
-import { openWhatsAppDirect, formatPaymentChannelsText } from '../utils/whatsapp';
-import { ToastBanner, ToastMessage } from './AppDialogs';
+} from '../types/index.ts';
+import { openWhatsAppDirect, formatPaymentChannelsText } from '../utils/whatsapp.ts';
+import { ToastBanner, ToastMessage } from './AppDialogs.tsx';
 
 interface WhatsAppAutomationViewProps {
   notifications: WhatsAppNotification[];

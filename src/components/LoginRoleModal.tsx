@@ -17,7 +17,7 @@ import {
   ArrowLeft,
   CheckCircle2,
 } from 'lucide-react';
-import { AppUser, Customer, LoginFormConfig, Reseller, UserAccount, UserRole } from '../types';
+import { AppUser, Customer, LoginFormConfig, Reseller, UserAccount, UserRole } from '../types/index.ts';
 import {
   defaultGuestUser,
   getDefaultPinForPhone,
@@ -27,8 +27,8 @@ import {
   apiRegisterCustomer,
   apiChangeOwnPassword,
   apiChangeMasterPin,
-} from '../utils/storage';
-import { openWhatsAppDirect } from '../utils/whatsapp';
+} from '../utils/storage.ts';
+import { openWhatsAppDirect } from '../utils/whatsapp.ts';
 
 function normalizePhoneOrId(val: string): string {
   const clean = val.trim().replace(/[\s-]/g, '');

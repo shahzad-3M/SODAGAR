@@ -1,12 +1,12 @@
 import React, { useMemo, useState } from 'react';
 import { FolderTree, Search, Layers } from 'lucide-react';
-import { CategoryRecord } from '../types';
+import { CategoryRecord } from '../types/index.ts';
 import {
   computeCategoryLevel,
   getCategoryBreadcrumb,
   isUpcomingCategoryName,
   UPCOMING_CATEGORY_ID,
-} from '../utils/locationCategoryHelpers';
+} from '../utils/locationCategoryHelpers.ts';
 
 interface CategoryCascadingSelectProps {
   categories: CategoryRecord[];

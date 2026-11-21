@@ -18,9 +18,9 @@ import {
   Customer,
   ProductBroadcast,
   ReminderTemplate,
-} from '../types';
-import { BroadcastSegmentFilters } from '../utils/automationEngine';
-import { buildProductBroadcastMessage, openWhatsAppDirect } from '../utils/whatsapp';
+} from '../types/index.ts';
+import { BroadcastSegmentFilters } from '../utils/automationEngine.ts';
+import { buildProductBroadcastMessage, openWhatsAppDirect } from '../utils/whatsapp.ts';
 
 interface ProductBroadcastModalProps {
   isOpen: boolean;

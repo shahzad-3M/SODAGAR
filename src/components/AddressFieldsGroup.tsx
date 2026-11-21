@@ -1,12 +1,12 @@
 import React, { useMemo, useState } from 'react';
 import { MapPin, Navigation, Home, Building2, Lock, Zap, CheckCircle2, Globe2 } from 'lucide-react';
-import { DeliveryCityConfig } from '../types';
+import { DeliveryCityConfig } from '../types/index.ts';
 import {
   getOrderedProvincesFromCities,
   inferProvinceForCity,
   isMuzaffarabadCity,
   normalizeTextKey,
-} from '../utils/locationCategoryHelpers';
+} from '../utils/locationCategoryHelpers.ts';
 
 interface AddressFieldsGroupProps {
   cities: DeliveryCityConfig[];

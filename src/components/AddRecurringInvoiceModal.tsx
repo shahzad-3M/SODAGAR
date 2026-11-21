@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { X, Repeat, Plus, Trash2 } from 'lucide-react';
-import { BusinessProfile, Customer, RecurringFrequency, RecurringInvoice } from '../types';
+import { BusinessProfile, Customer, RecurringFrequency, RecurringInvoice } from '../types/index.ts';
 
 interface AddRecurringInvoiceModalProps {
   isOpen: boolean;

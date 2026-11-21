@@ -27,9 +27,9 @@ import {
   MonthlyCustomerStatement,
   Transaction,
   UserRole,
-} from '../types';
-import { generateMonthlyCustomerStatements } from '../utils/automationEngine';
-import { buildMonthlyStatementWhatsAppMessage, openWhatsAppDirect } from '../utils/whatsapp';
+} from '../types/index.ts';
+import { generateMonthlyCustomerStatements } from '../utils/automationEngine.ts';
+import { buildMonthlyStatementWhatsAppMessage, openWhatsAppDirect } from '../utils/whatsapp.ts';
 
 interface MonthlyStatementViewProps {
   customers: Customer[];

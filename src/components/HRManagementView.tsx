@@ -26,14 +26,14 @@ import {
   BusinessProfile,
   Employee,
   EmployeeRole,
-} from '../types';
-import { openWhatsAppDirect } from '../utils/whatsapp';
+} from '../types/index.ts';
+import { openWhatsAppDirect } from '../utils/whatsapp.ts';
 import {
   ToastBanner,
   ToastMessage,
   ConfirmDialogModal,
   ConfirmDialogState,
-} from './AppDialogs';
+} from './AppDialogs.tsx';
 
 interface HRManagementViewProps {
   employees: Employee[];

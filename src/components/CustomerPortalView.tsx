@@ -23,18 +23,18 @@ import {
   MapPin,
   Edit2,
 } from 'lucide-react';
-import { AppUser, BusinessProfile, Customer, Transaction } from '../types';
-import { defaultDeliveryCities } from '../utils/defaultData';
-import { AddressFieldsGroup } from './AddressFieldsGroup';
+import { AppUser, BusinessProfile, Customer, Transaction } from '../types/index.ts';
+import { defaultDeliveryCities } from '../utils/defaultData.ts';
+import { AddressFieldsGroup } from './AddressFieldsGroup.tsx';
 import {
   createUserAccount,
   getDefaultPinForPhone,
   getUserAccounts,
   updateCustomerPin,
   updateUserAccount,
-} from '../utils/storage';
-import { createPasswordRecord, verifyPassword } from '../utils/security';
-import { openWhatsAppDirect } from '../utils/whatsapp';
+} from '../utils/storage.ts';
+import { createPasswordRecord, verifyPassword } from '../utils/security.ts';
+import { openWhatsAppDirect } from '../utils/whatsapp.ts';
 
 interface CustomerPortalViewProps {
   currentUser: AppUser;

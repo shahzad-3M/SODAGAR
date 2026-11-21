@@ -28,7 +28,7 @@ import {
   Check,
   Ruler,
 } from 'lucide-react';
-import { ProductItem, ProductVariation, ProductImportLog, CategoryRecord, ProductSizeChart } from '../types';
+import { ProductItem, ProductVariation, ProductImportLog, CategoryRecord, ProductSizeChart } from '../types/index.ts';
 import {
   getCategories,
   addCategory,
@@ -37,15 +37,15 @@ import {
   logProductImport,
   apiScrapeProductUrl,
   apiCacheExternalImage,
-} from '../utils/storage';
+} from '../utils/storage.ts';
 import {
   UPCOMING_CATEGORY_ID,
   UPCOMING_CATEGORY_NAME,
   resolveCategoryIdsFromProduct,
   getCategoryBreadcrumb,
-} from '../utils/locationCategoryHelpers';
-import { CategoryCascadingSelect } from './CategoryCascadingSelect';
-import { ProductSpecSizingShowcase } from './ProductSpecSizingShowcase';
+} from '../utils/locationCategoryHelpers.ts';
+import { CategoryCascadingSelect } from './CategoryCascadingSelect.tsx';
+import { ProductSpecSizingShowcase } from './ProductSpecSizingShowcase.tsx';
 
 interface ProductImporterModalProps {
   isOpen: boolean;

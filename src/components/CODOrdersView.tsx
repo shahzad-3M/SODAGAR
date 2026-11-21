@@ -32,24 +32,24 @@ import {
   PaymentMode,
   ProductItem,
   WasalSettlement,
-} from '../types';
-import { openWhatsAppDirect } from '../utils/whatsapp';
-import { getWasalSettlements, saveWasalSettlements } from '../utils/storage';
-import { defaultDeliveryCities } from '../utils/defaultData';
+} from '../types/index.ts';
+import { openWhatsAppDirect } from '../utils/whatsapp.ts';
+import { getWasalSettlements, saveWasalSettlements } from '../utils/storage.ts';
+import { defaultDeliveryCities } from '../utils/defaultData.ts';
 import {
   DEFAULT_CITY_CENTER_DELIVERY_CHARGE,
   getProductDeliveryMeta,
   isProductPurchaseBlocked,
   resolveDeliveryCharge,
   resolveExpressAreaAvailability,
-} from '../utils/locationCategoryHelpers';
-import { AddressFieldsGroup } from './AddressFieldsGroup';
+} from '../utils/locationCategoryHelpers.ts';
+import { AddressFieldsGroup } from './AddressFieldsGroup.tsx';
 import {
   ToastBanner,
   ToastMessage,
   ConfirmDialogModal,
   ConfirmDialogState,
-} from './AppDialogs';
+} from './AppDialogs.tsx';
 
 interface CODOrdersViewProps {
   orders: CODOrder[];

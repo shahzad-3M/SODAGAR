@@ -12,9 +12,9 @@ import {
   ChevronRight,
   Megaphone,
 } from 'lucide-react';
-import { BusinessProfile, Customer, RecurringInvoice, Transaction, WhatsAppNotification } from '../types';
-import { openWhatsAppDirect } from '../utils/whatsapp';
-import { FinancialVisuals } from './FinancialVisuals';
+import { BusinessProfile, Customer, RecurringInvoice, Transaction, WhatsAppNotification } from '../types/index.ts';
+import { openWhatsAppDirect } from '../utils/whatsapp.ts';
+import { FinancialVisuals } from './FinancialVisuals.tsx';
 
 interface DashboardViewProps {
   customers: Customer[];

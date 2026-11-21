@@ -34,8 +34,8 @@ import {
   ChevronRight,
   Database,
 } from 'lucide-react';
-import { BusinessProfile, Customer, DeliveryCityConfig, LoginAuditRecord, Reseller } from '../types';
-import { defaultDeliveryCities } from '../utils/defaultData';
+import { BusinessProfile, Customer, DeliveryCityConfig, LoginAuditRecord, Reseller } from '../types/index.ts';
+import { defaultDeliveryCities } from '../utils/defaultData.ts';
 import {
   exportAllDataJSON,
   importAllDataJSON,
@@ -59,7 +59,7 @@ import {
   apiUpdateCityArea,
   apiDeleteCityArea,
   apiCreateServerBackup,
-} from '../utils/storage';
+} from '../utils/storage.ts';
 import {
   DEFAULT_CITY_CENTER_DELIVERY_CHARGE,
   ensureCityAreasShape,
@@ -68,7 +68,7 @@ import {
   isMuzaffarabadCity,
   normalizeTextKey,
   PAKISTAN_PROVINCES,
-} from '../utils/locationCategoryHelpers';
+} from '../utils/locationCategoryHelpers.ts';
 import {
   ToastBanner,
   ToastMessage,
@@ -76,7 +76,7 @@ import {
   ConfirmDialogState,
   InputPromptModal,
   InputPromptState,
-} from './AppDialogs';
+} from './AppDialogs.tsx';
 
 interface SettingsViewProps {
   profile: BusinessProfile;

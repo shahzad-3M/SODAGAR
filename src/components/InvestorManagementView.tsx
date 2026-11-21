@@ -29,7 +29,7 @@ import {
   ProductItem,
   Reseller,
   UserRole,
-} from '../types';
+} from '../types/index.ts';
 import {
   getDefaultPinForPhone,
   getInvestors,
@@ -39,8 +39,8 @@ import {
   saveInvestorTransactions,
   saveProducts,
   saveResellers,
-} from '../utils/storage';
-import { openWhatsAppDirect } from '../utils/whatsapp';
+} from '../utils/storage.ts';
+import { openWhatsAppDirect } from '../utils/whatsapp.ts';
 
 interface InvestorManagementViewProps {
   currentUser: AppUser;

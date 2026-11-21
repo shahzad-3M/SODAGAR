@@ -22,7 +22,7 @@ import {
   Eye,
   Edit3,
 } from 'lucide-react';
-import { BusinessProfile, Customer, Transaction, TransactionAuditEntry } from '../types';
+import { BusinessProfile, Customer, Transaction, TransactionAuditEntry } from '../types/index.ts';
 
 interface TransactionHistoryViewProps {
   transactions: Transaction[];

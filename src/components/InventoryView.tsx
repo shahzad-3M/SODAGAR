@@ -28,7 +28,7 @@ import {
   Image as ImageIcon,
   Upload,
 } from 'lucide-react';
-import { AppUser, BusinessProfile, CategoryRecord, DeliverySpeedCategory, Investor, ProductDeliveryFeeType, ProductItem, ProductVariation } from '../types';
+import { AppUser, BusinessProfile, CategoryRecord, DeliverySpeedCategory, Investor, ProductDeliveryFeeType, ProductItem, ProductVariation } from '../types/index.ts';
 import {
   getCategories,
   addCategory,
@@ -37,7 +37,7 @@ import {
   apiSaveCategoryRecord,
   apiActivateProductArrival,
   apiCacheExternalImage,
-} from '../utils/storage';
+} from '../utils/storage.ts';
 import {
   UPCOMING_CATEGORY_ID,
   UPCOMING_CATEGORY_NAME,
@@ -47,9 +47,9 @@ import {
   resolveCategoryIdsFromProduct,
   getCategoryBreadcrumb,
   getProductDeliveryMeta,
-} from '../utils/locationCategoryHelpers';
-import { ProductImporterModal } from './ProductImporterModal';
-import { CategoryCascadingSelect } from './CategoryCascadingSelect';
+} from '../utils/locationCategoryHelpers.ts';
+import { ProductImporterModal } from './ProductImporterModal.tsx';
+import { CategoryCascadingSelect } from './CategoryCascadingSelect.tsx';
 
 interface InventoryViewProps {
   products: ProductItem[];

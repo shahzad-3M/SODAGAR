@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { X, Calendar, Send, Clock, Copy, Check } from 'lucide-react';
-import { BusinessProfile, Customer, ReminderTemplate, WhatsAppNotification } from '../types';
-import { formatTemplateMessage, openWhatsAppDirect, calculateDaysOverdue, formatPaymentChannelsText } from '../utils/whatsapp';
+import { BusinessProfile, Customer, ReminderTemplate, WhatsAppNotification } from '../types/index.ts';
+import { formatTemplateMessage, openWhatsAppDirect, calculateDaysOverdue, formatPaymentChannelsText } from '../utils/whatsapp.ts';
 
 interface ScheduleWhatsAppModalProps {
   isOpen: boolean;

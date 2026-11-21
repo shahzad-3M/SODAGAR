@@ -40,9 +40,11 @@ for (const filePath of collectFiles(projectRoot)) {
     return `${prefix}${normalizeSpecifier(filePath, specifier)}${suffix}`;
   });
 
-  updated = updated.replace(/import\s+\{([\s\S]*?)\}\s+from\s+(['"][^'"]*types\/index\.ts['"])/g, (match, names, source) => {
-    return `import type {${names}} from ${source}`;
-  });
+  // Only convert single non-type import blocks whose exact source is types/index.ts (never span across multiple imports)
+  updated = updated.replace(
+    /\bimport\s+\{([^}]*)\}\s+from\s+(['"][^'"]*types\/index\.ts['"])/g,
+    (_match, names, source) => `import type {${names}} from ${source}`
+  );
 
   if (updated !== original) fs.writeFileSync(filePath, updated);
 }
