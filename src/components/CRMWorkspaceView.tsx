@@ -5,6 +5,7 @@ import {
   BarChart3,
   Bot,
   CalendarClock,
+  CheckSquare,
   ChevronLeft,
   ChevronRight,
   Download,
@@ -12,13 +13,17 @@ import {
   FileSpreadsheet,
   Filter,
   HeartHandshake,
+  Image as ImageIcon,
   LifeBuoy,
+  Link2,
   Megaphone,
   MessageCircle,
+  Package,
   Play,
   Plus,
   RefreshCw,
   Search,
+  Send,
   SlidersHorizontal,
   Sparkles,
   Tag,
@@ -29,8 +34,9 @@ import {
   UserCheck,
   UserPlus,
   Users,
+  Video,
 } from 'lucide-react';
-import {
+import type {
   AppUser,
   BusinessProfile,
   CRMAutoSegmentName,
@@ -229,6 +235,23 @@ export const CRMWorkspaceView: React.FC<CRMWorkspaceViewProps> = ({
   const [campCity, setCampCity] = useState('');
   const [campCoupon, setCampCoupon] = useState('');
   const [campApproveNow, setCampApproveNow] = useState(false);
+
+  // Manual Product / Bundle Offer Campaign state
+  const [campMode, setCampMode] = useState<'segment' | 'manual_bundle'>('manual_bundle');
+  const [campBundleTitle, setCampBundleTitle] = useState('');
+  const [campBundleProductIds, setCampBundleProductIds] = useState<string[]>([]);
+  const [campBundleOfferPrice, setCampBundleOfferPrice] = useState('');
+  const [campMediaImageUrl, setCampMediaImageUrl] = useState('');
+  const [campMediaVideoUrl, setCampMediaVideoUrl] = useState('');
+  const [campOfferText, setCampOfferText] = useState('');
+  const [campCtaLabel, setCampCtaLabel] = useState('Shop Bundle Offer Now');
+  const [campCtaUrl, setCampCtaUrl] = useState('https://www.madinamarket.pk');
+  const [campSelectedRecipientIds, setCampSelectedRecipientIds] = useState<string[]>([]);
+  const [campRecipientSearch, setCampRecipientSearch] = useState('');
+  const [campRecipientCityFilter, setCampRecipientCityFilter] = useState('ALL');
+  const [campProductSearch, setCampProductSearch] = useState('');
+  const [activeBundleLauncherId, setActiveBundleLauncherId] = useState<string | null>(null);
+  const [sentRecipientIdsByCamp, setSentRecipientIdsByCamp] = useState<Record<string, string[]>>({});
 
   // Loyalty & Coupons state
   const [loyaltyCfgDraft, setLoyaltyCfgDraft] = useState<CRMLoyaltyConfig | null>(null);
@@ -697,15 +720,132 @@ export const CRMWorkspaceView: React.FC<CRMWorkspaceViewProps> = ({
     );
   };
 
+  const toggleBundleProduct = (prod: ProductItem) => {
+    setCampBundleProductIds((prev) => {
+      const exists = prev.includes(prod.id);
+      const next = exists ? prev.filter((id) => id !== prod.id) : [...prev, prod.id];
+      if (!exists) {
+        const primaryImg = prod.imageUrl || prod.pictures?.[0] || '';
+        if (!campMediaImageUrl && primaryImg) {
+          setCampMediaImageUrl(primaryImg);
+        }
+        if (campCtaUrl === 'https://www.madinamarket.pk' || !campCtaUrl.trim()) {
+          setCampCtaUrl(`https://www.madinamarket.pk/?product=${encodeURIComponent(prod.id)}`);
+        }
+        if (!campBundleTitle.trim()) {
+          setCampBundleTitle(next.length === 1 ? `${prod.name} Special Offer` : `${next.length}-Product Bundle Deal`);
+        }
+      }
+      return next;
+    });
+  };
+
+  const toggleBundleRecipient = (custId: string) => {
+    setCampSelectedRecipientIds((prev) =>
+      prev.includes(custId) ? prev.filter((id) => id !== custId) : [...prev, custId]
+    );
+  };
+
+  const buildBundleWhatsappText = (cmp: Partial<CRMCampaign>, recipientName: string): string => {
+    const bundleProds = (cmp.bundleProductIds || [])
+      .map((pid) => products.find((p) => p.id === pid))
+      .filter((p): p is ProductItem => Boolean(p));
+    const lines: string[] = [
+      `Assalam-o-Alaikum ${recipientName}!`,
+      cmp.bundleTitle ? `*${cmp.bundleTitle}*` : `*${cmp.name || 'Special Bundle Offer'}*`,
+    ];
+    if (bundleProds.length > 0) {
+      lines.push(`Included: ${bundleProds.map((p) => p.name).join(' + ')}`);
+    }
+    if (cmp.bundleOfferPrice && cmp.bundleOfferPrice > 0) {
+      lines.push(`Offer Price: ${profile.currencySymbol}${cmp.bundleOfferPrice.toLocaleString('en-PK')}`);
+    }
+    if (cmp.messageBody?.trim()) {
+      lines.push('', cmp.messageBody.trim());
+    }
+    if (cmp.couponCode) {
+      lines.push(`Coupon Code: *${cmp.couponCode}*`);
+    }
+    if (cmp.mediaImageUrl?.trim()) {
+      lines.push(`Offer Image: ${cmp.mediaImageUrl.trim()}`);
+    }
+    if (cmp.mediaVideoUrl?.trim()) {
+      lines.push(`Product Video: ${cmp.mediaVideoUrl.trim()}`);
+    }
+    if (cmp.ctaUrl?.trim()) {
+      lines.push(`${cmp.ctaLabel?.trim() || 'View & Order Offer'}: ${cmp.ctaUrl.trim()}`);
+    }
+    return lines.join('\n');
+  };
+
   const handleSaveCampaign = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!campName.trim()) {
-      showNotice('Campaign name is required.', 'error');
+    const resolvedTitle = campName.trim() || campBundleTitle.trim();
+    if (!resolvedTitle) {
+      showNotice('Campaign title is required.', 'error');
       return;
     }
+
+    if (campMode === 'manual_bundle') {
+      if (campSelectedRecipientIds.length === 0) {
+        showNotice('Please select at least 1 consented person in the target group.', 'error');
+        return;
+      }
+      const offerBody = campOfferText.trim() || renderedWaPreview;
+      if (!offerBody) {
+        showNotice('Please enter offer message text for the bundle campaign.', 'error');
+        return;
+      }
+      const status = campApproveNow && canApproveBulk ? 'Approved' : 'Draft';
+      const parsedOfferPrice = campBundleOfferPrice ? Number(campBundleOfferPrice) : undefined;
+      const res = await apiSaveCrmCampaign({
+        name: resolvedTitle,
+        campaignMode: 'manual_bundle',
+        bundleTitle: campBundleTitle.trim() || resolvedTitle,
+        bundleProductIds: campBundleProductIds,
+        bundleOfferPrice: parsedOfferPrice && !Number.isNaN(parsedOfferPrice) ? parsedOfferPrice : undefined,
+        mediaImageUrl: campMediaImageUrl.trim() || undefined,
+        mediaVideoUrl: campMediaVideoUrl.trim() || undefined,
+        ctaLabel: campCtaLabel.trim() || 'Shop Bundle Offer Now',
+        ctaUrl: campCtaUrl.trim() || 'https://www.madinamarket.pk',
+        targetRecipientIds: campSelectedRecipientIds,
+        recipientsCount: campSelectedRecipientIds.length,
+        templateType: 'discount_offer',
+        couponCode: campCoupon.trim().toUpperCase() || undefined,
+        messageBody: offerBody,
+        status,
+      });
+      if (!res.ok) {
+        showNotice(res.error || 'Could not save manual bundle campaign.', 'error');
+        return;
+      }
+      if (res.campaign?.id) {
+        setActiveBundleLauncherId(res.campaign.id);
+      }
+      setCampName('');
+      setCampBundleTitle('');
+      setCampBundleProductIds([]);
+      setCampBundleOfferPrice('');
+      setCampMediaImageUrl('');
+      setCampMediaVideoUrl('');
+      setCampOfferText('');
+      setCampCoupon('');
+      setCampSelectedRecipientIds([]);
+      setCampApproveNow(false);
+      showNotice(
+        status === 'Approved'
+          ? 'Manual Bundle Offer Campaign created & approved! Use the Group Sender below to reach each recipient.'
+          : 'Manual Bundle Offer Campaign saved as Draft (requires Admin approval before sending).',
+        'success'
+      );
+      await loadCrmData();
+      return;
+    }
+
     const status = campApproveNow && canApproveBulk ? 'Approved' : 'Draft';
     const res = await apiSaveCrmCampaign({
-      name: campName.trim(),
+      name: resolvedTitle,
+      campaignMode: 'segment',
       templateType: waTemplateType,
       segmentName: campSegment || undefined,
       targetCity: campCity.trim() || undefined,
@@ -728,6 +868,29 @@ export const CRMWorkspaceView: React.FC<CRMWorkspaceViewProps> = ({
       'success'
     );
     await loadCrmData();
+  };
+
+  const handleSendBundleRecipientWa = async (cmp: CRMCampaign, profileItem: Customer360Profile) => {
+    if (profileItem.customer.whatsappOptOut) {
+      showNotice(`${profileItem.customer.name} has opted out of marketing messages.`, 'error');
+      return;
+    }
+    const msg = buildBundleWhatsappText(cmp, profileItem.customer.name);
+    openWhatsAppDirect(profileItem.customer.whatsapp || profileItem.customer.phone, msg);
+    await apiLogCrmActivity({
+      customerId: profileItem.customer.id,
+      phone: profileItem.customer.phone,
+      eventType: 'whatsapp_opened',
+      notes: `Manual Bundle Campaign "${cmp.name}" opened via WhatsApp click-to-chat`,
+    });
+    const prevSent = sentRecipientIdsByCamp[cmp.id] || [];
+    if (!prevSent.includes(profileItem.customer.id)) {
+      const nextSent = [...prevSent, profileItem.customer.id];
+      setSentRecipientIdsByCamp((prev) => ({ ...prev, [cmp.id]: nextSent }));
+      await apiSaveCrmCampaign({ ...cmp, sentCount: Math.max(cmp.sentCount || 0, nextSent.length) });
+      await loadCrmData();
+    }
+    showNotice(`WhatsApp prepared for ${profileItem.customer.name}. Press Send inside WhatsApp to deliver.`, 'info');
   };
 
   const handleUpdateCampaignStatus = async (cmp: CRMCampaign, nextStatus: 'Approved' | 'Launched') => {
@@ -1950,131 +2113,572 @@ export const CRMWorkspaceView: React.FC<CRMWorkspaceViewProps> = ({
 
       {/* 5. WHATSAPP CRM & CAMPAIGN MANAGEMENT */}
       {activeSubTab === 'whatsapp' && crmState && (
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
-          <div className="lg:col-span-6 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-4 space-y-3 text-xs">
-            <div className="flex items-center justify-between">
-              <h3 className="text-sm font-bold text-slate-900 dark:text-white flex items-center gap-1.5">
-                <MessageCircle className="w-4 h-4 text-emerald-500" />
-                <span>WhatsApp CRM Click-to-Chat Composer (13 Templates)</span>
-              </h3>
-            </div>
-            <div className="p-2.5 rounded-lg bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800 text-[11px] text-amber-900 dark:text-amber-200">
-              Honest Compliance Notice: Clicking "Open in WhatsApp" opens WhatsApp Web/App via <code>wa.me</code> with your personalized template pre-filled so you verify and send directly. Bulk messages require customer opt-in consent and Administrator approval.
-            </div>
-
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-              <div>
-                <label className="block text-[10px] font-bold uppercase text-slate-500 mb-1">Template (13 Scenarios)</label>
-                <select value={waTemplateType} onChange={(e) => setWaTemplateType(e.target.value as CRMWhatsAppTemplateType)} className="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800">
-                  {CRM_WHATSAPP_TEMPLATES.map((t) => (
-                    <option key={t.type} value={t.type}>{t.label} ({t.urduLabel})</option>
-                  ))}
-                </select>
+        <div className="space-y-4">
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
+            <div className="lg:col-span-5 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-4 space-y-3 text-xs">
+              <div className="flex items-center justify-between">
+                <h3 className="text-sm font-bold text-slate-900 dark:text-white flex items-center gap-1.5">
+                  <MessageCircle className="w-4 h-4 text-emerald-500" />
+                  <span>WhatsApp CRM Click-to-Chat (13 Templates)</span>
+                </h3>
               </div>
-              <div>
-                <label className="block text-[10px] font-bold uppercase text-slate-500 mb-1">Recipient Customer</label>
-                <select value={waCustomerId} onChange={(e) => setWaCustomerId(e.target.value)} className="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800">
-                  {crmState.profiles.map((p) => (
-                    <option key={p.customer.id} value={p.customer.id}>
-                      {p.customer.name} ({p.customer.phone}) {p.customer.whatsappOptOut ? '[OPTED OUT]' : ''}
-                    </option>
-                  ))}
-                </select>
+              <div className="p-2.5 rounded-lg bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800 text-[11px] text-amber-900 dark:text-amber-200">
+                Honest Compliance Notice: Clicking "Open in WhatsApp" opens WhatsApp Web/App via <code>wa.me</code> with your personalized template or bundle offer pre-filled so you verify and send directly. Bulk campaigns require customer opt-in consent and Administrator approval.
               </div>
-              <input type="text" value={waProductName} onChange={(e) => setWaProductName(e.target.value)} placeholder="Product Name variable" className="px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800" />
-              <div className="flex gap-1.5">
-                <input type="text" value={waOrderNumber} onChange={(e) => setWaOrderNumber(e.target.value)} placeholder="Order #" className="flex-1 px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800" />
-                <input type="text" value={waCouponCode} onChange={(e) => setWaCouponCode(e.target.value)} placeholder="Coupon Code" className="flex-1 px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800" />
-              </div>
-            </div>
 
-            <textarea
-              rows={4}
-              value={waCustomBody || renderedWaPreview}
-              onChange={(e) => setWaCustomBody(e.target.value)}
-              className="w-full p-2.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 font-sans text-xs"
-            />
-            <div className="flex items-center justify-between gap-2">
-              {waCustomBody && (
-                <button type="button" onClick={() => setWaCustomBody('')} className="text-[11px] underline text-slate-500 cursor-pointer">
-                  Reset to Template Default
-                </button>
-              )}
-              <button
-                type="button"
-                disabled={!can('canSendWhatsAppCrm')}
-                onClick={() => void handleOpenWaClickToChat()}
-                className="ml-auto px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white font-bold inline-flex items-center gap-1.5 cursor-pointer"
-              >
-                <ExternalLink className="w-3.5 h-3.5" />
-                <span>Open Click-to-Chat in WhatsApp</span>
-              </button>
-            </div>
-          </div>
-
-          {/* Campaigns Builder & Approval Ledger */}
-          <div className="lg:col-span-6 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-4 space-y-3 text-xs">
-            <h3 className="text-sm font-bold text-slate-900 dark:text-white flex items-center gap-1.5">
-              <Megaphone className="w-4 h-4 text-amber-500" />
-              <span>Marketing Campaigns &amp; Admin Consent Guard</span>
-            </h3>
-
-            {can('canManageCampaigns') && (
-              <form onSubmit={handleSaveCampaign} className="grid grid-cols-1 sm:grid-cols-2 gap-2 p-3 rounded-lg bg-slate-50 dark:bg-slate-800/60">
-                <input type="text" value={campName} onChange={(e) => setCampName(e.target.value)} placeholder="Campaign Title *" className="px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900" />
-                <select value={campSegment} onChange={(e) => setCampSegment(e.target.value)} className="px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900">
-                  <option value="">All Consented Customers</option>
-                  {ALL_AUTO_SEGMENTS.map((s) => <option key={s} value={s}>{s}</option>)}
-                </select>
-                <input type="text" value={campCity} onChange={(e) => setCampCity(e.target.value)} placeholder="Target City (Optional)" className="px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900" />
-                <input type="text" value={campCoupon} onChange={(e) => setCampCoupon(e.target.value)} placeholder="Linked Coupon Code (Optional)" className="px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900" />
-                <div className="sm:col-span-2 flex items-center justify-between gap-2">
-                  {canApproveBulk ? (
-                    <label className="flex items-center gap-1.5 text-[11px] font-semibold cursor-pointer">
-                      <input type="checkbox" checked={campApproveNow} onChange={(e) => setCampApproveNow(e.target.checked)} />
-                      <span>Admin Approve Now (Consent verified)</span>
-                    </label>
-                  ) : (
-                    <span className="text-[11px] text-amber-600">Saved as Draft for Admin Approval</span>
-                  )}
-                  <button type="submit" className="px-3 py-1.5 rounded-lg bg-slate-900 dark:bg-amber-500 text-white dark:text-slate-950 font-bold cursor-pointer">
-                    Save Campaign
-                  </button>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                <div>
+                  <label className="block text-[10px] font-bold uppercase text-slate-500 mb-1">Template (13 Scenarios)</label>
+                  <select value={waTemplateType} onChange={(e) => setWaTemplateType(e.target.value as CRMWhatsAppTemplateType)} className="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800">
+                    {CRM_WHATSAPP_TEMPLATES.map((t) => (
+                      <option key={t.type} value={t.type}>{t.label} ({t.urduLabel})</option>
+                    ))}
+                  </select>
                 </div>
-              </form>
-            )}
+                <div>
+                  <label className="block text-[10px] font-bold uppercase text-slate-500 mb-1">Recipient Customer</label>
+                  <select value={waCustomerId} onChange={(e) => setWaCustomerId(e.target.value)} className="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800">
+                    {crmState.profiles.map((p) => (
+                      <option key={p.customer.id} value={p.customer.id}>
+                        {p.customer.name} ({p.customer.phone}) {p.customer.whatsappOptOut ? '[OPTED OUT]' : ''}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <input type="text" value={waProductName} onChange={(e) => setWaProductName(e.target.value)} placeholder="Product Name variable" className="px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800" />
+                <div className="flex gap-1.5">
+                  <input type="text" value={waOrderNumber} onChange={(e) => setWaOrderNumber(e.target.value)} placeholder="Order #" className="flex-1 px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800" />
+                  <input type="text" value={waCouponCode} onChange={(e) => setWaCouponCode(e.target.value)} placeholder="Coupon Code" className="flex-1 px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800" />
+                </div>
+              </div>
 
-            <div className="space-y-2 max-h-72 overflow-y-auto">
-              {crmState.campaigns.map((c) => (
-                <div key={c.id} className="p-3 rounded-lg border border-slate-200 dark:border-slate-800 flex items-center justify-between gap-2">
-                  <div className="min-w-0">
-                    <div className="font-bold text-slate-900 dark:text-white flex items-center gap-2">
-                      <span>{c.name}</span>
-                      <span className={`px-1.5 py-0.2 rounded text-[10px] font-bold ${
-                        c.status === 'Approved' || c.status === 'Launched'
-                          ? 'bg-emerald-100 text-emerald-800'
-                          : 'bg-slate-100 text-slate-700'
-                      }`}>
-                        {c.status}
+              <textarea
+                rows={4}
+                value={waCustomBody || renderedWaPreview}
+                onChange={(e) => setWaCustomBody(e.target.value)}
+                className="w-full p-2.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 font-sans text-xs"
+              />
+              <div className="flex items-center justify-between gap-2">
+                {waCustomBody && (
+                  <button type="button" onClick={() => setWaCustomBody('')} className="text-[11px] underline text-slate-500 cursor-pointer">
+                    Reset to Template Default
+                  </button>
+                )}
+                <button
+                  type="button"
+                  disabled={!can('canSendWhatsAppCrm')}
+                  onClick={() => void handleOpenWaClickToChat()}
+                  className="ml-auto px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white font-bold inline-flex items-center gap-1.5 cursor-pointer"
+                >
+                  <ExternalLink className="w-3.5 h-3.5" />
+                  <span>Open Click-to-Chat in WhatsApp</span>
+                </button>
+              </div>
+            </div>
+
+            {/* Campaigns Builder (Segment Campaigns + Manual Product/Bundle Offer Campaigns) */}
+            <div className="lg:col-span-7 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-4 space-y-3 text-xs">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <h3 className="text-sm font-bold text-slate-900 dark:text-white flex items-center gap-1.5">
+                  <Megaphone className="w-4 h-4 text-amber-500" />
+                  <span>Marketing Campaigns &amp; Manual Bundle Offers</span>
+                </h3>
+                {can('canManageCampaigns') && (
+                  <div className="inline-flex rounded-lg bg-slate-100 dark:bg-slate-800 p-0.5 border border-slate-200 dark:border-slate-700">
+                    <button
+                      type="button"
+                      onClick={() => setCampMode('manual_bundle')}
+                      className={`px-2.5 py-1 rounded-md font-bold text-[11px] cursor-pointer transition-colors ${
+                        campMode === 'manual_bundle'
+                          ? 'bg-amber-500 text-slate-950 shadow-2xs'
+                          : 'text-slate-600 dark:text-slate-300'
+                      }`}
+                    >
+                      Manual Bundle Offer
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setCampMode('segment')}
+                      className={`px-2.5 py-1 rounded-md font-bold text-[11px] cursor-pointer transition-colors ${
+                        campMode === 'segment'
+                          ? 'bg-slate-900 dark:bg-slate-700 text-white shadow-2xs'
+                          : 'text-slate-600 dark:text-slate-300'
+                      }`}
+                    >
+                      Segment Campaign
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              {can('canManageCampaigns') && campMode === 'segment' && (
+                <form onSubmit={handleSaveCampaign} className="grid grid-cols-1 sm:grid-cols-2 gap-2 p-3 rounded-lg bg-slate-50 dark:bg-slate-800/60">
+                  <input type="text" value={campName} onChange={(e) => setCampName(e.target.value)} placeholder="Campaign Title *" className="px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900" />
+                  <select value={campSegment} onChange={(e) => setCampSegment(e.target.value)} className="px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900">
+                    <option value="">All Consented Customers</option>
+                    {ALL_AUTO_SEGMENTS.map((s) => <option key={s} value={s}>{s}</option>)}
+                  </select>
+                  <input type="text" value={campCity} onChange={(e) => setCampCity(e.target.value)} placeholder="Target City (Optional)" className="px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900" />
+                  <input type="text" value={campCoupon} onChange={(e) => setCampCoupon(e.target.value)} placeholder="Linked Coupon Code (Optional)" className="px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900" />
+                  <div className="sm:col-span-2 flex items-center justify-between gap-2">
+                    {canApproveBulk ? (
+                      <label className="flex items-center gap-1.5 text-[11px] font-semibold cursor-pointer">
+                        <input type="checkbox" checked={campApproveNow} onChange={(e) => setCampApproveNow(e.target.checked)} />
+                        <span>Admin Approve Now (Consent verified)</span>
+                      </label>
+                    ) : (
+                      <span className="text-[11px] text-amber-600">Saved as Draft for Admin Approval</span>
+                    )}
+                    <button type="submit" className="px-3 py-1.5 rounded-lg bg-slate-900 dark:bg-amber-500 text-white dark:text-slate-950 font-bold cursor-pointer">
+                      Save Campaign
+                    </button>
+                  </div>
+                </form>
+              )}
+
+              {can('canManageCampaigns') && campMode === 'manual_bundle' && (
+                <form onSubmit={handleSaveCampaign} className="space-y-3 p-3.5 rounded-xl bg-amber-50/50 dark:bg-amber-950/20 border border-amber-200 dark:border-amber-800/70">
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                    <input
+                      type="text"
+                      value={campName}
+                      onChange={(e) => setCampName(e.target.value)}
+                      placeholder="Campaign Title * (e.g. Winter Kitchen Bundle)"
+                      className="sm:col-span-2 px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 font-semibold"
+                    />
+                    <input
+                      type="number"
+                      min="0"
+                      value={campBundleOfferPrice}
+                      onChange={(e) => setCampBundleOfferPrice(e.target.value)}
+                      placeholder="Bundle Offer Price (Rs)"
+                      className="px-2.5 py-1.5 font-mono rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900"
+                    />
+                  </div>
+
+                  {/* Step 1: Select 1 Product or Multiple Bundle Products */}
+                  <div className="p-2.5 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 space-y-1.5">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span className="font-bold text-[11px] flex items-center gap-1 text-slate-800 dark:text-slate-200">
+                        <Package className="w-3.5 h-3.5 text-amber-500" />
+                        1. Product / Bundle Items ({campBundleProductIds.length} selected)
                       </span>
+                      <input
+                        type="text"
+                        value={campProductSearch}
+                        onChange={(e) => setCampProductSearch(e.target.value)}
+                        placeholder="Search products..."
+                        className="px-2 py-1 text-[11px] rounded border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 w-40"
+                      />
                     </div>
-                    <div className="text-[11px] text-slate-500">
-                      Segment: {c.segmentName || 'All'} · Matched Consented Recipients: <strong>{c.recipientsCount}</strong> {c.adminApprovedBy ? `· Approved by ${c.adminApprovedBy}` : ''}
+                    <div className="max-h-28 overflow-y-auto grid grid-cols-1 sm:grid-cols-2 gap-1.5 pt-1">
+                      {products
+                        .filter((p) => {
+                          const q = campProductSearch.trim().toLowerCase();
+                          return !q || p.name.toLowerCase().includes(q) || p.sku.toLowerCase().includes(q);
+                        })
+                        .map((p) => {
+                          const selected = campBundleProductIds.includes(p.id);
+                          return (
+                            <label
+                              key={p.id}
+                              className={`flex items-center gap-2 p-1.5 rounded border text-[11px] cursor-pointer ${
+                                selected
+                                  ? 'bg-amber-50 dark:bg-amber-950/40 border-amber-400 font-bold'
+                                  : 'border-slate-200 dark:border-slate-800'
+                              }`}
+                            >
+                              <input
+                                type="checkbox"
+                                checked={selected}
+                                onChange={() => toggleBundleProduct(p)}
+                              />
+                              <span className="truncate flex-1">{p.name}</span>
+                              <span className="font-mono text-[10px] text-slate-500 shrink-0">
+                                {profile.currencySymbol}{p.ourPrice.toLocaleString('en-PK')}
+                              </span>
+                            </label>
+                          );
+                        })}
                     </div>
                   </div>
-                  {canApproveBulk && (c.status === 'Draft' || c.status === 'draft') && (
-                    <button type="button" onClick={() => void handleUpdateCampaignStatus(c, 'Approved')} className="px-2.5 py-1 rounded bg-emerald-600 text-white font-bold cursor-pointer shrink-0">
-                      Approve
-                    </button>
+
+                  {/* Step 2: Select Group of People (Consented Customers) */}
+                  <div className="p-2.5 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 space-y-1.5">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span className="font-bold text-[11px] flex items-center gap-1 text-slate-800 dark:text-slate-200">
+                        <Users className="w-3.5 h-3.5 text-emerald-600" />
+                        2. Target Group of People ({campSelectedRecipientIds.length} selected)
+                      </span>
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <select
+                          value={campRecipientCityFilter}
+                          onChange={(e) => setCampRecipientCityFilter(e.target.value)}
+                          className="px-2 py-1 text-[10px] rounded border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800"
+                        >
+                          <option value="ALL">All Cities</option>
+                          {Array.from(new Set(crmState.profiles.map((p) => p.customer.city).filter(Boolean))).map((city) => (
+                            <option key={city} value={city}>{city}</option>
+                          ))}
+                        </select>
+                        <input
+                          type="text"
+                          value={campRecipientSearch}
+                          onChange={(e) => setCampRecipientSearch(e.target.value)}
+                          placeholder="Filter people..."
+                          className="px-2 py-1 text-[10px] rounded border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 w-32"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const eligibleIds = crmState.profiles
+                              .filter((p) => !p.customer.whatsappOptOut)
+                              .filter((p) => campRecipientCityFilter === 'ALL' || p.customer.city === campRecipientCityFilter)
+                              .map((p) => p.customer.id);
+                            setCampSelectedRecipientIds(eligibleIds);
+                          }}
+                          className="px-2 py-1 rounded bg-emerald-100 text-emerald-800 font-bold text-[10px] cursor-pointer"
+                        >
+                          Select All
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setCampSelectedRecipientIds([])}
+                          className="px-2 py-1 rounded bg-slate-100 text-slate-600 font-bold text-[10px] cursor-pointer"
+                        >
+                          Clear
+                        </button>
+                      </div>
+                    </div>
+                    <div className="max-h-28 overflow-y-auto grid grid-cols-1 sm:grid-cols-2 gap-1.5 pt-1">
+                      {crmState.profiles
+                        .filter((p) => {
+                          if (campRecipientCityFilter !== 'ALL' && p.customer.city !== campRecipientCityFilter) return false;
+                          const q = campRecipientSearch.trim().toLowerCase();
+                          return (
+                            !q ||
+                            p.customer.name.toLowerCase().includes(q) ||
+                            p.customer.phone.toLowerCase().includes(q) ||
+                            (p.customer.city || '').toLowerCase().includes(q)
+                          );
+                        })
+                        .map((p) => {
+                          const optedOut = Boolean(p.customer.whatsappOptOut);
+                          const isChecked = campSelectedRecipientIds.includes(p.customer.id);
+                          return (
+                            <label
+                              key={p.customer.id}
+                              className={`flex items-center gap-2 p-1.5 rounded border text-[11px] ${
+                                optedOut
+                                  ? 'opacity-50 cursor-not-allowed bg-slate-50 dark:bg-slate-850 border-slate-200'
+                                  : isChecked
+                                  ? 'bg-emerald-50 dark:bg-emerald-950/30 border-emerald-400 font-bold cursor-pointer'
+                                  : 'border-slate-200 dark:border-slate-800 cursor-pointer'
+                              }`}
+                            >
+                              <input
+                                type="checkbox"
+                                disabled={optedOut}
+                                checked={isChecked}
+                                onChange={() => toggleBundleRecipient(p.customer.id)}
+                              />
+                              <span className="truncate flex-1">
+                                {p.customer.name} ({p.customer.city})
+                              </span>
+                              <span className="font-mono text-[10px] text-slate-400 shrink-0">
+                                {optedOut ? 'OPTED OUT' : p.customer.phone}
+                              </span>
+                            </label>
+                          );
+                        })}
+                    </div>
+                  </div>
+
+                  {/* Step 3: Media (Image + Video), Offer Message Text, and CTA Button + Destination Link */}
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                    <div>
+                      <label className="block text-[10px] font-bold text-slate-600 dark:text-slate-300 mb-0.5 flex items-center gap-1">
+                        <ImageIcon className="w-3 h-3 text-amber-500" /> Offer Image URL
+                      </label>
+                      <input
+                        type="url"
+                        value={campMediaImageUrl}
+                        onChange={(e) => setCampMediaImageUrl(e.target.value)}
+                        placeholder="https://... (auto-filled from bundle product)"
+                        className="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[10px] font-bold text-slate-600 dark:text-slate-300 mb-0.5 flex items-center gap-1">
+                        <Video className="w-3 h-3 text-rose-500" /> Offer Video URL (Optional)
+                      </label>
+                      <input
+                        type="url"
+                        value={campMediaVideoUrl}
+                        onChange={(e) => setCampMediaVideoUrl(e.target.value)}
+                        placeholder="https://youtube.com/... or MP4 video URL"
+                        className="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[10px] font-bold text-slate-600 dark:text-slate-300 mb-0.5 flex items-center gap-1">
+                        <Link2 className="w-3 h-3 text-blue-500" /> Button Text (CTA)
+                      </label>
+                      <input
+                        type="text"
+                        value={campCtaLabel}
+                        onChange={(e) => setCampCtaLabel(e.target.value)}
+                        placeholder="e.g. Order Bundle Offer Now"
+                        className="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 font-semibold"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[10px] font-bold text-slate-600 dark:text-slate-300 mb-0.5">
+                        Button Destination Link *
+                      </label>
+                      <input
+                        type="url"
+                        value={campCtaUrl}
+                        onChange={(e) => setCampCtaUrl(e.target.value)}
+                        placeholder="https://www.madinamarket.pk/..."
+                        className="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 font-mono text-[11px]"
+                      />
+                    </div>
+                  </div>
+
+                  <div>
+                    <div className="flex items-center justify-between mb-1">
+                      <label className="text-[10px] font-bold text-slate-600 dark:text-slate-300">
+                        Bundle Offer Message Text *
+                      </label>
+                      <input
+                        type="text"
+                        value={campCoupon}
+                        onChange={(e) => setCampCoupon(e.target.value)}
+                        placeholder="Coupon Code (Optional)"
+                        className="px-2 py-0.5 text-[10px] font-mono uppercase rounded border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 w-36"
+                      />
+                    </div>
+                    <textarea
+                      rows={3}
+                      value={campOfferText}
+                      onChange={(e) => setCampOfferText(e.target.value)}
+                      placeholder="Write super best price bundle deal details, savings highlights, and delivery promise..."
+                      className="w-full p-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs"
+                    />
+                  </div>
+
+                  {/* Live Visual Offer Card Preview */}
+                  {(campMediaImageUrl || campMediaVideoUrl || campOfferText || campBundleProductIds.length > 0) && (
+                    <div className="p-3 rounded-xl bg-white dark:bg-slate-900 border border-amber-300 dark:border-amber-700 flex flex-col sm:flex-row gap-3 items-start">
+                      {campMediaImageUrl && (
+                        <img
+                          src={campMediaImageUrl}
+                          alt="Bundle offer preview"
+                          className="w-20 h-20 object-cover rounded-lg border border-slate-200 dark:border-slate-700 shrink-0"
+                        />
+                      )}
+                      <div className="flex-1 min-w-0 space-y-1">
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <span className="font-black text-xs text-slate-900 dark:text-white">
+                            {campBundleTitle || campName || 'Bundle Offer Preview'}
+                          </span>
+                          {campBundleOfferPrice && (
+                            <span className="px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-800 font-mono font-bold text-[10px]">
+                              {profile.currencySymbol}{Number(campBundleOfferPrice).toLocaleString('en-PK')}
+                            </span>
+                          )}
+                          {campMediaVideoUrl && (
+                            <a
+                              href={campMediaVideoUrl}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-rose-100 text-rose-700 font-bold text-[10px]"
+                            >
+                              <Video className="w-3 h-3" /> Video Attached
+                            </a>
+                          )}
+                        </div>
+                        <p className="text-[11px] text-slate-600 dark:text-slate-300 whitespace-pre-line line-clamp-3">
+                          {campOfferText || 'Your offer text preview appears here...'}
+                        </p>
+                        {campCtaUrl && (
+                          <a
+                            href={campCtaUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="inline-flex items-center gap-1 px-3 py-1 rounded-lg bg-[#FFD200] text-slate-950 font-black text-[11px] mt-1"
+                          >
+                            <ExternalLink className="w-3 h-3" />
+                            <span>{campCtaLabel || 'Shop Offer Now'}</span>
+                          </a>
+                        )}
+                      </div>
+                    </div>
                   )}
-                  {canApproveBulk && (c.status === 'Approved' || c.status === 'approved') && (
-                    <button type="button" onClick={() => void handleUpdateCampaignStatus(c, 'Launched')} className="px-2.5 py-1 rounded bg-amber-500 text-slate-950 font-bold cursor-pointer shrink-0">
-                      Mark Launched
+
+                  <div className="flex items-center justify-between gap-2 pt-1">
+                    {canApproveBulk ? (
+                      <label className="flex items-center gap-1.5 text-[11px] font-semibold cursor-pointer">
+                        <input type="checkbox" checked={campApproveNow} onChange={(e) => setCampApproveNow(e.target.checked)} />
+                        <span>Admin Approve Now (Ready to Send)</span>
+                      </label>
+                    ) : (
+                      <span className="text-[11px] text-amber-600">Saved as Draft for Admin Approval</span>
+                    )}
+                    <button type="submit" className="px-4 py-1.5 rounded-lg bg-slate-900 dark:bg-amber-500 text-white dark:text-slate-950 font-black cursor-pointer inline-flex items-center gap-1.5">
+                      <CheckSquare className="w-3.5 h-3.5" />
+                      <span>Save Manual Bundle Campaign</span>
                     </button>
-                  )}
-                </div>
-              ))}
-              {crmState.campaigns.length === 0 && <p className="text-center text-slate-400 py-6">No campaigns created yet.</p>}
+                  </div>
+                </form>
+              )}
+
+              {/* Saved Campaigns & Group Sender Queue */}
+              <div className="space-y-2 max-h-[420px] overflow-y-auto">
+                {crmState.campaigns.map((c) => {
+                  const isBundle = c.campaignMode === 'manual_bundle' || (c.bundleProductIds && c.bundleProductIds.length > 0);
+                  const isApprovedOrLaunched = c.status === 'Approved' || c.status === 'Launched' || c.status === 'approved' || c.status === 'active';
+                  const isExpanded = activeBundleLauncherId === c.id;
+                  const targetProfiles = isBundle && c.targetRecipientIds
+                    ? crmState.profiles.filter((p) => c.targetRecipientIds!.includes(p.customer.id))
+                    : [];
+
+                  return (
+                    <div key={c.id} className="p-3 rounded-lg border border-slate-200 dark:border-slate-800 space-y-2.5">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div className="flex items-start gap-2.5 min-w-0">
+                          {c.mediaImageUrl && (
+                            <img
+                              src={c.mediaImageUrl}
+                              alt={c.name}
+                              className="w-11 h-11 rounded-lg object-cover border border-slate-200 dark:border-slate-700 shrink-0"
+                            />
+                          )}
+                          <div className="min-w-0">
+                            <div className="font-bold text-slate-900 dark:text-white flex flex-wrap items-center gap-1.5">
+                              <span>{c.name}</span>
+                              {isBundle && (
+                                <span className="px-1.5 py-0.2 rounded text-[10px] font-bold bg-amber-100 text-amber-900">
+                                  Manual Bundle ({c.bundleProductIds?.length || 0} items)
+                                </span>
+                              )}
+                              <span className={`px-1.5 py-0.2 rounded text-[10px] font-bold ${
+                                isApprovedOrLaunched
+                                  ? 'bg-emerald-100 text-emerald-800'
+                                  : 'bg-slate-100 text-slate-700'
+                              }`}>
+                                {c.status}
+                              </span>
+                            </div>
+                            <div className="text-[11px] text-slate-500">
+                              {isBundle
+                                ? `Group Recipients: ${c.recipientsCount} · Sent: ${c.sentCount || 0}`
+                                : `Segment: ${c.segmentName || 'All'} · Matched Consented Recipients: ${c.recipientsCount}`}
+                              {c.adminApprovedBy ? ` · Approved by ${c.adminApprovedBy}` : ''}
+                            </div>
+                          </div>
+                        </div>
+
+                        <div className="flex flex-wrap items-center gap-1.5 shrink-0">
+                          {isBundle && (
+                            <button
+                              type="button"
+                              onClick={() => setActiveBundleLauncherId(isExpanded ? null : c.id)}
+                              className="px-2.5 py-1 rounded bg-slate-900 dark:bg-slate-800 text-white font-bold text-[11px] cursor-pointer inline-flex items-center gap-1"
+                            >
+                              <Send className="w-3 h-3 text-amber-400" />
+                              <span>{isExpanded ? 'Hide Offer & Queue' : 'Open Offer & Group Sender'}</span>
+                            </button>
+                          )}
+                          {canApproveBulk && (c.status === 'Draft' || c.status === 'draft') && (
+                            <button type="button" onClick={() => void handleUpdateCampaignStatus(c, 'Approved')} className="px-2.5 py-1 rounded bg-emerald-600 text-white font-bold cursor-pointer">
+                              Approve
+                            </button>
+                          )}
+                          {canApproveBulk && (c.status === 'Approved' || c.status === 'approved') && (
+                            <button type="button" onClick={() => void handleUpdateCampaignStatus(c, 'Launched')} className="px-2.5 py-1 rounded bg-amber-500 text-slate-950 font-bold cursor-pointer">
+                              Mark Launched
+                            </button>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Expanded Manual Bundle Offer Card & Per-Person WhatsApp Group Queue */}
+                      {isBundle && isExpanded && (
+                        <div className="pt-2 border-t border-slate-200 dark:border-slate-800 space-y-2.5 bg-slate-50/70 dark:bg-slate-850 p-2.5 rounded-lg">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div className="text-[11px] text-slate-700 dark:text-slate-300 space-y-1">
+                              <div className="font-bold">{c.bundleTitle || c.name}</div>
+                              <p className="whitespace-pre-line">{c.messageBody}</p>
+                              <div className="flex flex-wrap items-center gap-2 pt-1">
+                                {c.mediaVideoUrl && (
+                                  <a
+                                    href={c.mediaVideoUrl}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-rose-100 text-rose-700 font-bold text-[10px]"
+                                  >
+                                    <Video className="w-3 h-3" /> Open Offer Video
+                                  </a>
+                                )}
+                                {c.ctaUrl && (
+                                  <a
+                                    href={c.ctaUrl}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-[#FFD200] text-slate-950 font-black text-[11px]"
+                                  >
+                                    <ExternalLink className="w-3 h-3" /> {c.ctaLabel || 'Open Offer Link'}
+                                  </a>
+                                )}
+                              </div>
+                            </div>
+                          </div>
+
+                          <div className="space-y-1">
+                            <span className="text-[10px] font-bold uppercase text-slate-500 block">
+                              Selected Group Recipients ({targetProfiles.length}) — Click to open WhatsApp with full offer &amp; link:
+                            </span>
+                            {!isApprovedOrLaunched && (
+                              <p className="text-[10px] text-amber-600 font-semibold">
+                                Admin approval required before sending group offers.
+                              </p>
+                            )}
+                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 max-h-40 overflow-y-auto">
+                              {targetProfiles.map((tp) => {
+                                const alreadySent = (sentRecipientIdsByCamp[c.id] || []).includes(tp.customer.id);
+                                return (
+                                  <div key={tp.customer.id} className="flex items-center justify-between gap-2 p-2 rounded border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900">
+                                    <div className="min-w-0">
+                                      <div className="font-bold text-[11px] truncate">{tp.customer.name}</div>
+                                      <div className="font-mono text-[10px] text-slate-400">{tp.customer.whatsapp || tp.customer.phone}</div>
+                                    </div>
+                                    <button
+                                      type="button"
+                                      disabled={!isApprovedOrLaunched || !can('canSendWhatsAppCrm')}
+                                      onClick={() => void handleSendBundleRecipientWa(c, tp)}
+                                      className={`px-2.5 py-1 rounded text-[10px] font-bold inline-flex items-center gap-1 cursor-pointer disabled:opacity-40 shrink-0 ${
+                                        alreadySent
+                                          ? 'bg-emerald-100 text-emerald-800 border border-emerald-300'
+                                          : 'bg-emerald-600 hover:bg-emerald-700 text-white'
+                                      }`}
+                                    >
+                                      <ExternalLink className="w-3 h-3" />
+                                      <span>{alreadySent ? 'Sent Again' : 'Send WhatsApp'}</span>
+                                    </button>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+                {crmState.campaigns.length === 0 && <p className="text-center text-slate-400 py-6">No campaigns created yet.</p>}
+              </div>
             </div>
           </div>
         </div>

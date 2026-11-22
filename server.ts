@@ -3206,21 +3206,35 @@ async function startServer() {
     }
 
     const bundle = buildAllCustomer360Profiles(db);
-    const recipients = bundle.profiles.filter((p) => {
-      if (p.customer.whatsappOptOut) return false;
-      if (body.segmentName && !p.autoSegments.includes(body.segmentName as (typeof p.autoSegments)[number]) && !p.customSegments.includes(body.segmentName)) {
-        return false;
-      }
-      if (body.targetCity && !(p.customer.city || '').toLowerCase().includes(body.targetCity.toLowerCase())) {
-        return false;
-      }
-      return true;
-    });
+    const hasManualGroup =
+      body.campaignMode === 'manual_bundle' && Array.isArray(body.targetRecipientIds) && body.targetRecipientIds.length > 0;
+    const manualIdSet = new Set(hasManualGroup ? body.targetRecipientIds : []);
+    const recipients = hasManualGroup
+      ? bundle.profiles.filter((p) => !p.customer.whatsappOptOut && manualIdSet.has(p.customer.id))
+      : bundle.profiles.filter((p) => {
+          if (p.customer.whatsappOptOut) return false;
+          if (body.segmentName && !p.autoSegments.includes(body.segmentName as (typeof p.autoSegments)[number]) && !p.customSegments.includes(body.segmentName)) {
+            return false;
+          }
+          if (body.targetCity && !(p.customer.city || '').toLowerCase().includes(body.targetCity.toLowerCase())) {
+            return false;
+          }
+          return true;
+        });
 
     const campaign = upsertCrmCampaign(db, {
       id: body.id || `cmp_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`,
       name: body.name.trim(),
       templateType: body.templateType || 'discount_offer',
+      campaignMode: body.campaignMode || 'segment',
+      bundleTitle: body.bundleTitle?.trim() || undefined,
+      bundleProductIds: Array.isArray(body.bundleProductIds) ? body.bundleProductIds : undefined,
+      bundleOfferPrice: typeof body.bundleOfferPrice === 'number' ? body.bundleOfferPrice : undefined,
+      mediaImageUrl: body.mediaImageUrl?.trim() || undefined,
+      mediaVideoUrl: body.mediaVideoUrl?.trim() || undefined,
+      ctaLabel: body.ctaLabel?.trim() || undefined,
+      ctaUrl: body.ctaUrl?.trim() || undefined,
+      targetRecipientIds: Array.isArray(body.targetRecipientIds) ? body.targetRecipientIds : undefined,
       segmentName: body.segmentName,
       targetCity: body.targetCity,
       couponCode: body.couponCode?.trim().toUpperCase(),
@@ -3234,7 +3248,9 @@ async function startServer() {
         requestedStatus === 'Approved' || requestedStatus === 'Launched'
           ? new Date().toISOString()
           : body.adminApprovedAt,
-      recipientsCount: body.recipientsCount ?? recipients.length,
+      recipientsCount:
+        body.recipientsCount ??
+        (hasManualGroup ? body.targetRecipientIds!.length : recipients.length),
       sentCount: body.sentCount ?? 0,
       conversionsCount: body.conversionsCount ?? 0,
       revenueGenerated: body.revenueGenerated ?? 0,

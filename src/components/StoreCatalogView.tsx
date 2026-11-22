@@ -659,10 +659,10 @@ export const StoreCatalogView: React.FC<StoreCatalogViewProps> = ({
         </button>
       </div>
 
-      {/* 2. MAIN LAYOUT: LEFT SIDEBAR + PRODUCT GRID */}
-      <div className="grid grid-cols-1 lg:grid-cols-4 gap-4 sm:gap-6 items-start">
+      {/* 2. MAIN LAYOUT: LEFT SIDEBAR + FULL-WIDTH 5-COL PRODUCT GRID */}
+      <div className="flex flex-col lg:flex-row gap-4 sm:gap-5 items-start">
         {/* LEFT SIDEBAR: CATEGORIES TREE */}
-        <aside className={`${isMobileFilterOpen ? 'block' : 'hidden'} lg:block lg:col-span-1 bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 p-4 shadow-2xs space-y-4`}>
+        <aside className={`${isMobileFilterOpen ? 'block' : 'hidden'} lg:block w-full lg:w-60 xl:w-64 shrink-0 bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 p-4 shadow-2xs space-y-4`}>
           <div className="flex items-center justify-between pb-3 border-b border-slate-100 dark:border-slate-800">
             <h2 className="text-sm font-bold text-slate-900 dark:text-white flex items-center gap-1.5">
               <span>Show All Categories</span>
@@ -961,7 +961,7 @@ export const StoreCatalogView: React.FC<StoreCatalogViewProps> = ({
         </aside>
 
         {/* RIGHT AREA: HEADER BAR + PRODUCT GRID + CART DRAWER TRIGGER */}
-        <section className="lg:col-span-3 space-y-4">
+        <section className="w-full lg:flex-1 min-w-0 space-y-4">
           {/* Main Grid Header Row (Matching Screenshot) */}
           <div className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 p-3 shadow-2xs flex flex-wrap items-center justify-between gap-3">
             <div>
@@ -1097,7 +1097,7 @@ export const StoreCatalogView: React.FC<StoreCatalogViewProps> = ({
                 )}
               </div>
 
-              <div className="grid grid-cols-2 gap-2 sm:gap-3.5 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-4 xl:grid-cols-5">
+              <div className="grid grid-cols-2 gap-2.5 sm:gap-3.5 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
                 {expressGroupProducts.map(renderProductCard)}
               </div>
             </div>
@@ -1116,7 +1116,7 @@ export const StoreCatalogView: React.FC<StoreCatalogViewProps> = ({
                   </span>
                 </div>
               )}
-              <div className="grid grid-cols-2 gap-2 sm:gap-3.5 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-4 xl:grid-cols-5">
+              <div className="grid grid-cols-2 gap-2.5 sm:gap-3.5 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
                 {standardGroupProducts.map(renderProductCard)}
               </div>
             </div>

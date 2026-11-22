@@ -1779,8 +1779,8 @@ export default function App() {
 
       {/* Security Reminder Banner: Prompt Customer to Change Default Password (USER DIRECTIVE) */}
       {(currentUser.mustChangePassword || currentUser.hasDefaultPin) && activeRole === 'customer' && (
-        <div className="bg-amber-500 text-slate-950 px-3 py-2 text-xs font-bold flex items-center justify-between gap-2 shadow-xs border-b border-amber-600 no-print">
-          <div className="flex items-center gap-2 max-w-7xl mx-auto w-full justify-between">
+        <div className="bg-amber-500 text-slate-950 px-3 sm:px-6 lg:px-8 py-2 text-xs font-bold flex items-center justify-between gap-2 shadow-xs border-b border-amber-600 no-print">
+          <div className="flex items-center gap-2 w-full justify-between">
             <span className="flex items-center gap-1.5">
               <Lock className="w-4 h-4 shrink-0" />
               <span>
@@ -1801,8 +1801,8 @@ export default function App() {
         </div>
       )}
 
-      {/* Main Content Body (USER DIRECTIVE: fix to all device friendly fix the paddings especially for mobile too) */}
-      <main className="flex-1 max-w-7xl w-full mx-auto px-3 sm:px-4 md:px-6 lg:px-8 py-3 sm:py-6">
+      {/* Main Content Body (Full-width desktop layout with mobile-friendly responsive padding) */}
+      <main className="flex-1 w-full px-3 sm:px-5 md:px-6 lg:px-8 py-3 sm:py-6">
         {/* 1. STORE & POS CATALOG VIEW (Default View Matching Screenshot) */}
         {currentTab === 'store' && (
           <StoreCatalogView
@@ -1908,6 +1908,7 @@ export default function App() {
             currentUser={currentUser}
             userRole={activeRole}
             products={products}
+            codOrders={codOrders}
             profile={profile}
             investorsList={investors}
             onInvestorsUpdated={(updated) => setInvestors(updated)}
@@ -2322,7 +2323,7 @@ export default function App() {
 
       {/* Pakistani Business Footer (USER DIRECTIVE: hide payment phone numbers from footer, use single number only in checkout) */}
       <footer className="border-t border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 py-4 no-print transition-colors">
-        <div className="max-w-7xl mx-auto px-3 sm:px-4 md:px-6 lg:px-8 flex flex-col sm:flex-row items-center justify-between text-xs text-slate-500 dark:text-slate-400 gap-3">
+        <div className="w-full px-3 sm:px-5 md:px-6 lg:px-8 flex flex-col sm:flex-row items-center justify-between text-xs text-slate-500 dark:text-slate-400 gap-3">
           <div className="flex flex-wrap items-center gap-2">
             <span className="font-extrabold text-slate-900 dark:text-white">100DAGAR</span>
             <span>·</span>

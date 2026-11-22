@@ -579,9 +579,11 @@ export interface Investor {
   whatsapp: string;
   email?: string;
   address?: string;
+  investorType?: 'silent' | 'product'; // 'silent': Min Rs. 100K capital @ editable monthly %; 'product': Product equity & qty
+  monthlyProfitPercent?: number; // Default 3.5% per month for silent investors (editable)
   totalInvestment: number; // Capital invested in PKR
-  profitShareType: 'percentage' | 'fixed_per_unit';
-  profitShareValue: number; // e.g. 20% or Rs. 150 per unit
+  profitShareType: 'percentage' | 'fixed_per_unit' | 'fixed_per_order';
+  profitShareValue: number; // e.g. 20% per product or Rs. 150 fixed per order/unit
   assignedProductIds: string[]; // List of product IDs funded by this investor
   productAllocations?: InvestorProductAllocation[]; // Multi-investor co-ownership with manual unit entry
   isReseller?: boolean; // Can also operate as a Reseller partner
@@ -1065,6 +1067,15 @@ export interface CRMCampaign {
   name: string;
   description?: string;
   channel?: 'whatsapp_click_to_chat' | 'broadcast_queue' | 'referral_push';
+  campaignMode?: 'segment' | 'manual_bundle';
+  bundleTitle?: string;
+  bundleProductIds?: string[];
+  bundleOfferPrice?: number;
+  mediaImageUrl?: string;
+  mediaVideoUrl?: string;
+  ctaLabel?: string;
+  ctaUrl?: string;
+  targetRecipientIds?: string[];
   status: 'Draft' | 'Approved' | 'Launched' | 'Completed' | 'Paused' | 'draft' | 'approved' | 'active' | 'completed' | 'paused';
   segmentName?: string;
   targetCity?: string;

@@ -19,9 +19,10 @@ import {
   Save,
   MessageSquare,
 } from 'lucide-react';
-import {
+import type {
   AppUser,
   BusinessProfile,
+  CODOrder,
   Investor,
   InvestorProductAllocation,
   InvestorTransaction,
@@ -46,6 +47,7 @@ interface InvestorManagementViewProps {
   currentUser: AppUser;
   userRole: UserRole;
   products: ProductItem[];
+  codOrders?: CODOrder[];
   profile: BusinessProfile;
   investorsList?: Investor[];
   onInvestorsUpdated?: (updated: Investor[]) => void;
@@ -56,6 +58,7 @@ export const InvestorManagementView: React.FC<InvestorManagementViewProps> = ({
   currentUser,
   userRole,
   products,
+  codOrders = [],
   profile,
   investorsList,
   onInvestorsUpdated,
@@ -98,6 +101,8 @@ export const InvestorManagementView: React.FC<InvestorManagementViewProps> = ({
   const [notification, setNotification] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
 
   // New investor form
+  const [newInvType, setNewInvType] = useState<'silent' | 'product'>('product');
+  const [newInvMonthlyPercent, setNewInvMonthlyPercent] = useState<number>(3.5);
   const [newInvName, setNewInvName] = useState('');
   const [newInvUrduName, setNewInvUrduName] = useState('');
   const [newInvPhone, setNewInvPhone] = useState('');
@@ -105,14 +110,18 @@ export const InvestorManagementView: React.FC<InvestorManagementViewProps> = ({
   const [newInvEmail, setNewInvEmail] = useState('');
   const [newInvAddress, setNewInvAddress] = useState('');
   const [newInvCapital, setNewInvCapital] = useState<number>(100000);
-  const [newInvShareType, setNewInvShareType] = useState<'percentage' | 'fixed_per_unit'>('percentage');
+  const [newInvShareType, setNewInvShareType] = useState<'percentage' | 'fixed_per_unit' | 'fixed_per_order'>('percentage');
   const [newInvShareValue, setNewInvShareValue] = useState<number>(25);
+  const [newInvAllocations, setNewInvAllocations] = useState<Record<string, InvestorProductAllocation>>({});
+  const [newInvProductSearch, setNewInvProductSearch] = useState('');
   const [newInvNotes, setNewInvNotes] = useState('');
   const [newInvIsReseller, setNewInvIsReseller] = useState<boolean>(false);
   const [newInvResellerCode, setNewInvResellerCode] = useState('');
   const [newInvResellerChannel, setNewInvResellerChannel] = useState<'easypaisa' | 'jazzcash' | 'sadapay' | 'bank' | 'cash'>('easypaisa');
 
   // Edit investor form (ALL fields editable)
+  const [editInvType, setEditInvType] = useState<'silent' | 'product'>('product');
+  const [editMonthlyPercent, setEditMonthlyPercent] = useState<number>(3.5);
   const [editName, setEditName] = useState('');
   const [editUrduName, setEditUrduName] = useState('');
   const [editPhone, setEditPhone] = useState('');
@@ -121,8 +130,10 @@ export const InvestorManagementView: React.FC<InvestorManagementViewProps> = ({
   const [editAddress, setEditAddress] = useState('');
   const [editCapital, setEditCapital] = useState<number>(0);
   const [editSettledProfit, setEditSettledProfit] = useState<number>(0);
-  const [editShareType, setEditShareType] = useState<'percentage' | 'fixed_per_unit'>('percentage');
+  const [editShareType, setEditShareType] = useState<'percentage' | 'fixed_per_unit' | 'fixed_per_order'>('percentage');
   const [editShareValue, setEditShareValue] = useState<number>(25);
+  const [editAllocations, setEditAllocations] = useState<Record<string, InvestorProductAllocation>>({});
+  const [editProductSearch, setEditProductSearch] = useState('');
   const [editStatus, setEditStatus] = useState<'active' | 'inactive'>('active');
   const [editNotes, setEditNotes] = useState('');
   const [editIsReseller, setEditIsReseller] = useState<boolean>(false);
@@ -130,6 +141,7 @@ export const InvestorManagementView: React.FC<InvestorManagementViewProps> = ({
   const [editResellerChannel, setEditResellerChannel] = useState<'easypaisa' | 'jazzcash' | 'sadapay' | 'bank' | 'cash'>('easypaisa');
   const [editResellerAccountTitle, setEditResellerAccountTitle] = useState('');
   const [editResellerAccountNumber, setEditResellerAccountNumber] = useState('');
+  const [inlineMonthlyPercent, setInlineMonthlyPercent] = useState<number>(3.5);
 
   // Draft allocations inside Product Ownership modal
   const [draftAllocations, setDraftAllocations] = useState<Record<string, InvestorProductAllocation>>({});
@@ -157,10 +169,12 @@ export const InvestorManagementView: React.FC<InvestorManagementViewProps> = ({
   useEffect(() => {
     if (activeInvestor) {
       setInlineWhatsapp(activeInvestor.whatsapp || activeInvestor.phone || '');
+      setInlineMonthlyPercent(activeInvestor.monthlyProfitPercent ?? 3.5);
     } else {
       setInlineWhatsapp('');
+      setInlineMonthlyPercent(3.5);
     }
-  }, [activeInvestor?.id, activeInvestor?.whatsapp, activeInvestor?.phone]);
+  }, [activeInvestor?.id, activeInvestor?.whatsapp, activeInvestor?.phone, activeInvestor?.monthlyProfitPercent]);
 
   // Helper: Get normalized product allocations for any investor
   const getInvestorAllocations = (inv: Investor | undefined): InvestorProductAllocation[] => {
@@ -214,11 +228,14 @@ export const InvestorManagementView: React.FC<InvestorManagementViewProps> = ({
       )
     : undefined;
 
+  const activeInvestorType: 'silent' | 'product' = activeInvestor?.investorType || 'product';
+
   // Compute proportional ownership metrics for active investor
   let inventoryStockValue = 0;
   let totalInvestorOwnedUnits = 0;
   let totalSalesGenerated = 0;
   let totalUnitsSoldAttributed = 0;
+  let totalOrdersAttributed = 0;
   let totalGrossProfitAttributed = 0;
 
   assignedProducts.forEach((p) => {
@@ -228,20 +245,43 @@ export const InvestorManagementView: React.FC<InvestorManagementViewProps> = ({
     const totalCoOwnedUnits = coOwners.reduce((sum, co) => sum + (co.unitsOwned || 0), 0);
     const ownershipRatio = totalCoOwnedUnits > 0 ? myUnits / totalCoOwnedUnits : 1;
 
+    const directOrderCount = codOrders.filter(
+      (ord) => ord.status !== 'returned' && ord.items?.some((it) => it.productId === p.id)
+    ).length;
+    const effectiveOrderCount = directOrderCount > 0 ? directOrderCount : p.salesCount;
+
     totalInvestorOwnedUnits += myUnits;
     inventoryStockValue += myUnits * p.costPrice;
     totalSalesGenerated += Math.round(p.totalRevenue * ownershipRatio);
     totalUnitsSoldAttributed += Math.round(p.salesCount * ownershipRatio);
+    totalOrdersAttributed += Math.round(effectiveOrderCount * ownershipRatio);
     totalGrossProfitAttributed += Math.round(p.totalProfit * ownershipRatio);
   });
+
+  // Silent Investor monthly calculations (default 3.5% editable monthly profit on total investment)
+  const silentMonthlyPercent = activeInvestor?.monthlyProfitPercent ?? 3.5;
+  const silentMonthlyProfit = activeInvestor
+    ? Math.round((activeInvestor.totalInvestment * silentMonthlyPercent) / 100)
+    : 0;
+  const silentMonthsActive = (() => {
+    if (!activeInvestor?.createdAt) return 1;
+    const createdMs = new Date(activeInvestor.createdAt).getTime();
+    if (Number.isNaN(createdMs)) return 1;
+    const diffDays = Math.max(0, Math.floor((Date.now() - createdMs) / 86400000));
+    return Math.max(1, Math.floor(diffDays / 30) || 1);
+  })();
 
   // Calculate Investor Profit Share
   let calculatedInvestorProfit = 0;
   if (activeInvestor) {
-    if (activeInvestor.profitShareType === 'percentage') {
+    if (activeInvestorType === 'silent') {
+      calculatedInvestorProfit = silentMonthlyProfit * silentMonthsActive;
+    } else if (activeInvestor.profitShareType === 'percentage') {
       calculatedInvestorProfit = Math.round(
         (totalGrossProfitAttributed * activeInvestor.profitShareValue) / 100
       );
+    } else if (activeInvestor.profitShareType === 'fixed_per_order') {
+      calculatedInvestorProfit = totalOrdersAttributed * activeInvestor.profitShareValue;
     } else {
       calculatedInvestorProfit = totalUnitsSoldAttributed * activeInvestor.profitShareValue;
     }
@@ -343,7 +383,45 @@ export const InvestorManagementView: React.FC<InvestorManagementViewProps> = ({
     };
   };
 
-  // Handler: Add New Investor
+  // Helper: Toggle / Update allocations inline inside Register or Edit Investor modals
+  const toggleModalAllocation = (
+    setter: React.Dispatch<React.SetStateAction<Record<string, InvestorProductAllocation>>>,
+    product: ProductItem
+  ) => {
+    setter((prev) => {
+      const next = { ...prev };
+      if (next[product.id]) {
+        delete next[product.id];
+      } else {
+        const defaultUnits = Math.max(1, product.stockQty || 1);
+        next[product.id] = {
+          productId: product.id,
+          unitsOwned: defaultUnits,
+          investedAmount: defaultUnits * product.costPrice,
+        };
+      }
+      return next;
+    });
+  };
+
+  const updateModalAllocationUnits = (
+    setter: React.Dispatch<React.SetStateAction<Record<string, InvestorProductAllocation>>>,
+    product: ProductItem,
+    units: number
+  ) => {
+    const safeUnits = Math.max(0, Number.isNaN(units) ? 0 : units);
+    setter((prev) => ({
+      ...prev,
+      [product.id]: {
+        ...(prev[product.id] || { productId: product.id }),
+        productId: product.id,
+        unitsOwned: safeUnits,
+        investedAmount: safeUnits * product.costPrice,
+      },
+    }));
+  };
+
+  // Handler: Add New Investor (Silent Min 100K @ Editable 3.5%/mo OR Product Investor w/ Inline Product Selection & Qty)
   const handleAddInvestor = (e: React.FormEvent) => {
     e.preventDefault();
     if (!newInvName.trim() || !newInvPhone.trim()) {
@@ -351,7 +429,25 @@ export const InvestorManagementView: React.FC<InvestorManagementViewProps> = ({
       return;
     }
 
+    const numericCapital = Number(newInvCapital) || 0;
+    if (newInvType === 'silent' && numericCapital < 100000) {
+      showNotification('error', 'Silent Investor requires a minimum capital investment of Rs. 100,000 (100K).');
+      return;
+    }
+
+    const allocationsList =
+      newInvType === 'product'
+        ? Object.values(newInvAllocations).filter((a) => a.unitsOwned > 0)
+        : [];
+    if (newInvType === 'product' && allocationsList.length === 0) {
+      showNotification('error', 'Please select at least 1 product and enter quantity for a Product Investor.');
+      return;
+    }
+
     const newInvId = `inv_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+    const resolvedMonthlyPct = Math.max(0, Number(newInvMonthlyPercent) || 3.5);
+    const assignedProductIds = allocationsList.map((a) => a.productId);
+
     let newInv: Investor = {
       id: newInvId,
       name: newInvName.trim(),
@@ -360,11 +456,13 @@ export const InvestorManagementView: React.FC<InvestorManagementViewProps> = ({
       whatsapp: newInvWhatsapp.trim() || newInvPhone.trim(),
       email: newInvEmail.trim() || undefined,
       address: newInvAddress.trim() || undefined,
-      totalInvestment: Number(newInvCapital) || 0,
-      profitShareType: newInvShareType,
-      profitShareValue: Number(newInvShareValue) || 0,
-      assignedProductIds: [],
-      productAllocations: [],
+      investorType: newInvType,
+      monthlyProfitPercent: newInvType === 'silent' ? resolvedMonthlyPct : undefined,
+      totalInvestment: numericCapital,
+      profitShareType: newInvType === 'silent' ? 'percentage' : newInvShareType,
+      profitShareValue: newInvType === 'silent' ? resolvedMonthlyPct : Number(newInvShareValue) || 0,
+      assignedProductIds,
+      productAllocations: allocationsList,
       isReseller: newInvIsReseller,
       resellerPaymentChannel: newInvIsReseller ? newInvResellerChannel : undefined,
       status: 'active',
@@ -396,6 +494,27 @@ export const InvestorManagementView: React.FC<InvestorManagementViewProps> = ({
     setSelectedInvestorId(newInv.id);
     setIsAddInvestorModalOpen(false);
 
+    // Sync WhatsApp number on newly linked products if product didn't have an investor yet
+    if (newInvType === 'product' && assignedProductIds.length > 0) {
+      const linkedSet = new Set(assignedProductIds);
+      let prodsChanged = false;
+      const syncedProds = products.map((p) => {
+        if (linkedSet.has(p.id) && !p.investorId) {
+          prodsChanged = true;
+          return {
+            ...p,
+            investorId: newInv.id,
+            investorWhatsApp: newInv.whatsapp || newInv.phone,
+          };
+        }
+        return p;
+      });
+      if (prodsChanged) {
+        saveProducts(syncedProds);
+        onProductInvestorSynced?.(syncedProds);
+      }
+    }
+
     // Initial deposit tx if capital > 0
     if (newInv.totalInvestment > 0) {
       const initialTx: InvestorTransaction = {
@@ -405,7 +524,10 @@ export const InvestorManagementView: React.FC<InvestorManagementViewProps> = ({
         type: 'investment_deposit',
         amount: newInv.totalInvestment,
         paymentMode: 'bank_transfer',
-        notes: 'Initial Capital Injection',
+        notes:
+          newInvType === 'silent'
+            ? `Silent Investor Initial Capital (${resolvedMonthlyPct}%/month)`
+            : `Product Investor Capital (${assignedProductIds.length} product(s))`,
         reference: `INV-CAP-${Date.now().toString().slice(-5)}`,
         createdAt: new Date().toISOString(),
       };
@@ -420,16 +542,25 @@ export const InvestorManagementView: React.FC<InvestorManagementViewProps> = ({
     setNewInvWhatsapp('');
     setNewInvEmail('');
     setNewInvAddress('');
+    setNewInvCapital(100000);
+    setNewInvMonthlyPercent(3.5);
+    setNewInvAllocations({});
+    setNewInvProductSearch('');
     setNewInvNotes('');
     setNewInvIsReseller(false);
     setNewInvResellerCode('');
 
-    showNotification('success', `Investor '${newInv.name}' registered successfully!`);
+    showNotification(
+      'success',
+      `${newInvType === 'silent' ? 'Silent' : 'Product'} Investor '${newInv.name}' registered successfully!`
+    );
   };
 
   // Open Edit Investor Info Modal with ALL fields populated
   const openEditInvestorModal = () => {
     if (!activeInvestor) return;
+    setEditInvType(activeInvestor.investorType || 'product');
+    setEditMonthlyPercent(activeInvestor.monthlyProfitPercent ?? 3.5);
     setEditName(activeInvestor.name);
     setEditUrduName(activeInvestor.urduName || '');
     setEditPhone(activeInvestor.phone);
@@ -440,6 +571,12 @@ export const InvestorManagementView: React.FC<InvestorManagementViewProps> = ({
     setEditSettledProfit(activeInvestor.settledProfit || 0);
     setEditShareType(activeInvestor.profitShareType);
     setEditShareValue(activeInvestor.profitShareValue);
+    const allocMap: Record<string, InvestorProductAllocation> = {};
+    getInvestorAllocations(activeInvestor).forEach((a) => {
+      allocMap[a.productId] = { ...a };
+    });
+    setEditAllocations(allocMap);
+    setEditProductSearch('');
     setEditStatus(activeInvestor.status);
     setEditNotes(activeInvestor.notes || '');
     setEditIsReseller(Boolean(activeInvestor.isReseller));
@@ -459,18 +596,35 @@ export const InvestorManagementView: React.FC<InvestorManagementViewProps> = ({
       return;
     }
 
+    const numericEditCap = Number(editCapital) || 0;
+    if (editInvType === 'silent' && numericEditCap < 100000) {
+      showNotification('error', 'Silent Investor requires a minimum capital investment of Rs. 100,000 (100K).');
+      return;
+    }
+
+    const editedAllocationsList =
+      editInvType === 'product'
+        ? Object.values(editAllocations).filter((a) => a.unitsOwned >= 0)
+        : [];
+    const editedAssignedIds = editedAllocationsList.map((a) => a.productId);
+    const resolvedEditMonthlyPct = Math.max(0, Number(editMonthlyPercent) || 0);
+
     let updatedInvestor: Investor = {
       ...activeInvestor,
+      investorType: editInvType,
+      monthlyProfitPercent: editInvType === 'silent' ? resolvedEditMonthlyPct : undefined,
       name: editName.trim(),
       urduName: editUrduName.trim() || undefined,
       phone: editPhone.trim(),
       whatsapp: editWhatsapp.trim() || editPhone.trim(),
       email: editEmail.trim() || undefined,
       address: editAddress.trim() || undefined,
-      totalInvestment: Number(editCapital) || 0,
+      totalInvestment: numericEditCap,
       settledProfit: Number(editSettledProfit) || 0,
-      profitShareType: editShareType,
-      profitShareValue: Number(editShareValue) || 0,
+      profitShareType: editInvType === 'silent' ? 'percentage' : editShareType,
+      profitShareValue: editInvType === 'silent' ? resolvedEditMonthlyPct : Number(editShareValue) || 0,
+      assignedProductIds: editedAssignedIds,
+      productAllocations: editedAllocationsList,
       status: editStatus,
       notes: editNotes.trim() || undefined,
       isReseller: editIsReseller,
@@ -530,6 +684,18 @@ export const InvestorManagementView: React.FC<InvestorManagementViewProps> = ({
         updatedInvestor.isReseller ? ` · Reseller Active: ${updatedInvestor.linkedResellerCode}` : ''
       }.`
     );
+  };
+
+  const handleSaveInlineMonthlyPercent = () => {
+    if (!activeInvestor || !isAdmin) return;
+    const pct = Math.max(0, Number(inlineMonthlyPercent) || 0);
+    const updatedList = investors.map((inv) =>
+      inv.id === activeInvestor.id
+        ? { ...inv, investorType: 'silent' as const, monthlyProfitPercent: pct }
+        : inv
+    );
+    commitInvestorsUpdate(updatedList);
+    showNotification('success', `Updated monthly profit rate for ${activeInvestor.name} to ${pct}% / month.`);
   };
 
   const handleSaveInlineWhatsapp = () => {
@@ -732,12 +898,15 @@ export const InvestorManagementView: React.FC<InvestorManagementViewProps> = ({
                 onChange={(e) => setSelectedInvestorId(e.target.value)}
                 className="px-3 py-1.5 text-xs font-bold rounded-xl border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-white cursor-pointer focus:outline-hidden"
               >
-                {investors.map((inv) => (
-                  <option key={inv.id} value={inv.id}>
-                    {inv.name} ({profile.currencySymbol}{inv.totalInvestment.toLocaleString('en-PK')})
-                    {inv.isReseller ? ' · Reseller' : ''}
-                  </option>
-                ))}
+                {investors.map((inv) => {
+                  const invType = inv.investorType || 'product';
+                  return (
+                    <option key={inv.id} value={inv.id}>
+                      {inv.name} · {invType === 'silent' ? `Silent ${inv.monthlyProfitPercent ?? 3.5}%/mo` : 'Product Equity'} ({profile.currencySymbol}{inv.totalInvestment.toLocaleString('en-PK')})
+                      {inv.isReseller ? ' · Reseller' : ''}
+                    </option>
+                  );
+                })}
               </select>
             )}
 
@@ -795,6 +964,17 @@ export const InvestorManagementView: React.FC<InvestorManagementViewProps> = ({
                     ({activeInvestor.urduName})
                   </span>
                 )}
+                <span
+                  className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${
+                    activeInvestorType === 'silent'
+                      ? 'bg-indigo-100 text-indigo-800 dark:bg-indigo-950/60 dark:text-indigo-300'
+                      : 'bg-amber-100 text-amber-900 dark:bg-amber-950/60 dark:text-amber-300'
+                  }`}
+                >
+                  {activeInvestorType === 'silent'
+                    ? `Silent Investor (${silentMonthlyPercent}%/mo)`
+                    : 'Product Investor'}
+                </span>
                 <span
                   className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${
                     activeInvestor.status === 'active'
@@ -927,35 +1107,61 @@ export const InvestorManagementView: React.FC<InvestorManagementViewProps> = ({
             {profile.currencySymbol}{activeInvestor?.totalInvestment.toLocaleString('en-PK') || 0}
           </div>
           <span className="text-[10px] text-slate-400 block mt-0.5">
-            کل سرمایہ کاری
+            {activeInvestorType === 'silent' ? 'Silent Capital (Min Rs. 100K) · کل سرمایہ' : 'کل سرمایہ کاری'}
           </span>
         </div>
 
-        {/* Owned Stock Units & Valuation */}
-        <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-3.5 sm:p-4 shadow-2xs">
-          <div className="flex items-center justify-between text-slate-500 dark:text-slate-400 mb-1">
-            <span className="text-[11px] font-bold uppercase tracking-wider">Owned Units Value</span>
-            <Package className="w-4 h-4 text-blue-500" />
+        {/* Owned Stock Units & Valuation OR Silent Monthly Return */}
+        {activeInvestorType === 'silent' ? (
+          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-3.5 sm:p-4 shadow-2xs">
+            <div className="flex items-center justify-between text-slate-500 dark:text-slate-400 mb-1">
+              <span className="text-[11px] font-bold uppercase tracking-wider">Monthly Profit ({silentMonthlyPercent}%)</span>
+              <Percent className="w-4 h-4 text-indigo-500" />
+            </div>
+            <div className="text-lg sm:text-xl font-black font-mono text-indigo-600 dark:text-indigo-400">
+              {profile.currencySymbol}{silentMonthlyProfit.toLocaleString('en-PK')}
+              <span className="text-xs font-semibold text-slate-400 ml-1">/mo</span>
+            </div>
+            <span className="text-[10px] text-slate-400 block mt-0.5">
+              Editable Monthly Return Rate: {silentMonthlyPercent}%
+            </span>
           </div>
-          <div className="text-lg sm:text-xl font-black font-mono text-blue-600 dark:text-blue-400">
-            {profile.currencySymbol}{inventoryStockValue.toLocaleString('en-PK')}
+        ) : (
+          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-3.5 sm:p-4 shadow-2xs">
+            <div className="flex items-center justify-between text-slate-500 dark:text-slate-400 mb-1">
+              <span className="text-[11px] font-bold uppercase tracking-wider">Owned Units Value</span>
+              <Package className="w-4 h-4 text-blue-500" />
+            </div>
+            <div className="text-lg sm:text-xl font-black font-mono text-blue-600 dark:text-blue-400">
+              {profile.currencySymbol}{inventoryStockValue.toLocaleString('en-PK')}
+            </div>
+            <span className="text-[10px] text-slate-400 block mt-0.5">
+              {totalInvestorOwnedUnits} Owned Units across {assignedProducts.length} product(s)
+            </span>
           </div>
-          <span className="text-[10px] text-slate-400 block mt-0.5">
-            {totalInvestorOwnedUnits} Owned Units across {assignedProducts.length} product(s)
-          </span>
-        </div>
+        )}
 
         {/* Total Profit Earned */}
         <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-3.5 sm:p-4 shadow-2xs">
           <div className="flex items-center justify-between text-slate-500 dark:text-slate-400 mb-1">
-            <span className="text-[11px] font-bold uppercase tracking-wider">Investor Profit Share</span>
+            <span className="text-[11px] font-bold uppercase tracking-wider">
+              {activeInvestorType === 'silent' ? 'Accrued Total Profit' : 'Investor Profit Share'}
+            </span>
             <Percent className="w-4 h-4 text-emerald-500" />
           </div>
           <div className="text-lg sm:text-xl font-black font-mono text-emerald-600 dark:text-emerald-400">
             {profile.currencySymbol}{calculatedInvestorProfit.toLocaleString('en-PK')}
           </div>
           <span className="text-[10px] text-slate-400 block mt-0.5">
-            Model: {activeInvestor?.profitShareValue}{activeInvestor?.profitShareType === 'percentage' ? '% Net Profit' : ' Rs/Unit'} ({totalSalesGenerated.toLocaleString('en-PK')} rev)
+            {activeInvestorType === 'silent'
+              ? `${silentMonthsActive} month(s) @ ${silentMonthlyPercent}% / month`
+              : `Model: ${activeInvestor?.profitShareValue}${
+                  activeInvestor?.profitShareType === 'percentage'
+                    ? '% Net Profit / Product'
+                    : activeInvestor?.profitShareType === 'fixed_per_order'
+                    ? ' Rs Fixed / Order'
+                    : ' Rs/Unit'
+                } (${totalSalesGenerated.toLocaleString('en-PK')} rev)`}
           </span>
         </div>
 
@@ -986,7 +1192,9 @@ export const InvestorManagementView: React.FC<InvestorManagementViewProps> = ({
                 : 'text-slate-600 dark:text-slate-400 hover:text-slate-900'
             }`}
           >
-            Owned Products &amp; Units ({assignedProducts.length})
+            {activeInvestorType === 'silent'
+              ? 'Silent Capital & Monthly Return'
+              : `Owned Products & Units (${assignedProducts.length})`}
           </button>
           <button
             type="button"
@@ -1003,14 +1211,16 @@ export const InvestorManagementView: React.FC<InvestorManagementViewProps> = ({
 
         {isAdmin && (
           <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={openOwnershipModal}
-              className="px-3 py-1.5 text-xs font-bold rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700 text-slate-800 dark:text-slate-200 cursor-pointer flex items-center gap-1.5"
-            >
-              <Users className="w-3.5 h-3.5 text-amber-500" />
-              <span>Product Ownership &amp; Manual Units</span>
-            </button>
+            {activeInvestorType === 'product' && (
+              <button
+                type="button"
+                onClick={openOwnershipModal}
+                className="px-3 py-1.5 text-xs font-bold rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700 text-slate-800 dark:text-slate-200 cursor-pointer flex items-center gap-1.5"
+              >
+                <Users className="w-3.5 h-3.5 text-amber-500" />
+                <span>Product Ownership &amp; Manual Units</span>
+              </button>
+            )}
             <button
               type="button"
               onClick={() => setIsRecordTxModalOpen(true)}
@@ -1022,8 +1232,78 @@ export const InvestorManagementView: React.FC<InvestorManagementViewProps> = ({
         )}
       </div>
 
-      {/* 1. OWNED PRODUCTS & MULTI-INVESTOR ALLOCATION TAB */}
-      {activeTab === 'overview' && (
+      {/* 1A. SILENT INVESTOR OVERVIEW PANEL */}
+      {activeTab === 'overview' && activeInvestor && activeInvestorType === 'silent' && (
+        <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden shadow-xs p-5 space-y-4 text-xs">
+          <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-slate-200 dark:border-slate-800">
+            <div>
+              <h3 className="text-sm font-black text-slate-900 dark:text-white flex items-center gap-2">
+                <span className="px-2 py-0.5 rounded bg-indigo-100 text-indigo-800 dark:bg-indigo-950/70 dark:text-indigo-300 text-[10px] font-bold uppercase">
+                  Type 1 · Silent Investor
+                </span>
+                <span>Monthly Fixed-Rate Capital Investment Plan</span>
+              </h3>
+              <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
+                Minimum Capital Rs. 100,000 (100K) · Capital-only investment (no product assignment required) · Default 3.5% per month (editable anytime).
+              </p>
+            </div>
+            {isAdmin && (
+              <div className="flex items-center gap-2 bg-indigo-50/70 dark:bg-indigo-950/30 px-3 py-2 rounded-xl border border-indigo-200 dark:border-indigo-800">
+                <label className="text-[11px] font-bold text-indigo-900 dark:text-indigo-200">
+                  Monthly Profit %:
+                </label>
+                <input
+                  type="number"
+                  min="0"
+                  step="0.1"
+                  value={inlineMonthlyPercent}
+                  onChange={(e) => setInlineMonthlyPercent(Number(e.target.value))}
+                  className="w-20 px-2 py-1 text-xs font-mono font-bold rounded-lg border border-indigo-300 dark:border-indigo-700 bg-white dark:bg-slate-900 text-slate-900 dark:text-white"
+                />
+                <button
+                  type="button"
+                  onClick={handleSaveInlineMonthlyPercent}
+                  className="px-2.5 py-1 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-[11px] flex items-center gap-1 cursor-pointer"
+                >
+                  <Save className="w-3 h-3" />
+                  Update %
+                </button>
+              </div>
+            )}
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <div className="p-3.5 rounded-xl bg-slate-50 dark:bg-slate-850 border border-slate-200 dark:border-slate-800">
+              <span className="text-[10px] font-bold uppercase text-slate-400 block">Invested Capital</span>
+              <span className="text-lg font-black font-mono text-slate-900 dark:text-white">
+                {profile.currencySymbol}{activeInvestor.totalInvestment.toLocaleString('en-PK')}
+              </span>
+              <span className="text-[10px] text-slate-500 block mt-0.5">Joined: {activeInvestor.createdAt}</span>
+            </div>
+            <div className="p-3.5 rounded-xl bg-indigo-50/60 dark:bg-indigo-950/20 border border-indigo-200 dark:border-indigo-800/60">
+              <span className="text-[10px] font-bold uppercase text-indigo-700 dark:text-indigo-300 block">Monthly Return ({silentMonthlyPercent}%)</span>
+              <span className="text-lg font-black font-mono text-indigo-700 dark:text-indigo-300">
+                {profile.currencySymbol}{silentMonthlyProfit.toLocaleString('en-PK')} / month
+              </span>
+              <span className="text-[10px] text-slate-500 block mt-0.5">
+                = {activeInvestor.totalInvestment.toLocaleString('en-PK')} × {silentMonthlyPercent}%
+              </span>
+            </div>
+            <div className="p-3.5 rounded-xl bg-emerald-50/60 dark:bg-emerald-950/20 border border-emerald-200 dark:border-emerald-800/60">
+              <span className="text-[10px] font-bold uppercase text-emerald-700 dark:text-emerald-300 block">Pending vs Settled</span>
+              <span className="text-lg font-black font-mono text-emerald-700 dark:text-emerald-300">
+                Pending: {profile.currencySymbol}{pendingProfit.toLocaleString('en-PK')}
+              </span>
+              <span className="text-[10px] text-slate-500 block mt-0.5">
+                Total Settled: {profile.currencySymbol}{settledProfit.toLocaleString('en-PK')}
+              </span>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 1B. OWNED PRODUCTS & MULTI-INVESTOR ALLOCATION TAB (PRODUCT INVESTOR) */}
+      {activeTab === 'overview' && activeInvestorType === 'product' && (
         <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden shadow-xs">
           <div className="p-4 bg-slate-50 dark:bg-slate-850 border-b border-slate-200 dark:border-slate-800 flex flex-wrap items-center justify-between gap-2">
             <div>
@@ -1035,7 +1315,7 @@ export const InvestorManagementView: React.FC<InvestorManagementViewProps> = ({
               </p>
             </div>
             <span className="text-[11px] font-mono text-slate-500">
-              Total Investor Units: <b>{totalInvestorOwnedUnits}</b> · Attributed Sales: <b>{totalUnitsSoldAttributed}</b>
+              Total Investor Units: <b>{totalInvestorOwnedUnits}</b> · Attributed Sales: <b>{totalUnitsSoldAttributed}</b> ({totalOrdersAttributed} orders)
             </span>
           </div>
 
@@ -1229,6 +1509,46 @@ export const InvestorManagementView: React.FC<InvestorManagementViewProps> = ({
             </div>
 
             <form onSubmit={handleAddInvestor} className="p-5 sm:p-6 space-y-3.5 overflow-y-auto">
+              {/* Investor Type Switcher (Type 1: Silent Investor Min 100K | Type 2: Product Investor w/ Inline Product Selection & Qty) */}
+              <div className="p-3 rounded-xl bg-slate-50 dark:bg-slate-850 border border-slate-200 dark:border-slate-800 space-y-2">
+                <label className="block text-[11px] font-black uppercase tracking-wider text-slate-700 dark:text-slate-300">
+                  Select Investor Type * (انویسٹر کی قسم منتخب کریں)
+                </label>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setNewInvType('silent');
+                      if ((Number(newInvCapital) || 0) < 100000) setNewInvCapital(100000);
+                    }}
+                    className={`p-2.5 rounded-xl border text-left transition-all cursor-pointer ${
+                      newInvType === 'silent'
+                        ? 'bg-indigo-600 text-white border-indigo-600 shadow-xs'
+                        : 'bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 border-slate-300 dark:border-slate-700 hover:border-indigo-400'
+                    }`}
+                  >
+                    <div className="text-xs font-black">1. Silent Investor (سائلنٹ انویسٹر)</div>
+                    <div className={`text-[10px] mt-0.5 ${newInvType === 'silent' ? 'text-indigo-100' : 'text-slate-500 dark:text-slate-400'}`}>
+                      Min Rs. 100,000 capital · 3.5%/mo profit (Editable)
+                    </div>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setNewInvType('product')}
+                    className={`p-2.5 rounded-xl border text-left transition-all cursor-pointer ${
+                      newInvType === 'product'
+                        ? 'bg-amber-500 text-slate-950 border-amber-500 shadow-xs'
+                        : 'bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 border-slate-300 dark:border-slate-700 hover:border-amber-400'
+                    }`}
+                  >
+                    <div className="text-xs font-black">2. Product Investor (پراڈکٹ انویسٹر)</div>
+                    <div className={`text-[10px] mt-0.5 ${newInvType === 'product' ? 'text-slate-900' : 'text-slate-500 dark:text-slate-400'}`}>
+                      Select product(s) &amp; editable qty · Multi-owner supported
+                    </div>
+                  </button>
+                </div>
+              </div>
+
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div>
                   <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1">
@@ -1313,47 +1633,163 @@ export const InvestorManagementView: React.FC<InvestorManagementViewProps> = ({
                 </div>
               </div>
 
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                <div>
-                  <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1">
-                    Initial Capital (PKR):
-                  </label>
-                  <input
-                    type="number"
-                    min="0"
-                    value={newInvCapital}
-                    onChange={(e) => setNewInvCapital(Number(e.target.value))}
-                    className="w-full px-3 py-2 text-xs font-mono rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-amber-400 focus:outline-hidden"
-                  />
+              {newInvType === 'silent' ? (
+                <div className="p-3.5 rounded-xl bg-indigo-50/70 dark:bg-indigo-950/30 border border-indigo-200 dark:border-indigo-800 space-y-2.5">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-xs font-bold text-indigo-900 dark:text-indigo-200 mb-1">
+                        Investment Amount (PKR · Min 100,000) *
+                      </label>
+                      <input
+                        type="number"
+                        min="100000"
+                        step="1000"
+                        required
+                        value={newInvCapital}
+                        onChange={(e) => setNewInvCapital(Number(e.target.value))}
+                        className="w-full px-3 py-2 text-xs font-mono font-bold rounded-lg border border-indigo-300 dark:border-indigo-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-indigo-500 focus:outline-hidden"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-bold text-indigo-900 dark:text-indigo-200 mb-1">
+                        Monthly Profit % (Editable · Default 3.5%) *
+                      </label>
+                      <input
+                        type="number"
+                        min="0.1"
+                        step="0.1"
+                        required
+                        value={newInvMonthlyPercent}
+                        onChange={(e) => setNewInvMonthlyPercent(Number(e.target.value))}
+                        className="w-full px-3 py-2 text-xs font-mono font-bold rounded-lg border border-indigo-300 dark:border-indigo-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-indigo-500 focus:outline-hidden"
+                      />
+                    </div>
+                  </div>
+                  <div className="flex items-center justify-between text-[11px] font-bold text-indigo-800 dark:text-indigo-300 pt-1">
+                    <span>Estimated Monthly Profit Return:</span>
+                    <span className="font-mono text-sm">
+                      {profile.currencySymbol}
+                      {Math.round(((Number(newInvCapital) || 0) * (Number(newInvMonthlyPercent) || 0)) / 100).toLocaleString('en-PK')} / month
+                    </span>
+                  </div>
                 </div>
+              ) : (
+                <>
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                    <div>
+                      <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1">
+                        Initial Capital (PKR):
+                      </label>
+                      <input
+                        type="number"
+                        min="0"
+                        value={newInvCapital}
+                        onChange={(e) => setNewInvCapital(Number(e.target.value))}
+                        className="w-full px-3 py-2 text-xs font-mono rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-amber-400 focus:outline-hidden"
+                      />
+                    </div>
 
-                <div>
-                  <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1">
-                    Profit Model:
-                  </label>
-                  <select
-                    value={newInvShareType}
-                    onChange={(e) => setNewInvShareType(e.target.value as 'percentage' | 'fixed_per_unit')}
-                    className="w-full px-2.5 py-2 text-xs rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-hidden cursor-pointer"
-                  >
-                    <option value="percentage">% Net Profit</option>
-                    <option value="fixed_per_unit">Rs Fixed / Unit</option>
-                  </select>
-                </div>
+                    <div>
+                      <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1">
+                        Profit Share Model:
+                      </label>
+                      <select
+                        value={newInvShareType}
+                        onChange={(e) => setNewInvShareType(e.target.value as 'percentage' | 'fixed_per_unit' | 'fixed_per_order')}
+                        className="w-full px-2.5 py-2 text-xs rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-hidden cursor-pointer"
+                      >
+                        <option value="percentage">% Net Profit per Product</option>
+                        <option value="fixed_per_order">Rs Fixed Amount / Order</option>
+                        <option value="fixed_per_unit">Rs Fixed / Unit Sold</option>
+                      </select>
+                    </div>
 
-                <div>
-                  <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1">
-                    Share Value:
-                  </label>
-                  <input
-                    type="number"
-                    min="1"
-                    value={newInvShareValue}
-                    onChange={(e) => setNewInvShareValue(Number(e.target.value))}
-                    className="w-full px-3 py-2 text-xs font-mono rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-amber-400 focus:outline-hidden"
-                  />
-                </div>
-              </div>
+                    <div>
+                      <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1">
+                        Share Value ({newInvShareType === 'percentage' ? '%' : 'PKR'}):
+                      </label>
+                      <input
+                        type="number"
+                        min="1"
+                        value={newInvShareValue}
+                        onChange={(e) => setNewInvShareValue(Number(e.target.value))}
+                        className="w-full px-3 py-2 text-xs font-mono rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-amber-400 focus:outline-hidden"
+                      />
+                    </div>
+                  </div>
+
+                  {/* Inline Product Selection & Editable Quantity during Investor Data Entry */}
+                  <div className="p-3.5 rounded-xl bg-amber-50/50 dark:bg-amber-950/20 border border-amber-200 dark:border-amber-800 space-y-2.5">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div>
+                        <span className="text-xs font-black text-slate-900 dark:text-white">
+                          Select Products &amp; Quantity (Editable Units) *
+                        </span>
+                        <span className="text-[10px] text-slate-500 dark:text-slate-400 block">
+                          Multiple investors can invest in the same product with separate unit quantities.
+                        </span>
+                      </div>
+                      <input
+                        type="text"
+                        placeholder="Search products..."
+                        value={newInvProductSearch}
+                        onChange={(e) => setNewInvProductSearch(e.target.value)}
+                        className="px-2.5 py-1 text-[11px] rounded-lg border border-amber-300 dark:border-amber-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white w-44"
+                      />
+                    </div>
+                    <div className="max-h-48 overflow-y-auto divide-y divide-amber-100 dark:divide-slate-800 border border-amber-200/80 dark:border-slate-700 rounded-lg bg-white dark:bg-slate-900">
+                      {products
+                        .filter((p) => {
+                          const q = newInvProductSearch.trim().toLowerCase();
+                          return !q || p.name.toLowerCase().includes(q) || p.sku.toLowerCase().includes(q);
+                        })
+                        .map((p) => {
+                          const alloc = newInvAllocations[p.id];
+                          const checked = Boolean(alloc);
+                          const existingCoOwners = getProductCoOwners(p.id);
+                          return (
+                            <div key={p.id} className={`p-2.5 flex flex-wrap items-center justify-between gap-2 ${checked ? 'bg-amber-50/70 dark:bg-amber-950/30' : ''}`}>
+                              <label className="flex items-center gap-2 cursor-pointer flex-1 min-w-[180px]">
+                                <input
+                                  type="checkbox"
+                                  checked={checked}
+                                  onChange={() => toggleModalAllocation(setNewInvAllocations, p)}
+                                  className="w-4 h-4 rounded text-amber-500 cursor-pointer"
+                                />
+                                <div className="min-w-0">
+                                  <div className="text-xs font-bold text-slate-900 dark:text-white truncate">{p.name}</div>
+                                  <div className="text-[10px] text-slate-500 font-mono">
+                                    Stock: {p.stockQty} · Cost: {profile.currencySymbol}{p.costPrice}
+                                    {existingCoOwners.length > 0 && (
+                                      <span className="ml-1.5 text-blue-600 dark:text-blue-400">
+                                        ({existingCoOwners.map((co) => `${co.investor.name.split(' ')[0]}: ${co.unitsOwned}u`).join(', ')})
+                                      </span>
+                                    )}
+                                  </div>
+                                </div>
+                              </label>
+                              {checked && alloc && (
+                                <div className="flex items-center gap-1.5 shrink-0">
+                                  <span className="text-[10px] font-bold text-slate-500">Qty:</span>
+                                  <input
+                                    type="number"
+                                    min="1"
+                                    value={alloc.unitsOwned}
+                                    onChange={(e) => updateModalAllocationUnits(setNewInvAllocations, p, parseInt(e.target.value, 10) || 0)}
+                                    className="w-20 px-2 py-1 text-xs font-mono font-bold rounded border border-amber-400 bg-white dark:bg-slate-800 text-slate-900 dark:text-white"
+                                  />
+                                  <span className="text-[10px] font-mono text-slate-500">
+                                    = {profile.currencySymbol}{(alloc.unitsOwned * p.costPrice).toLocaleString('en-PK')}
+                                  </span>
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                    </div>
+                  </div>
+                </>
+              )}
 
               {/* Is Investor Also a Reseller Toggle */}
               <div className="p-3.5 rounded-xl bg-purple-50/70 dark:bg-purple-950/30 border border-purple-200 dark:border-purple-800 space-y-2.5">
@@ -1479,6 +1915,40 @@ export const InvestorManagementView: React.FC<InvestorManagementViewProps> = ({
             </div>
 
             <form onSubmit={handleSaveEditInvestor} className="p-5 sm:p-6 space-y-4 overflow-y-auto text-xs">
+              {/* Investor Type Switcher inside Edit Modal */}
+              <div className="p-3 rounded-xl bg-slate-50 dark:bg-slate-850 border border-slate-200 dark:border-slate-800 space-y-2">
+                <label className="block text-[11px] font-black uppercase tracking-wider text-slate-700 dark:text-slate-300">
+                  Investor Type (انویسٹر کی قسم)
+                </label>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setEditInvType('silent');
+                      if ((Number(editCapital) || 0) < 100000) setEditCapital(100000);
+                    }}
+                    className={`p-2 rounded-xl border text-left cursor-pointer ${
+                      editInvType === 'silent'
+                        ? 'bg-indigo-600 text-white border-indigo-600'
+                        : 'bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 border-slate-300 dark:border-slate-700'
+                    }`}
+                  >
+                    <div className="font-black">1. Silent Investor (Min 100K · %/mo)</div>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setEditInvType('product')}
+                    className={`p-2 rounded-xl border text-left cursor-pointer ${
+                      editInvType === 'product'
+                        ? 'bg-amber-500 text-slate-950 border-amber-500'
+                        : 'bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200 border-slate-300 dark:border-slate-700'
+                    }`}
+                  >
+                    <div className="font-black">2. Product Investor (Product Selection &amp; Qty)</div>
+                  </button>
+                </div>
+              </div>
+
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div>
                   <label className="block font-bold text-slate-700 dark:text-slate-300 mb-1">
@@ -1570,57 +2040,167 @@ export const InvestorManagementView: React.FC<InvestorManagementViewProps> = ({
                 </div>
               </div>
 
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-                <div>
-                  <label className="block font-bold text-slate-700 dark:text-slate-300 mb-1">
-                    Total Capital (PKR)
-                  </label>
-                  <input
-                    type="number"
-                    min="0"
-                    value={editCapital}
-                    onChange={(e) => setEditCapital(Number(e.target.value))}
-                    className="w-full px-3 py-2 font-mono rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white"
-                  />
+              {editInvType === 'silent' ? (
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 p-3.5 rounded-xl bg-indigo-50/70 dark:bg-indigo-950/30 border border-indigo-200 dark:border-indigo-800">
+                  <div>
+                    <label className="block font-bold text-indigo-900 dark:text-indigo-200 mb-1">
+                      Total Capital (PKR · Min 100K)
+                    </label>
+                    <input
+                      type="number"
+                      min="100000"
+                      value={editCapital}
+                      onChange={(e) => setEditCapital(Number(e.target.value))}
+                      className="w-full px-3 py-2 font-mono rounded-lg border border-indigo-300 dark:border-indigo-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white"
+                    />
+                  </div>
+                  <div>
+                    <label className="block font-bold text-indigo-900 dark:text-indigo-200 mb-1">
+                      Monthly Profit % (Editable)
+                    </label>
+                    <input
+                      type="number"
+                      min="0"
+                      step="0.1"
+                      value={editMonthlyPercent}
+                      onChange={(e) => setEditMonthlyPercent(Number(e.target.value))}
+                      className="w-full px-3 py-2 font-mono font-bold rounded-lg border border-indigo-300 dark:border-indigo-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white"
+                    />
+                  </div>
+                  <div>
+                    <label className="block font-bold text-slate-700 dark:text-slate-300 mb-1">
+                      Settled Profit (PKR)
+                    </label>
+                    <input
+                      type="number"
+                      min="0"
+                      value={editSettledProfit}
+                      onChange={(e) => setEditSettledProfit(Number(e.target.value))}
+                      className="w-full px-3 py-2 font-mono rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white"
+                    />
+                  </div>
                 </div>
-                <div>
-                  <label className="block font-bold text-slate-700 dark:text-slate-300 mb-1">
-                    Settled Profit (PKR)
-                  </label>
-                  <input
-                    type="number"
-                    min="0"
-                    value={editSettledProfit}
-                    onChange={(e) => setEditSettledProfit(Number(e.target.value))}
-                    className="w-full px-3 py-2 font-mono rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white"
-                  />
-                </div>
-                <div>
-                  <label className="block font-bold text-slate-700 dark:text-slate-300 mb-1">
-                    Profit Share Type
-                  </label>
-                  <select
-                    value={editShareType}
-                    onChange={(e) => setEditShareType(e.target.value as 'percentage' | 'fixed_per_unit')}
-                    className="w-full px-2.5 py-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white cursor-pointer"
-                  >
-                    <option value="percentage">% Net Profit</option>
-                    <option value="fixed_per_unit">Rs Fixed / Unit</option>
-                  </select>
-                </div>
-                <div>
-                  <label className="block font-bold text-slate-700 dark:text-slate-300 mb-1">
-                    Share Value
-                  </label>
-                  <input
-                    type="number"
-                    min="0"
-                    value={editShareValue}
-                    onChange={(e) => setEditShareValue(Number(e.target.value))}
-                    className="w-full px-3 py-2 font-mono rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white"
-                  />
-                </div>
-              </div>
+              ) : (
+                <>
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                    <div>
+                      <label className="block font-bold text-slate-700 dark:text-slate-300 mb-1">
+                        Total Capital (PKR)
+                      </label>
+                      <input
+                        type="number"
+                        min="0"
+                        value={editCapital}
+                        onChange={(e) => setEditCapital(Number(e.target.value))}
+                        className="w-full px-3 py-2 font-mono rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white"
+                      />
+                    </div>
+                    <div>
+                      <label className="block font-bold text-slate-700 dark:text-slate-300 mb-1">
+                        Settled Profit (PKR)
+                      </label>
+                      <input
+                        type="number"
+                        min="0"
+                        value={editSettledProfit}
+                        onChange={(e) => setEditSettledProfit(Number(e.target.value))}
+                        className="w-full px-3 py-2 font-mono rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white"
+                      />
+                    </div>
+                    <div>
+                      <label className="block font-bold text-slate-700 dark:text-slate-300 mb-1">
+                        Profit Share Type
+                      </label>
+                      <select
+                        value={editShareType}
+                        onChange={(e) => setEditShareType(e.target.value as 'percentage' | 'fixed_per_unit' | 'fixed_per_order')}
+                        className="w-full px-2.5 py-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white cursor-pointer"
+                      >
+                        <option value="percentage">% Net Profit per Product</option>
+                        <option value="fixed_per_order">Rs Fixed Amount / Order</option>
+                        <option value="fixed_per_unit">Rs Fixed / Unit Sold</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label className="block font-bold text-slate-700 dark:text-slate-300 mb-1">
+                        Share Value
+                      </label>
+                      <input
+                        type="number"
+                        min="0"
+                        value={editShareValue}
+                        onChange={(e) => setEditShareValue(Number(e.target.value))}
+                        className="w-full px-3 py-2 font-mono rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white"
+                      />
+                    </div>
+                  </div>
+
+                  {/* Inline Product Selection & Editable Quantity in Edit Investor Modal */}
+                  <div className="p-3.5 rounded-xl bg-amber-50/50 dark:bg-amber-950/20 border border-amber-200 dark:border-amber-800 space-y-2">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span className="font-bold text-slate-900 dark:text-white">
+                        Assigned Products &amp; Editable Quantities
+                      </span>
+                      <input
+                        type="text"
+                        placeholder="Search products..."
+                        value={editProductSearch}
+                        onChange={(e) => setEditProductSearch(e.target.value)}
+                        className="px-2.5 py-1 text-[11px] rounded-lg border border-amber-300 dark:border-amber-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white w-44"
+                      />
+                    </div>
+                    <div className="max-h-44 overflow-y-auto divide-y divide-amber-100 dark:divide-slate-800 border border-amber-200/80 dark:border-slate-700 rounded-lg bg-white dark:bg-slate-900">
+                      {products
+                        .filter((p) => {
+                          const q = editProductSearch.trim().toLowerCase();
+                          return !q || p.name.toLowerCase().includes(q) || p.sku.toLowerCase().includes(q);
+                        })
+                        .map((p) => {
+                          const alloc = editAllocations[p.id];
+                          const checked = Boolean(alloc);
+                          const otherCoOwners = getProductCoOwners(p.id).filter(
+                            (co) => co.investor.id !== activeInvestor.id
+                          );
+                          return (
+                            <div key={p.id} className={`p-2 flex flex-wrap items-center justify-between gap-2 ${checked ? 'bg-amber-50/70 dark:bg-amber-950/30' : ''}`}>
+                              <label className="flex items-center gap-2 cursor-pointer flex-1 min-w-[180px]">
+                                <input
+                                  type="checkbox"
+                                  checked={checked}
+                                  onChange={() => toggleModalAllocation(setEditAllocations, p)}
+                                  className="w-4 h-4 rounded text-amber-500 cursor-pointer"
+                                />
+                                <div className="min-w-0">
+                                  <div className="font-bold text-slate-900 dark:text-white truncate">{p.name}</div>
+                                  <div className="text-[10px] text-slate-500 font-mono">
+                                    Stock: {p.stockQty} · Cost: {profile.currencySymbol}{p.costPrice}
+                                    {otherCoOwners.length > 0 && (
+                                      <span className="ml-1.5 text-blue-600 dark:text-blue-400">
+                                        ({otherCoOwners.map((co) => `${co.investor.name.split(' ')[0]}: ${co.unitsOwned}u`).join(', ')})
+                                      </span>
+                                    )}
+                                  </div>
+                                </div>
+                              </label>
+                              {checked && alloc && (
+                                <div className="flex items-center gap-1.5 shrink-0">
+                                  <span className="text-[10px] font-bold text-slate-500">Qty:</span>
+                                  <input
+                                    type="number"
+                                    min="0"
+                                    value={alloc.unitsOwned}
+                                    onChange={(e) => updateModalAllocationUnits(setEditAllocations, p, parseInt(e.target.value, 10) || 0)}
+                                    className="w-20 px-2 py-1 font-mono font-bold rounded border border-amber-400 bg-white dark:bg-slate-800 text-slate-900 dark:text-white"
+                                  />
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                    </div>
+                  </div>
+                </>
+              )}
 
               {/* Is Investor Also a Reseller Toggle + Details */}
               <div className="p-4 rounded-xl bg-purple-50/70 dark:bg-purple-950/30 border border-purple-200 dark:border-purple-800 space-y-3">

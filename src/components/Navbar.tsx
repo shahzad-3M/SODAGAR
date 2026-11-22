@@ -309,7 +309,7 @@ export const Navbar: React.FC<NavbarProps> = ({
     <header className="sticky top-0 z-40 flex flex-col no-print shadow-xs bg-white dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800 transition-colors">
       {/* 1. MAIN HEADER BAR */}
       <div className="w-full">
-        <div className="max-w-7xl mx-auto px-3 sm:px-4 md:px-6 lg:px-8 py-2 sm:py-2.5">
+        <div className="w-full px-3 sm:px-5 md:px-6 lg:px-8 py-2 sm:py-2.5">
           <div className="flex items-center justify-between gap-1.5 sm:gap-4">
             {/* Logo & Tagline (WE BUY WE SELL, Urdu removed) */}
             <div
@@ -540,7 +540,7 @@ export const Navbar: React.FC<NavbarProps> = ({
 
       {/* 2. PRIMARY APP TABS ROW (Overflow-visible wrapper around More Services so dropdown never clips!) */}
       <div className="w-full bg-slate-50 dark:bg-slate-950 border-t border-slate-200 dark:border-slate-800">
-        <div className="max-w-7xl mx-auto px-3 sm:px-4 md:px-6 lg:px-8 py-1.5 flex items-center justify-between gap-2 relative">
+        <div className="w-full px-3 sm:px-5 md:px-6 lg:px-8 py-1.5 flex items-center justify-between gap-2 relative">
           <nav className="flex items-center gap-1 overflow-x-auto no-scrollbar min-w-0 flex-1">
             {primaryNavItems.map((item) => {
               const isActive = currentTab === item.id;
@@ -774,7 +774,7 @@ export const Navbar: React.FC<NavbarProps> = ({
 
       {/* 3. SHOW ALL CATEGORIES BAR ON ALL DEVICES (USER DIRECTIVE: show all catagories on others devices as well) */}
       <div className="w-full bg-white dark:bg-slate-900 border-t border-slate-100 dark:border-slate-800">
-        <div className="max-w-7xl mx-auto px-3 sm:px-4 md:px-6 lg:px-8 py-1.5 flex items-center gap-2 overflow-x-auto no-scrollbar">
+        <div className="w-full px-3 sm:px-5 md:px-6 lg:px-8 py-1.5 flex items-center gap-2 overflow-x-auto no-scrollbar">
           <span className="text-[11px] font-bold text-slate-400 uppercase tracking-wider shrink-0 mr-1 flex items-center gap-1">
             <Sparkles className="w-3 h-3 text-amber-500" />
             <span className="hidden sm:inline">Categories:</span>
