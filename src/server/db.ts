@@ -1,8 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
-import {
+import type {
   AdminAuditLog,
   BusinessProfile,
   CategoryRecord,
@@ -75,10 +74,47 @@ import {
   UPCOMING_CATEGORY_ID,
   UPCOMING_CATEGORY_NAME,
 } from '../utils/locationCategoryHelpers.ts';
+import {
+  buildUpsertSql,
+  type DbAdapter,
+  type DbDriver,
+  type DbExecutor,
+  getMysqlConfigFromEnv,
+  insertIgnoreKeyword,
+  MysqlDbAdapter,
+  parseJsonSafe,
+  resolveDbDriver,
+  SqliteDbAdapter,
+} from './dbAdapter.ts';
+
+export { buildUpsertSql, insertIgnoreKeyword, parseJsonSafe };
+export type { DbAdapter, DbDriver, DbExecutor };
 
 const DATA_DIR = path.resolve(process.cwd(), 'data');
 const BACKUP_DIR = path.join(DATA_DIR, 'backups');
 const DB_PATH = path.join(DATA_DIR, 'madinamarket.db');
+
+export const EXPECTED_MYSQL_TABLES = [
+  'admin_audit_logs',
+  'app_collections',
+  'categories',
+  'cities',
+  'city_areas',
+  'crm_activity_events',
+  'crm_automation_logs',
+  'crm_automation_rules',
+  'crm_campaigns',
+  'crm_coupons',
+  'crm_custom_segments',
+  'crm_follow_ups',
+  'crm_leads',
+  'crm_loyalty_accounts',
+  'crm_loyalty_ledger',
+  'crm_support_tickets',
+  'customers',
+  'products',
+  'schema_migrations',
+] as const;
 
 export interface BackupMetadata {
   id: string;
@@ -119,7 +155,8 @@ const DEFAULT_COLLECTION_MAP: Record<string, unknown> = {
   business_profile: defaultBusinessProfile,
 };
 
-let dbInstance: DatabaseSync | null = null;
+let dbAdapterInstance: DbAdapter | null = null;
+let dbInitPromise: Promise<DbAdapter> | null = null;
 let lastSyncVersion = new Date().toISOString();
 
 export function getSyncVersion(): string {
@@ -136,47 +173,93 @@ function ensureDirectories() {
   fs.mkdirSync(BACKUP_DIR, { recursive: true });
 }
 
-export function getDb(): DatabaseSync {
-  if (!dbInstance) {
+export async function initDb(): Promise<DbAdapter> {
+  if (dbAdapterInstance) return dbAdapterInstance;
+  if (dbInitPromise) return dbInitPromise;
+
+  dbInitPromise = (async () => {
+    const driver = resolveDbDriver();
+
+    if (driver === 'mysql') {
+      const mysqlCfg = getMysqlConfigFromEnv();
+      const adapter = await MysqlDbAdapter.create(mysqlCfg);
+      dbAdapterInstance = adapter;
+      await verifyMysqlImportedSchema(adapter);
+      await seedCrmDefaultsIfEmpty(adapter);
+      await initServerSessionSecret(adapter);
+      return adapter;
+    }
+
     ensureDirectories();
     const hadExistingDb = fs.existsSync(DB_PATH) && fs.statSync(DB_PATH).size > 0;
-    dbInstance = new DatabaseSync(DB_PATH);
-    dbInstance.exec('PRAGMA busy_timeout = 5000;');
+    const { DatabaseSync } = await import('node:sqlite');
+    const sqliteRaw = new DatabaseSync(DB_PATH);
+    sqliteRaw.exec('PRAGMA busy_timeout = 5000;');
     try {
-      dbInstance.exec('PRAGMA journal_mode = WAL;');
+      sqliteRaw.exec('PRAGMA journal_mode = WAL;');
     } catch (walErr) {
       console.warn('SQLite WAL mode unavailable, falling back to TRUNCATE/DELETE journal mode:', walErr);
       try {
-        dbInstance.exec('PRAGMA journal_mode = TRUNCATE;');
+        sqliteRaw.exec('PRAGMA journal_mode = TRUNCATE;');
       } catch {
         try {
-          dbInstance.exec('PRAGMA journal_mode = DELETE;');
+          sqliteRaw.exec('PRAGMA journal_mode = DELETE;');
         } catch {
           // ignore if journal mode cannot be switched
         }
       }
     }
-    dbInstance.exec('PRAGMA foreign_keys = ON;');
-    dbInstance.exec('PRAGMA synchronous = NORMAL;');
-    runMigrations(dbInstance, hadExistingDb);
+    sqliteRaw.exec('PRAGMA foreign_keys = ON;');
+    sqliteRaw.exec('PRAGMA synchronous = NORMAL;');
+
+    const adapter = new SqliteDbAdapter(sqliteRaw);
+    dbAdapterInstance = adapter;
+    await runSqliteMigrations(adapter, hadExistingDb);
+    await initServerSessionSecret(adapter);
+    return adapter;
+  })().catch((err) => {
+    dbInitPromise = null;
+    dbAdapterInstance = null;
+    throw err;
+  });
+
+  return dbInitPromise;
+}
+
+export async function getDb(): Promise<DbAdapter> {
+  return initDb();
+}
+
+export async function withDbTransaction<T>(fn: (tx: DbExecutor) => Promise<T>): Promise<T> {
+  const db = await getDb();
+  return db.withTransaction(fn);
+}
+
+export async function closeDb(): Promise<void> {
+  if (dbAdapterInstance) {
+    await dbAdapterInstance.close();
+    dbAdapterInstance = null;
+    dbInitPromise = null;
   }
-  return dbInstance;
 }
 
 let cachedFallbackSessionSecret: string | null = null;
 
-export function getOrCreateServerSessionSecret(dbArg?: DatabaseSync): string {
+export async function initServerSessionSecret(dbArg?: DbExecutor): Promise<string> {
   if (process.env.SESSION_SECRET && process.env.SESSION_SECRET.trim()) {
     return process.env.SESSION_SECRET.trim();
   }
   if (cachedFallbackSessionSecret) return cachedFallbackSessionSecret;
-  const db = dbArg || getDb();
-  const row = db
-    .prepare('SELECT data_json FROM app_collections WHERE collection_key = ?')
-    .get('server_session_secret') as { data_json: string } | undefined;
+
+  const db = dbArg || (await getDb());
+  const row = await db.get<{ data_json: unknown }>(
+    'SELECT data_json FROM app_collections WHERE collection_key = ?',
+    ['server_session_secret']
+  );
+
   if (row?.data_json) {
     try {
-      const parsed = JSON.parse(row.data_json) as { secret?: string };
+      const parsed = parseJsonSafe<{ secret?: string }>(row.data_json, {});
       if (parsed?.secret && typeof parsed.secret === 'string' && parsed.secret.length >= 32) {
         cachedFallbackSessionSecret = parsed.secret;
         return cachedFallbackSessionSecret;
@@ -185,19 +268,31 @@ export function getOrCreateServerSessionSecret(dbArg?: DatabaseSync): string {
       // regenerate below
     }
   }
+
   const generated = crypto.randomBytes(32).toString('hex');
-  db.prepare(`
-    INSERT INTO app_collections (collection_key, data_json, updated_at)
-    VALUES (?, ?, ?)
-    ON CONFLICT(collection_key) DO UPDATE SET
-      data_json = excluded.data_json,
-      updated_at = excluded.updated_at
-  `).run('server_session_secret', JSON.stringify({ secret: generated }), new Date().toISOString());
+  const upsertSql = buildUpsertSql({
+    driver: db.driver,
+    table: 'app_collections',
+    insertColumns: ['collection_key', 'data_json', 'updated_at'],
+    conflictColumn: 'collection_key',
+    updateAssignments: [{ column: 'data_json' }, { column: 'updated_at' }],
+  });
+  await db.run(upsertSql, ['server_session_secret', JSON.stringify({ secret: generated }), db.formatTimestamp()]);
   cachedFallbackSessionSecret = generated;
   return generated;
 }
 
-export function createVerifiedBackup(reason: string): BackupMetadata {
+export function getCachedServerSessionSecret(): string {
+  if (process.env.SESSION_SECRET && process.env.SESSION_SECRET.trim()) {
+    return process.env.SESSION_SECRET.trim();
+  }
+  if (!cachedFallbackSessionSecret) {
+    throw new Error('Server session secret is not initialized yet.');
+  }
+  return cachedFallbackSessionSecret;
+}
+
+export async function createVerifiedBackup(reason: string): Promise<BackupMetadata> {
   ensureDirectories();
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
   const safeReason = reason.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 40) || 'manual';
@@ -206,11 +301,11 @@ export function createVerifiedBackup(reason: string): BackupMetadata {
   const jsonBackupPath = path.join(BACKUP_DIR, `${id}.json`);
 
   let sqliteFile: string | null = null;
-  if (fs.existsSync(DB_PATH) && fs.statSync(DB_PATH).size > 0) {
+  if (dbAdapterInstance?.driver === 'sqlite' && fs.existsSync(DB_PATH) && fs.statSync(DB_PATH).size > 0) {
     try {
-      if (dbInstance) {
+      if (dbAdapterInstance instanceof SqliteDbAdapter) {
         const escaped = sqliteBackupPath.replace(/'/g, "''");
-        dbInstance.exec(`VACUUM INTO '${escaped}';`);
+        dbAdapterInstance.rawDb.exec(`VACUUM INTO '${escaped}';`);
       } else {
         fs.copyFileSync(DB_PATH, sqliteBackupPath);
       }
@@ -221,25 +316,19 @@ export function createVerifiedBackup(reason: string): BackupMetadata {
     }
   }
 
-  let snapshot: Record<string, unknown> = {};
+  const snapshot: Record<string, unknown> = {};
   const counts: Record<string, number> = {};
 
-  if (dbInstance) {
-    try {
-      const tableRows = (table: string) =>
-        dbInstance!.prepare(`SELECT * FROM ${table}`).all();
-      const tables = ['categories', 'cities', 'city_areas', 'products', 'customers', 'app_collections', 'admin_audit_logs'];
-      for (const tbl of tables) {
-        try {
-          const rows = tableRows(tbl);
-          snapshot[tbl] = rows;
-          counts[tbl] = rows.length;
-        } catch {
-          counts[tbl] = 0;
-        }
+  if (dbAdapterInstance) {
+    const tables = ['categories', 'cities', 'city_areas', 'products', 'customers', 'app_collections', 'admin_audit_logs'];
+    for (const tbl of tables) {
+      try {
+        const rows = await dbAdapterInstance.all(`SELECT * FROM ${tbl}`);
+        snapshot[tbl] = rows;
+        counts[tbl] = rows.length;
+      } catch {
+        counts[tbl] = 0;
       }
-    } catch {
-      // ignore on brand-new uninitialized db
     }
   }
 
@@ -285,8 +374,23 @@ export function listBackups(): Array<{ file: string; sizeBytes: number; createdA
     .slice(0, 30);
 }
 
-function runMigrations(db: DatabaseSync, hadExistingDb: boolean) {
-  db.exec(`
+async function verifyMysqlImportedSchema(db: DbAdapter): Promise<void> {
+  const missingTables: string[] = [];
+  for (const tbl of EXPECTED_MYSQL_TABLES) {
+    const exists = await db.tableExists(tbl);
+    if (!exists) {
+      missingTables.push(tbl);
+    }
+  }
+  if (missingTables.length > 0) {
+    throw new Error(
+      `Imported MySQL schema is missing required tables: ${missingTables.join(', ')}. Aborting without modifying or dropping existing tables.`
+    );
+  }
+}
+
+async function runSqliteMigrations(db: SqliteDbAdapter, hadExistingDb: boolean) {
+  await db.exec(`
     CREATE TABLE IF NOT EXISTS schema_migrations (
       id TEXT PRIMARY KEY,
       applied_at TEXT NOT NULL,
@@ -294,38 +398,36 @@ function runMigrations(db: DatabaseSync, hadExistingDb: boolean) {
     );
   `);
 
-  const hasMigration = (id: string): boolean => {
-    const row = db.prepare('SELECT id FROM schema_migrations WHERE id = ?').get(id);
+  const hasMigration = async (id: string): Promise<boolean> => {
+    const row = await db.get('SELECT id FROM schema_migrations WHERE id = ?', [id]);
     return Boolean(row);
   };
 
-  const recordMigration = (id: string, notes: string) => {
-    db.prepare('INSERT OR IGNORE INTO schema_migrations (id, applied_at, notes) VALUES (?, ?, ?)').run(
-      id,
-      new Date().toISOString(),
-      notes
+  const recordMigration = async (id: string, notes: string) => {
+    await db.run(
+      `${insertIgnoreKeyword(db.driver)} INTO schema_migrations (id, applied_at, notes) VALUES (?, ?, ?)`,
+      [id, new Date().toISOString(), notes]
     );
   };
 
-  // Pre-migration safety backup if an existing DB was present and pending migrations exist
   const pendingMigrations =
-    !hasMigration('001_initial_schema') ||
-    !hasMigration('002_seed_defaults_if_empty') ||
-    !hasMigration('003_upgrade_upcoming_categories_locations') ||
-    !hasMigration('004_delivery_charges_city_areas') ||
-    !hasMigration('005_all_provinces_kashmir_subcities_villages') ||
-    !hasMigration('006_product_delivery_fees_and_templates') ||
-    !hasMigration('007_fix_broadcast_templates_key') ||
-    !hasMigration('008_audit_clean_order_history_and_links') ||
-    !hasMigration('009_crm_schema_and_security_hardening');
+    !(await hasMigration('001_initial_schema')) ||
+    !(await hasMigration('002_seed_defaults_if_empty')) ||
+    !(await hasMigration('003_upgrade_upcoming_categories_locations')) ||
+    !(await hasMigration('004_delivery_charges_city_areas')) ||
+    !(await hasMigration('005_all_provinces_kashmir_subcities_villages')) ||
+    !(await hasMigration('006_product_delivery_fees_and_templates')) ||
+    !(await hasMigration('007_fix_broadcast_templates_key')) ||
+    !(await hasMigration('008_audit_clean_order_history_and_links')) ||
+    !(await hasMigration('009_crm_schema_and_security_hardening'));
 
   if (hadExistingDb && pendingMigrations) {
-    createVerifiedBackup('pre_migration');
+    await createVerifiedBackup('pre_migration');
   }
 
   // MIGRATION 001: Create all normalized tables cleanly
-  if (!hasMigration('001_initial_schema')) {
-    db.exec(`
+  if (!(await hasMigration('001_initial_schema'))) {
+    await db.exec(`
       CREATE TABLE IF NOT EXISTS categories (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
@@ -434,143 +536,131 @@ function runMigrations(db: DatabaseSync, hadExistingDb: boolean) {
         created_at TEXT NOT NULL
       );
     `);
-    recordMigration('001_initial_schema', 'Created normalized categories, cities, city_areas, products, customers, app_collections, admin_audit_logs');
+    await recordMigration(
+      '001_initial_schema',
+      'Created normalized categories, cities, city_areas, products, customers, app_collections, admin_audit_logs'
+    );
   }
 
   // MIGRATION 002: Seed defaults ONLY into empty tables/keys (strictly non-destructive)
-  if (!hasMigration('002_seed_defaults_if_empty')) {
-    const now = new Date().toISOString();
+  if (!(await hasMigration('002_seed_defaults_if_empty'))) {
+    const now = db.formatTimestamp();
 
-    const catCount = Number((db.prepare('SELECT COUNT(*) as cnt FROM categories').get() as { cnt: number }).cnt || 0);
-    if (catCount === 0) {
-      const stmt = db.prepare(`
-        INSERT OR IGNORE INTO categories (id, name, urdu_name, parent_category_id, level, description, is_upcoming, is_active, display_order, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `);
+    const catCountRow = await db.get<{ cnt: number }>('SELECT COUNT(*) as cnt FROM categories');
+    if (Number(catCountRow?.cnt || 0) === 0) {
       for (const c of defaultCategoryRecords) {
         const level = c.level || computeCategoryLevel(c, defaultCategoryRecords);
-        stmt.run(
+        await db.run(
+          `${insertIgnoreKeyword(db.driver)} INTO categories (id, name, urdu_name, parent_category_id, level, description, is_upcoming, is_active, display_order, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            c.id,
+            c.name,
+            c.urduName || null,
+            c.parentCategoryId || null,
+            level,
+            c.description || null,
+            c.isUpcoming ? 1 : 0,
+            c.isActive === false ? 0 : 1,
+            c.displayOrder || 0,
+            now,
+            now,
+          ]
+        );
+      }
+    }
+
+    const cityCountRow = await db.get<{ cnt: number }>('SELECT COUNT(*) as cnt FROM cities');
+    if (Number(cityCountRow?.cnt || 0) === 0) {
+      for (let idx = 0; idx < defaultDeliveryCities.length; idx++) {
+        const city = defaultDeliveryCities[idx];
+        const cityId = city.id || slugifyId('city', city.name);
+        await db.run(
+          `${insertIgnoreKeyword(db.driver)} INTO cities (id, name, allowed, delivery_charge, display_order, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [cityId, city.name, city.allowed ? 1 : 0, city.deliveryCharge ?? null, idx + 1, now, now]
+        );
+        for (const area of city.areas || []) {
+          const areaId = area.id || slugifyId('area', `${city.name}_${area.name}`);
+          await db.run(
+            `${insertIgnoreKeyword(db.driver)} INTO city_areas (id, city_id, name, allowed, delivery_charge, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            [areaId, cityId, area.name, area.allowed ? 1 : 0, area.deliveryCharge ?? null, now, now]
+          );
+        }
+      }
+    }
+
+    const prodCountRow = await db.get<{ cnt: number }>('SELECT COUNT(*) as cnt FROM products');
+    if (Number(prodCountRow?.cnt || 0) === 0) {
+      for (const p of defaultProducts) {
+        await upsertProductRow(db, p);
+      }
+    }
+
+    const custCountRow = await db.get<{ cnt: number }>('SELECT COUNT(*) as cnt FROM customers');
+    if (Number(custCountRow?.cnt || 0) === 0) {
+      for (const cust of defaultCustomers) {
+        await upsertCustomerRow(db, cust);
+      }
+    }
+
+    for (const [key, val] of Object.entries(DEFAULT_COLLECTION_MAP)) {
+      await db.run(
+        `${insertIgnoreKeyword(db.driver)} INTO app_collections (collection_key, data_json, updated_at)
+         VALUES (?, ?, ?)`,
+        [key, JSON.stringify(val), now]
+      );
+    }
+
+    await recordMigration('002_seed_defaults_if_empty', 'Seeded empty tables safely');
+  }
+
+  // MIGRATION 003: Non-destructive normalization for Upcoming Viral Products | Coming Soon, 3-level hierarchy & City areas
+  if (!(await hasMigration('003_upgrade_upcoming_categories_locations'))) {
+    const now = db.formatTimestamp();
+
+    const existingUpcoming = await db.get<Record<string, unknown>>(
+      'SELECT * FROM categories WHERE id = ? OR is_upcoming = 1',
+      [UPCOMING_CATEGORY_ID]
+    );
+    if (existingUpcoming) {
+      await db.run(
+        `UPDATE categories
+         SET name = ?, is_upcoming = 1, is_active = 1, level = 1, parent_category_id = NULL, updated_at = ?
+         WHERE id = ?`,
+        [UPCOMING_CATEGORY_NAME, now, String(existingUpcoming.id)]
+      );
+    } else {
+      const upCat = defaultCategoryRecords.find((c) => c.id === UPCOMING_CATEGORY_ID)!;
+      await db.run(
+        `${insertIgnoreKeyword(db.driver)} INTO categories (id, name, urdu_name, parent_category_id, level, description, is_upcoming, is_active, display_order, created_at, updated_at)
+         VALUES (?, ?, ?, NULL, 1, ?, 1, 1, ?, ?, ?)`,
+        [upCat.id, UPCOMING_CATEGORY_NAME, upCat.urduName || null, upCat.description || null, 7, now, now]
+      );
+    }
+
+    for (const c of defaultCategoryRecords) {
+      await db.run(
+        `${insertIgnoreKeyword(db.driver)} INTO categories (id, name, urdu_name, parent_category_id, level, description, is_upcoming, is_active, display_order, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
           c.id,
           c.name,
           c.urduName || null,
           c.parentCategoryId || null,
-          level,
+          c.level || computeCategoryLevel(c, defaultCategoryRecords),
           c.description || null,
           c.isUpcoming ? 1 : 0,
           c.isActive === false ? 0 : 1,
           c.displayOrder || 0,
           now,
-          now
-        );
-      }
-    }
-
-    const cityCount = Number((db.prepare('SELECT COUNT(*) as cnt FROM cities').get() as { cnt: number }).cnt || 0);
-    if (cityCount === 0) {
-      const insertCity = db.prepare(`
-        INSERT OR IGNORE INTO cities (id, name, allowed, delivery_charge, display_order, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-      `);
-      const insertArea = db.prepare(`
-        INSERT OR IGNORE INTO city_areas (id, city_id, name, allowed, delivery_charge, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-      `);
-      defaultDeliveryCities.forEach((city, idx) => {
-        const cityId = city.id || slugifyId('city', city.name);
-        insertCity.run(
-          cityId,
-          city.name,
-          city.allowed ? 1 : 0,
-          city.deliveryCharge ?? null,
-          idx + 1,
           now,
-          now
-        );
-        (city.areas || []).forEach((area) => {
-          const areaId = area.id || slugifyId('area', `${city.name}_${area.name}`);
-          insertArea.run(
-            areaId,
-            cityId,
-            area.name,
-            area.allowed ? 1 : 0,
-            area.deliveryCharge ?? null,
-            now,
-            now
-          );
-        });
-      });
-    }
-
-    const prodCount = Number((db.prepare('SELECT COUNT(*) as cnt FROM products').get() as { cnt: number }).cnt || 0);
-    if (prodCount === 0) {
-      for (const p of defaultProducts) {
-        upsertProductRow(db, p);
-      }
-    }
-
-    const custCount = Number((db.prepare('SELECT COUNT(*) as cnt FROM customers').get() as { cnt: number }).cnt || 0);
-    if (custCount === 0) {
-      for (const cust of defaultCustomers) {
-        upsertCustomerRow(db, cust);
-      }
-    }
-
-    const insertCollection = db.prepare(`
-      INSERT OR IGNORE INTO app_collections (collection_key, data_json, updated_at)
-      VALUES (?, ?, ?)
-    `);
-    for (const [key, val] of Object.entries(DEFAULT_COLLECTION_MAP)) {
-      insertCollection.run(key, JSON.stringify(val), now);
-    }
-
-    recordMigration('002_seed_defaults_if_empty', 'Seeded empty tables safely using INSERT OR IGNORE');
-  }
-
-  // MIGRATION 003: Non-destructive normalization for Upcoming Viral Products | Coming Soon, 3-level hierarchy & City areas
-  if (!hasMigration('003_upgrade_upcoming_categories_locations')) {
-    const now = new Date().toISOString();
-
-    // 1. Ensure canonical Upcoming category record exists and uses new label without losing ID
-    const existingUpcoming = db
-      .prepare('SELECT * FROM categories WHERE id = ? OR is_upcoming = 1')
-      .get(UPCOMING_CATEGORY_ID) as Record<string, unknown> | undefined;
-    if (existingUpcoming) {
-      db.prepare(`
-        UPDATE categories
-        SET name = ?, is_upcoming = 1, is_active = 1, level = 1, parent_category_id = NULL, updated_at = ?
-        WHERE id = ?
-      `).run(UPCOMING_CATEGORY_NAME, now, String(existingUpcoming.id));
-    } else {
-      const upCat = defaultCategoryRecords.find((c) => c.id === UPCOMING_CATEGORY_ID)!;
-      db.prepare(`
-        INSERT OR IGNORE INTO categories (id, name, urdu_name, parent_category_id, level, description, is_upcoming, is_active, display_order, created_at, updated_at)
-        VALUES (?, ?, ?, NULL, 1, ?, 1, 1, ?, ?, ?)
-      `).run(upCat.id, UPCOMING_CATEGORY_NAME, upCat.urduName || null, upCat.description || null, 7, now, now);
-    }
-
-    // 2. Ensure default subcategories/child categories exist without touching custom user categories
-    const insertCatIgnore = db.prepare(`
-      INSERT OR IGNORE INTO categories (id, name, urdu_name, parent_category_id, level, description, is_upcoming, is_active, display_order, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-    for (const c of defaultCategoryRecords) {
-      insertCatIgnore.run(
-        c.id,
-        c.name,
-        c.urduName || null,
-        c.parentCategoryId || null,
-        c.level || computeCategoryLevel(c, defaultCategoryRecords),
-        c.description || null,
-        c.isUpcoming ? 1 : 0,
-        c.isActive === false ? 0 : 1,
-        c.displayOrder || 0,
-        now,
-        now
+        ]
       );
     }
 
-    // 3. Normalize existing Upcoming products non-destructively
-    const allProds = getAllProductsFromDb(db);
+    const allProds = await getAllProductsFromDb(db);
     for (const p of allProds) {
       if (isProductPurchaseBlocked(p)) {
         const updated: ProductItem = {
@@ -581,291 +671,224 @@ function runMigrations(db: DatabaseSync, hadExistingDb: boolean) {
           upcomingStatus: 'coming_soon',
           stockQty: 0,
         };
-        upsertProductRow(db, updated);
+        await upsertProductRow(db, updated);
       }
     }
 
-    // 4. Sync business_profile.deliveryCities with cities & city_areas non-destructively
-    const profile = getCollectionValue<BusinessProfile>(db, 'business_profile', defaultBusinessProfile);
+    const profile = await getCollectionValue<BusinessProfile>(db, 'business_profile', defaultBusinessProfile);
     if (profile.deliveryCities && profile.deliveryCities.length > 0) {
-      const insertCityIgnore = db.prepare(`
-        INSERT OR IGNORE INTO cities (id, name, allowed, display_order, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-      `);
-      profile.deliveryCities.forEach((dc, idx) => {
-        insertCityIgnore.run(dc.id || slugifyId('city', dc.name), dc.name.trim(), dc.allowed ? 1 : 0, idx + 1, now, now);
-      });
-    }
-    // Add default areas only to cities that currently have 0 areas
-    const insertAreaIgnore = db.prepare(`
-      INSERT OR IGNORE INTO city_areas (id, city_id, name, allowed, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `);
-    for (const defCity of defaultDeliveryCities) {
-      const cityRow = db.prepare('SELECT id FROM cities WHERE LOWER(name) = LOWER(?)').get(defCity.name) as { id: string } | undefined;
-      if (cityRow && defCity.areas && defCity.areas.length > 0) {
-        const existingAreaCnt = Number(
-          (db.prepare('SELECT COUNT(*) as cnt FROM city_areas WHERE city_id = ?').get(cityRow.id) as { cnt: number }).cnt || 0
+      for (let idx = 0; idx < profile.deliveryCities.length; idx++) {
+        const dc = profile.deliveryCities[idx];
+        await db.run(
+          `${insertIgnoreKeyword(db.driver)} INTO cities (id, name, allowed, display_order, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+          [dc.id || slugifyId('city', dc.name), dc.name.trim(), dc.allowed ? 1 : 0, idx + 1, now, now]
         );
-        if (existingAreaCnt === 0) {
+      }
+    }
+
+    for (const defCity of defaultDeliveryCities) {
+      const cityRow = await db.get<{ id: string }>(
+        'SELECT id FROM cities WHERE LOWER(name) = LOWER(?)',
+        [defCity.name]
+      );
+      if (cityRow && defCity.areas && defCity.areas.length > 0) {
+        const cntRow = await db.get<{ cnt: number }>(
+          'SELECT COUNT(*) as cnt FROM city_areas WHERE city_id = ?',
+          [cityRow.id]
+        );
+        if (Number(cntRow?.cnt || 0) === 0) {
           for (const a of defCity.areas) {
-            insertAreaIgnore.run(a.id, cityRow.id, a.name, a.allowed ? 1 : 0, now, now);
+            await db.run(
+              `${insertIgnoreKeyword(db.driver)} INTO city_areas (id, city_id, name, allowed, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?)`,
+              [a.id, cityRow.id, a.name, a.allowed ? 1 : 0, now, now]
+            );
           }
         }
       }
     }
-    syncDeliveryCitiesIntoBusinessProfile(db);
+    await syncDeliveryCitiesIntoBusinessProfile(db);
 
-    recordMigration('003_upgrade_upcoming_categories_locations', 'Normalized Upcoming category label, seeded multi-level sample subcategories, and synced city areas');
+    await recordMigration(
+      '003_upgrade_upcoming_categories_locations',
+      'Normalized Upcoming category label, seeded multi-level sample subcategories, and synced city areas'
+    );
   }
 
-  if (!hasMigration('004_delivery_charges_city_areas')) {
-    const now = new Date().toISOString();
+  // MIGRATION 004
+  if (!(await hasMigration('004_delivery_charges_city_areas'))) {
+    const now = db.formatTimestamp();
 
-    const cityCols = db.prepare('PRAGMA table_info(cities)').all() as Array<{ name: string }>;
-    if (!cityCols.some((c) => c.name === 'delivery_charge')) {
-      db.exec('ALTER TABLE cities ADD COLUMN delivery_charge REAL;');
+    if (!(await db.columnExists('cities', 'delivery_charge'))) {
+      await db.exec('ALTER TABLE cities ADD COLUMN delivery_charge REAL;');
+    }
+    if (!(await db.columnExists('city_areas', 'delivery_charge'))) {
+      await db.exec('ALTER TABLE city_areas ADD COLUMN delivery_charge REAL;');
     }
 
-    const areaCols = db.prepare('PRAGMA table_info(city_areas)').all() as Array<{ name: string }>;
-    if (!areaCols.some((c) => c.name === 'delivery_charge')) {
-      db.exec('ALTER TABLE city_areas ADD COLUMN delivery_charge REAL;');
-    }
-
-    // Ensure Muzaffarabad stays active and defaults to Rs. 50 for City Center
-    const mzdRow = db
-      .prepare("SELECT id, delivery_charge FROM cities WHERE LOWER(TRIM(name)) = 'muzaffarabad'")
-      .get() as { id: string; delivery_charge: number | null } | undefined;
+    const mzdRow = await db.get<{ id: string; delivery_charge: number | null }>(
+      "SELECT id, delivery_charge FROM cities WHERE LOWER(TRIM(name)) = 'muzaffarabad'"
+    );
 
     if (mzdRow) {
-      db.prepare(
-        'UPDATE cities SET allowed = 1, delivery_charge = COALESCE(delivery_charge, 50), updated_at = ? WHERE id = ?'
-      ).run(now, mzdRow.id);
+      await db.run(
+        'UPDATE cities SET allowed = 1, delivery_charge = COALESCE(delivery_charge, 50), updated_at = ? WHERE id = ?',
+        [now, mzdRow.id]
+      );
 
-      const cityCenterArea = db
-        .prepare("SELECT id FROM city_areas WHERE city_id = ? AND LOWER(TRIM(name)) = 'city center'")
-        .get(mzdRow.id) as { id: string } | undefined;
+      const cityCenterArea = await db.get<{ id: string }>(
+        "SELECT id FROM city_areas WHERE city_id = ? AND LOWER(TRIM(name)) = 'city center'",
+        [mzdRow.id]
+      );
 
       if (!cityCenterArea) {
-        db.prepare(
-          'INSERT OR IGNORE INTO city_areas (id, city_id, name, allowed, delivery_charge, created_at, updated_at) VALUES (?, ?, ?, 1, 50, ?, ?)'
-        ).run('area_mzd_city_center', mzdRow.id, 'City Center', now, now);
+        await db.run(
+          `${insertIgnoreKeyword(db.driver)} INTO city_areas (id, city_id, name, allowed, delivery_charge, created_at, updated_at) VALUES (?, ?, ?, 1, 50, ?, ?)`,
+          ['area_mzd_city_center', mzdRow.id, 'City Center', now, now]
+        );
       } else {
-        db.prepare(
-          'UPDATE city_areas SET allowed = 1, delivery_charge = COALESCE(delivery_charge, 50), updated_at = ? WHERE id = ?'
-        ).run(now, cityCenterArea.id);
+        await db.run(
+          'UPDATE city_areas SET allowed = 1, delivery_charge = COALESCE(delivery_charge, 50), updated_at = ? WHERE id = ?',
+          [now, cityCenterArea.id]
+        );
       }
 
-      db.prepare(
-        "UPDATE city_areas SET delivery_charge = COALESCE(delivery_charge, 50), updated_at = ? WHERE city_id = ? AND LOWER(TRIM(name)) = 'madina market'"
-      ).run(now, mzdRow.id);
+      await db.run(
+        "UPDATE city_areas SET delivery_charge = COALESCE(delivery_charge, 50), updated_at = ? WHERE city_id = ? AND LOWER(TRIM(name)) = 'madina market'",
+        [now, mzdRow.id]
+      );
     }
 
-    const currentProfile = getCollectionValue<BusinessProfile>(db, 'business_profile', defaultBusinessProfile);
+    const currentProfile = await getCollectionValue<BusinessProfile>(db, 'business_profile', defaultBusinessProfile);
     if (currentProfile.defaultCityCenterDeliveryCharge === undefined) {
-      saveCollectionValue(db, 'business_profile', {
+      await saveCollectionValue(db, 'business_profile', {
         ...currentProfile,
         defaultCityCenterDeliveryCharge: 50,
       });
     }
-    syncDeliveryCitiesIntoBusinessProfile(db);
+    await syncDeliveryCitiesIntoBusinessProfile(db);
 
-    recordMigration('004_delivery_charges_city_areas', 'Added per-city and per-area delivery_charge columns with City Center Rs. 50 default');
+    await recordMigration(
+      '004_delivery_charges_city_areas',
+      'Added per-city and per-area delivery_charge columns with City Center Rs. 50 default'
+    );
   }
 
-  // MIGRATION 005: Non-destructive expansion across ALL Pakistan provinces & Azad Kashmir (cities, sub-cities, child cities & villages)
-  if (!hasMigration('005_all_provinces_kashmir_subcities_villages')) {
+  // MIGRATION 005
+  if (!(await hasMigration('005_all_provinces_kashmir_subcities_villages'))) {
     if (hadExistingDb) {
-      createVerifiedBackup('pre_migration_005_provinces');
+      await createVerifiedBackup('pre_migration_005_provinces');
     }
-    const now = new Date().toISOString();
+    const now = db.formatTimestamp();
 
-    const cityCols = db.prepare('PRAGMA table_info(cities)').all() as Array<{ name: string }>;
-    if (!cityCols.some((c) => c.name === 'province')) {
-      db.exec('ALTER TABLE cities ADD COLUMN province TEXT;');
+    if (!(await db.columnExists('cities', 'province'))) {
+      await db.exec('ALTER TABLE cities ADD COLUMN province TEXT;');
     }
-
-    const areaCols = db.prepare('PRAGMA table_info(city_areas)').all() as Array<{ name: string }>;
-    if (!areaCols.some((c) => c.name === 'area_type')) {
-      db.exec('ALTER TABLE city_areas ADD COLUMN area_type TEXT;');
+    if (!(await db.columnExists('city_areas', 'area_type'))) {
+      await db.exec('ALTER TABLE city_areas ADD COLUMN area_type TEXT;');
     }
 
-    const findCityByNameOrId = db.prepare(
-      'SELECT id, name, province FROM cities WHERE id = ? OR LOWER(TRIM(name)) = LOWER(TRIM(?)) LIMIT 1'
-    );
-    const insertCityIgnore = db.prepare(`
-      INSERT OR IGNORE INTO cities (id, name, province, allowed, delivery_charge, display_order, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-    const updateCityProvinceOnly = db.prepare(
-      'UPDATE cities SET province = COALESCE(NULLIF(TRIM(province), \'\'), ?), updated_at = ? WHERE id = ?'
-    );
-    const findAreaByName = db.prepare(
-      'SELECT id FROM city_areas WHERE city_id = ? AND LOWER(TRIM(name)) = LOWER(TRIM(?)) LIMIT 1'
-    );
-    const updateAreaTypeOnly = db.prepare(
-      'UPDATE city_areas SET area_type = COALESCE(NULLIF(TRIM(area_type), \'\'), ?), updated_at = ? WHERE id = ?'
-    );
-    const insertAreaIgnore = db.prepare(`
-      INSERT OR IGNORE INTO city_areas (id, city_id, name, allowed, delivery_charge, area_type, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-
-    defaultDeliveryCities.forEach((defCity, idx) => {
+    for (let idx = 0; idx < defaultDeliveryCities.length; idx++) {
+      const defCity = defaultDeliveryCities[idx];
       const resolvedProv = inferProvinceForCity(defCity.name, defCity.province);
-      const existingCity = findCityByNameOrId.get(
-        defCity.id || slugifyId('city', defCity.name),
-        defCity.name
-      ) as { id: string; name: string; province?: string } | undefined;
+      const existingCity = await db.get<{ id: string; name: string; province?: string }>(
+        'SELECT id, name, province FROM cities WHERE id = ? OR LOWER(TRIM(name)) = LOWER(TRIM(?)) LIMIT 1',
+        [defCity.id || slugifyId('city', defCity.name), defCity.name]
+      );
 
       let targetCityId: string;
       if (existingCity) {
         targetCityId = existingCity.id;
-        // Strictly preserve existing allowed & delivery_charge; only populate missing province label
-        updateCityProvinceOnly.run(resolvedProv, now, targetCityId);
+        await db.run(
+          "UPDATE cities SET province = COALESCE(NULLIF(TRIM(province), ''), ?), updated_at = ? WHERE id = ?",
+          [resolvedProv, now, targetCityId]
+        );
       } else {
         targetCityId = defCity.id || slugifyId('city', defCity.name);
-        insertCityIgnore.run(
-          targetCityId,
-          defCity.name,
-          resolvedProv,
-          defCity.allowed ? 1 : 0,
-          defCity.deliveryCharge ?? null,
-          idx + 1,
-          now,
-          now
+        await db.run(
+          `${insertIgnoreKeyword(db.driver)} INTO cities (id, name, province, allowed, delivery_charge, display_order, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            targetCityId,
+            defCity.name,
+            resolvedProv,
+            defCity.allowed ? 1 : 0,
+            defCity.deliveryCharge ?? null,
+            idx + 1,
+            now,
+            now,
+          ]
         );
       }
 
       for (const a of defCity.areas || []) {
-        const existingArea = findAreaByName.get(targetCityId, a.name) as { id: string } | undefined;
+        const existingArea = await db.get<{ id: string }>(
+          'SELECT id FROM city_areas WHERE city_id = ? AND LOWER(TRIM(name)) = LOWER(TRIM(?)) LIMIT 1',
+          [targetCityId, a.name]
+        );
         if (existingArea) {
           if (a.areaType) {
-            updateAreaTypeOnly.run(a.areaType, now, existingArea.id);
+            await db.run(
+              "UPDATE city_areas SET area_type = COALESCE(NULLIF(TRIM(area_type), ''), ?), updated_at = ? WHERE id = ?",
+              [a.areaType, now, existingArea.id]
+            );
           }
         } else {
-          insertAreaIgnore.run(
-            a.id || slugifyId('area', `${defCity.name}_${a.name}`),
-            targetCityId,
-            a.name,
-            a.allowed !== false ? 1 : 0,
-            a.deliveryCharge ?? null,
-            a.areaType || null,
-            now,
-            now
+          await db.run(
+            `${insertIgnoreKeyword(db.driver)} INTO city_areas (id, city_id, name, allowed, delivery_charge, area_type, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+              a.id || slugifyId('area', `${defCity.name}_${a.name}`),
+              targetCityId,
+              a.name,
+              a.allowed !== false ? 1 : 0,
+              a.deliveryCharge ?? null,
+              a.areaType || null,
+              now,
+              now,
+            ]
           );
         }
       }
-    });
+    }
 
-    // Backfill province on any custom cities created before Migration 005
-    const allCityRows = db.prepare('SELECT id, name, province FROM cities').all() as Array<{
-      id: string;
-      name: string;
-      province?: string | null;
-    }>;
+    const allCityRows = await db.all<{ id: string; name: string; province?: string | null }>(
+      'SELECT id, name, province FROM cities'
+    );
     for (const row of allCityRows) {
       if (!row.province || !String(row.province).trim()) {
-        db.prepare('UPDATE cities SET province = ? WHERE id = ?').run(
-          inferProvinceForCity(row.name),
-          row.id
-        );
+        await db.run('UPDATE cities SET province = ? WHERE id = ?', [inferProvinceForCity(row.name), row.id]);
       }
     }
 
-    syncDeliveryCitiesIntoBusinessProfile(db);
-    recordMigration(
+    await syncDeliveryCitiesIntoBusinessProfile(db);
+    await recordMigration(
       '005_all_provinces_kashmir_subcities_villages',
       'Non-destructively added all Pakistan provinces & Azad Kashmir cities, sub-cities, child cities & villages while keeping Standard delivery open nationwide'
     );
   }
 
-  // MIGRATION 006: Add per-product delivery_fee_type & custom_delivery_charge columns + update default broadcast Super Best Price & madinamarket.pk URLs
-  if (!hasMigration('006_product_delivery_fees_and_templates')) {
+  // MIGRATION 006
+  if (!(await hasMigration('006_product_delivery_fees_and_templates'))) {
     if (hadExistingDb) {
-      createVerifiedBackup('pre_migration_006_delivery_fees');
+      await createVerifiedBackup('pre_migration_006_delivery_fees');
     }
-    const now = new Date().toISOString();
+    const now = db.formatTimestamp();
 
-    const prodCols = db.prepare('PRAGMA table_info(products)').all() as Array<{ name: string }>;
-    if (!prodCols.some((c) => c.name === 'delivery_fee_type')) {
-      db.exec("ALTER TABLE products ADD COLUMN delivery_fee_type TEXT NOT NULL DEFAULT 'default';");
+    if (!(await db.columnExists('products', 'delivery_fee_type'))) {
+      await db.exec("ALTER TABLE products ADD COLUMN delivery_fee_type TEXT NOT NULL DEFAULT 'default';");
     }
-    if (!prodCols.some((c) => c.name === 'custom_delivery_charge')) {
-      db.exec('ALTER TABLE products ADD COLUMN custom_delivery_charge REAL;');
+    if (!(await db.columnExists('products', 'custom_delivery_charge'))) {
+      await db.exec('ALTER TABLE products ADD COLUMN custom_delivery_charge REAL;');
     }
 
-    // Non-destructively upgrade tpl_product_broadcast in templates if it still contains "Wholesale Price" / "Wholesale Deal"
     try {
-      const tplRow = db
-        .prepare("SELECT data_json FROM app_collections WHERE collection_key = 'templates'")
-        .get() as { data_json?: string } | undefined;
+      const tplRow = await db.get<{ data_json?: unknown }>(
+        "SELECT data_json FROM app_collections WHERE collection_key = 'templates'"
+      );
       if (tplRow?.data_json) {
-        const templates = JSON.parse(tplRow.data_json) as Array<Record<string, unknown>>;
-        let changed = false;
-        const nextTemplates = templates.map((t) => {
-          if (t && (t.id === 'tpl_product_broadcast' || t.type === 'product_broadcast') && typeof t.content === 'string') {
-            let nextContent = t.content
-              .replace(/Wholesale Deal!/gi, 'Super Best Deal!')
-              .replace(/Wholesale Price:/gi, 'Super Best Price:');
-            if (nextContent !== t.content) {
-              changed = true;
-              return { ...t, content: nextContent };
-            }
-          }
-          return t;
-        });
-        if (changed) {
-          db.prepare('UPDATE app_collections SET data_json = ?, updated_at = ? WHERE collection_key = ?').run(
-            JSON.stringify(nextTemplates),
-            now,
-            'templates'
-          );
-        }
-      }
-    } catch {
-      // ignore JSON parse issues on custom collection
-    }
-
-    // Non-destructively replace legacy seeded 100dagar.pk/example.com dummy URLs in product_broadcasts & saved_broadcasts
-    for (const colKey of ['product_broadcasts', 'saved_broadcasts']) {
-      try {
-        const row = db
-          .prepare('SELECT data_json FROM app_collections WHERE collection_key = ?')
-          .get(colKey) as { data_json?: string } | undefined;
-        if (row?.data_json && (row.data_json.includes('100dagar.pk') || row.data_json.includes('Wholesale'))) {
-          const updatedJson = row.data_json
-            .replace(/https?:\/\/100dagar\.pk/gi, 'https://madinamarket.pk')
-            .replace(/Our Wholesale:/gi, 'Our Super Best Price:')
-            .replace(/New wholesale arrival/gi, 'New Super Best Price arrival');
-          if (updatedJson !== row.data_json) {
-            db.prepare('UPDATE app_collections SET data_json = ?, updated_at = ? WHERE collection_key = ?').run(
-              updatedJson,
-              now,
-              colKey
-            );
-          }
-        }
-      } catch {
-        // ignore
-      }
-    }
-
-    recordMigration(
-      '006_product_delivery_fees_and_templates',
-      'Added product delivery_fee_type & custom_delivery_charge columns and updated broadcast templates to Super Best Price & madinamarket.pk'
-    );
-  }
-
-  // MIGRATION 007: Upgrade templates collection under correct key ('templates') for existing DBs
-  if (!hasMigration('007_fix_broadcast_templates_key')) {
-    const now = new Date().toISOString();
-    try {
-      const tplRow = db
-        .prepare("SELECT data_json FROM app_collections WHERE collection_key = 'templates'")
-        .get() as { data_json?: string } | undefined;
-      if (tplRow?.data_json) {
-        const templates = JSON.parse(tplRow.data_json) as Array<Record<string, unknown>>;
+        const templates = parseJsonSafe<Array<Record<string, unknown>>>(tplRow.data_json, []);
         let changed = false;
         const nextTemplates = templates.map((t) => {
           if (t && (t.id === 'tpl_product_broadcast' || t.type === 'product_broadcast') && typeof t.content === 'string') {
@@ -880,46 +903,111 @@ function runMigrations(db: DatabaseSync, hadExistingDb: boolean) {
           return t;
         });
         if (changed) {
-          db.prepare('UPDATE app_collections SET data_json = ?, updated_at = ? WHERE collection_key = ?').run(
+          await db.run('UPDATE app_collections SET data_json = ?, updated_at = ? WHERE collection_key = ?', [
             JSON.stringify(nextTemplates),
             now,
-            'templates'
-          );
+            'templates',
+          ]);
+        }
+      }
+    } catch {
+      // ignore JSON parse issues on custom collection
+    }
+
+    for (const colKey of ['product_broadcasts', 'saved_broadcasts']) {
+      try {
+        const row = await db.get<{ data_json?: unknown }>(
+          'SELECT data_json FROM app_collections WHERE collection_key = ?',
+          [colKey]
+        );
+        const rawStr = typeof row?.data_json === 'string' ? row.data_json : row?.data_json ? JSON.stringify(row.data_json) : '';
+        if (rawStr && (rawStr.includes('100dagar.pk') || rawStr.includes('Wholesale'))) {
+          const updatedJson = rawStr
+            .replace(/https?:\/\/100dagar\.pk/gi, 'https://madinamarket.pk')
+            .replace(/Our Wholesale:/gi, 'Our Super Best Price:')
+            .replace(/New wholesale arrival/gi, 'New Super Best Price arrival');
+          if (updatedJson !== rawStr) {
+            await db.run('UPDATE app_collections SET data_json = ?, updated_at = ? WHERE collection_key = ?', [
+              updatedJson,
+              now,
+              colKey,
+            ]);
+          }
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    await recordMigration(
+      '006_product_delivery_fees_and_templates',
+      'Added product delivery_fee_type & custom_delivery_charge columns and updated broadcast templates to Super Best Price & madinamarket.pk'
+    );
+  }
+
+  // MIGRATION 007
+  if (!(await hasMigration('007_fix_broadcast_templates_key'))) {
+    const now = db.formatTimestamp();
+    try {
+      const tplRow = await db.get<{ data_json?: unknown }>(
+        "SELECT data_json FROM app_collections WHERE collection_key = 'templates'"
+      );
+      if (tplRow?.data_json) {
+        const templates = parseJsonSafe<Array<Record<string, unknown>>>(tplRow.data_json, []);
+        let changed = false;
+        const nextTemplates = templates.map((t) => {
+          if (t && (t.id === 'tpl_product_broadcast' || t.type === 'product_broadcast') && typeof t.content === 'string') {
+            const nextContent = t.content
+              .replace(/Wholesale Deal!/gi, 'Super Best Deal!')
+              .replace(/Wholesale Price:/gi, 'Super Best Price:');
+            if (nextContent !== t.content) {
+              changed = true;
+              return { ...t, content: nextContent };
+            }
+          }
+          return t;
+        });
+        if (changed) {
+          await db.run('UPDATE app_collections SET data_json = ?, updated_at = ? WHERE collection_key = ?', [
+            JSON.stringify(nextTemplates),
+            now,
+            'templates',
+          ]);
         }
       }
     } catch {
       // ignore
     }
 
-    recordMigration(
+    await recordMigration(
       '007_fix_broadcast_templates_key',
       'Upgraded broadcast template in app_collections.templates to Super Best Price & Super Best Deal'
     );
   }
 
-  // MIGRATION 008: Audit & repair backend order history (missing customer links, ledger consistency, stale dummy URLs)
-  if (!hasMigration('008_audit_clean_order_history_and_links')) {
+  // MIGRATION 008
+  if (!(await hasMigration('008_audit_clean_order_history_and_links'))) {
     if (hadExistingDb) {
-      createVerifiedBackup('pre_migration_008_order_audit');
+      await createVerifiedBackup('pre_migration_008_order_audit');
     }
     try {
-      auditAndRepairOrderHistory(db);
+      await auditAndRepairOrderHistory(db);
     } catch (err) {
       console.warn('Migration 008 order audit warning:', err);
     }
-    recordMigration(
+    await recordMigration(
       '008_audit_clean_order_history_and_links',
       'Audited and repaired backend COD orders, orphaned customer/transaction links, balances, and madinamarket.pk links'
     );
   }
 
-  // MIGRATION 009: Complete CRM tables, retention automation defaults & server-side scrypt secret hardening
-  if (!hasMigration('009_crm_schema_and_security_hardening')) {
+  // MIGRATION 009
+  if (!(await hasMigration('009_crm_schema_and_security_hardening'))) {
     if (hadExistingDb) {
-      createVerifiedBackup('pre_migration_009_crm_and_security');
+      await createVerifiedBackup('pre_migration_009_crm_and_security');
     }
 
-    db.exec(`
+    await db.exec(`
       CREATE TABLE IF NOT EXISTS crm_follow_ups (
         id TEXT PRIMARY KEY,
         customer_id TEXT,
@@ -1050,13 +1138,12 @@ function runMigrations(db: DatabaseSync, hadExistingDb: boolean) {
       CREATE INDEX IF NOT EXISTS idx_crm_activity_prod ON crm_activity_events (product_id, event_type);
     `);
 
-    // Security hardening: migrate legacy plaintext PINs in user_accounts & business_profile to scrypt hashes
     try {
-      const bp = getCollectionValue<BusinessProfile>(db, 'business_profile', defaultBusinessProfile);
+      const bp = await getCollectionValue<BusinessProfile>(db, 'business_profile', defaultBusinessProfile);
       const envMasterPin = (process.env.ADMIN_MASTER_PIN || '').trim();
       const rawAdminPin = typeof bp.adminPin === 'string' && bp.adminPin.trim() ? bp.adminPin.trim() : undefined;
 
-      const accounts = getCollectionValue<UserAccount[]>(db, 'user_accounts', []);
+      const accounts = await getCollectionValue<UserAccount[]>(db, 'user_accounts', []);
       let accountsChanged = false;
       const migratedAccounts = accounts.map((acc) => {
         const next: UserAccount = { ...acc };
@@ -1083,55 +1170,54 @@ function runMigrations(db: DatabaseSync, hadExistingDb: boolean) {
         return next;
       });
       if (accountsChanged) {
-        saveCollectionValue(db, 'user_accounts', migratedAccounts);
+        await saveCollectionValue(db, 'user_accounts', migratedAccounts);
       }
 
       if (bp.adminPin !== undefined) {
         const cleanedBp: BusinessProfile = { ...bp };
         delete cleanedBp.adminPin;
-        saveCollectionValue(db, 'business_profile', cleanedBp);
+        await saveCollectionValue(db, 'business_profile', cleanedBp);
       }
     } catch (err) {
       console.warn('Migration 009 secret hardening warning:', err);
     }
 
-    // Seed CRM loyalty config & automation rules (idempotent)
-    seedCrmDefaultsIfEmpty(db);
+    await seedCrmDefaultsIfEmpty(db);
 
-    recordMigration(
+    await recordMigration(
       '009_crm_schema_and_security_hardening',
-      'Created CRM tables (leads, follow-ups, campaigns, tickets, loyalty, coupons, custom segments, automation, activity), seeded defaults, and hashed stored credentials via scrypt'
+      'Created CRM tables, seeded defaults, and hashed stored credentials via scrypt'
     );
   }
 
-  // MIGRATION 010: Non-destructive expansion of 3-level Categories, Subcategories & Major Child Categories
-  if (!hasMigration('010_expand_wholesale_categories_hierarchy')) {
+  // MIGRATION 010
+  if (!(await hasMigration('010_expand_wholesale_categories_hierarchy'))) {
     if (hadExistingDb) {
-      createVerifiedBackup('pre_migration_010_categories_hierarchy');
+      await createVerifiedBackup('pre_migration_010_categories_hierarchy');
     }
-    const now = new Date().toISOString();
-    const insertCatIgnore = db.prepare(`
-      INSERT OR IGNORE INTO categories (id, name, urdu_name, parent_category_id, level, description, is_upcoming, is_active, display_order, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
+    const now = db.formatTimestamp();
     for (const c of defaultCategoryRecords) {
-      insertCatIgnore.run(
-        c.id,
-        c.name,
-        c.urduName || null,
-        c.parentCategoryId || null,
-        c.level || computeCategoryLevel(c, defaultCategoryRecords),
-        c.description || null,
-        c.isUpcoming ? 1 : 0,
-        c.isActive === false ? 0 : 1,
-        c.displayOrder || 0,
-        now,
-        now
+      await db.run(
+        `${insertIgnoreKeyword(db.driver)} INTO categories (id, name, urdu_name, parent_category_id, level, description, is_upcoming, is_active, display_order, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          c.id,
+          c.name,
+          c.urduName || null,
+          c.parentCategoryId || null,
+          c.level || computeCategoryLevel(c, defaultCategoryRecords),
+          c.description || null,
+          c.isUpcoming ? 1 : 0,
+          c.isActive === false ? 0 : 1,
+          c.displayOrder || 0,
+          now,
+          now,
+        ]
       );
     }
-    recordMigration(
+    await recordMigration(
       '010_expand_wholesale_categories_hierarchy',
-      'Non-destructively inserted expanded 3-level main categories, subcategories, and major child categories using INSERT OR IGNORE'
+      'Non-destructively inserted expanded 3-level main categories, subcategories, and major child categories'
     );
   }
 }
@@ -1140,10 +1226,11 @@ function runMigrations(db: DatabaseSync, hadExistingDb: boolean) {
 // DATA ACCESS HELPERS (CENTRAL SOURCE OF TRUTH)
 // ==========================================
 
-export function getAllCategoriesFromDb(db = getDb()): CategoryRecord[] {
-  const rows = db
-    .prepare('SELECT * FROM categories ORDER BY display_order ASC, level ASC, name ASC')
-    .all() as Array<Record<string, unknown>>;
+export async function getAllCategoriesFromDb(dbArg?: DbExecutor): Promise<CategoryRecord[]> {
+  const db = dbArg || (await getDb());
+  const rows = await db.all<Record<string, unknown>>(
+    'SELECT * FROM categories ORDER BY display_order ASC, level ASC, name ASC'
+  );
 
   return rows.map((r) =>
     normalizeUpcomingCategoryRecord({
@@ -1154,7 +1241,7 @@ export function getAllCategoriesFromDb(db = getDb()): CategoryRecord[] {
       level: (Number(r.level) as 1 | 2 | 3) || 1,
       description: r.description ? String(r.description) : undefined,
       isUpcoming: Boolean(r.is_upcoming),
-      isActive: r.is_active === undefined ? true : Boolean(r.is_active),
+      isActive: r.is_active === undefined || r.is_active === null ? true : Boolean(r.is_active),
       displayOrder: Number(r.display_order || 0),
       createdAt: r.created_at ? String(r.created_at) : undefined,
       updatedAt: r.updated_at ? String(r.updated_at) : undefined,
@@ -1162,26 +1249,43 @@ export function getAllCategoriesFromDb(db = getDb()): CategoryRecord[] {
   );
 }
 
-export function upsertCategoryRow(db: DatabaseSync, cat: CategoryRecord): CategoryRecord {
+export async function upsertCategoryRow(db: DbExecutor, cat: CategoryRecord): Promise<CategoryRecord> {
   const normalized = normalizeUpcomingCategoryRecord(cat);
-  const allCats = getAllCategoriesFromDb(db);
+  const allCats = await getAllCategoriesFromDb(db);
   const level = computeCategoryLevel(normalized, allCats.filter((c) => c.id !== normalized.id).concat(normalized));
-  const now = new Date().toISOString();
+  const now = db.formatTimestamp();
 
-  db.prepare(`
-    INSERT INTO categories (id, name, urdu_name, parent_category_id, level, description, is_upcoming, is_active, display_order, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(id) DO UPDATE SET
-      name = excluded.name,
-      urdu_name = excluded.urdu_name,
-      parent_category_id = excluded.parent_category_id,
-      level = excluded.level,
-      description = excluded.description,
-      is_upcoming = excluded.is_upcoming,
-      is_active = excluded.is_active,
-      display_order = excluded.display_order,
-      updated_at = excluded.updated_at
-  `).run(
+  const sql = buildUpsertSql({
+    driver: db.driver,
+    table: 'categories',
+    insertColumns: [
+      'id',
+      'name',
+      'urdu_name',
+      'parent_category_id',
+      'level',
+      'description',
+      'is_upcoming',
+      'is_active',
+      'display_order',
+      'created_at',
+      'updated_at',
+    ],
+    conflictColumn: 'id',
+    updateAssignments: [
+      { column: 'name' },
+      { column: 'urdu_name' },
+      { column: 'parent_category_id' },
+      { column: 'level' },
+      { column: 'description' },
+      { column: 'is_upcoming' },
+      { column: 'is_active' },
+      { column: 'display_order' },
+      { column: 'updated_at' },
+    ],
+  });
+
+  await db.run(sql, [
     normalized.id,
     normalized.name.trim(),
     normalized.urduName || null,
@@ -1192,19 +1296,20 @@ export function upsertCategoryRow(db: DatabaseSync, cat: CategoryRecord): Catego
     normalized.isActive === false ? 0 : 1,
     normalized.displayOrder || 0,
     normalized.createdAt || now,
-    now
-  );
+    now,
+  ]);
 
   return { ...normalized, level, updatedAt: now };
 }
 
-export function getAllCitiesFromDb(db = getDb()): DeliveryCityConfig[] {
-  const cityRows = db
-    .prepare('SELECT * FROM cities ORDER BY display_order ASC, name ASC')
-    .all() as Array<Record<string, unknown>>;
-  const areaRows = db
-    .prepare("SELECT * FROM city_areas ORDER BY CASE WHEN LOWER(TRIM(name)) = 'city center' THEN 0 ELSE 1 END, name ASC")
-    .all() as Array<Record<string, unknown>>;
+export async function getAllCitiesFromDb(dbArg?: DbExecutor): Promise<DeliveryCityConfig[]> {
+  const db = dbArg || (await getDb());
+  const cityRows = await db.all<Record<string, unknown>>(
+    'SELECT * FROM cities ORDER BY display_order ASC, name ASC'
+  );
+  const areaRows = await db.all<Record<string, unknown>>(
+    "SELECT * FROM city_areas ORDER BY CASE WHEN LOWER(TRIM(name)) = 'city center' THEN 0 ELSE 1 END, name ASC"
+  );
 
   const areasByCity = new Map<string, DeliveryAreaConfig[]>();
   for (const ar of areaRows) {
@@ -1241,27 +1346,58 @@ export function getAllCitiesFromDb(db = getDb()): DeliveryCityConfig[] {
   });
 }
 
-export function syncDeliveryCitiesIntoBusinessProfile(db = getDb()): BusinessProfile {
-  const cities = getAllCitiesFromDb(db);
-  const profile = getCollectionValue<BusinessProfile>(db, 'business_profile', defaultBusinessProfile);
+export async function syncDeliveryCitiesIntoBusinessProfile(dbArg?: DbExecutor): Promise<BusinessProfile> {
+  const db = dbArg || (await getDb());
+  const cities = await getAllCitiesFromDb(db);
+  const profile = await getCollectionValue<BusinessProfile>(db, 'business_profile', defaultBusinessProfile);
   const updatedProfile: BusinessProfile = {
     ...profile,
     defaultCityCenterDeliveryCharge:
-      profile.defaultCityCenterDeliveryCharge !== undefined
-        ? profile.defaultCityCenterDeliveryCharge
-        : 50,
+      profile.defaultCityCenterDeliveryCharge !== undefined ? profile.defaultCityCenterDeliveryCharge : 50,
     deliveryCities: ensureCityAreasShape(cities),
   };
-  saveCollectionValue(db, 'business_profile', updatedProfile);
+  await saveCollectionValue(db, 'business_profile', updatedProfile);
   return updatedProfile;
 }
 
-export function replaceCitiesAndAreasFromList(db: DatabaseSync, incomingCities: DeliveryCityConfig[]) {
-  const now = new Date().toISOString();
+export async function replaceCitiesAndAreasFromList(db: DbExecutor, incomingCities: DeliveryCityConfig[]): Promise<void> {
+  const now = db.formatTimestamp();
   const shaped = ensureCityAreasShape(incomingCities);
 
-  const existingCities = getAllCitiesFromDb(db);
+  const existingCities = await getAllCitiesFromDb(db);
   const existingByName = new Map(existingCities.map((c) => [normalizeTextKey(c.name), c]));
+
+  const upsertCitySql = buildUpsertSql({
+    driver: db.driver,
+    table: 'cities',
+    insertColumns: ['id', 'name', 'province', 'allowed', 'delivery_charge', 'display_order', 'created_at', 'updated_at'],
+    conflictColumn: 'id',
+    updateAssignments: [
+      { column: 'name' },
+      { column: 'province' },
+      { column: 'allowed' },
+      { column: 'delivery_charge' },
+      { column: 'display_order' },
+      { column: 'updated_at' },
+    ],
+  });
+
+  const upsertAreaSql = buildUpsertSql({
+    driver: db.driver,
+    table: 'city_areas',
+    insertColumns: ['id', 'city_id', 'name', 'allowed', 'delivery_charge', 'area_type', 'created_at', 'updated_at'],
+    conflictColumn: 'id',
+    updateAssignments: [
+      { column: 'name' },
+      { column: 'allowed' },
+      { column: 'delivery_charge' },
+      {
+        column: 'area_type',
+        expr: (rhs) => `COALESCE(${rhs}, city_areas.area_type)`,
+      },
+      { column: 'updated_at' },
+    ],
+  });
 
   for (let i = 0; i < shaped.length; i++) {
     const c = shaped[i];
@@ -1272,52 +1408,47 @@ export function replaceCitiesAndAreasFromList(db: DatabaseSync, incomingCities: 
       typeof c.deliveryCharge === 'number' && Number.isFinite(c.deliveryCharge) && c.deliveryCharge >= 0
         ? Math.round(c.deliveryCharge)
         : null;
-    db.prepare(`
-      INSERT INTO cities (id, name, province, allowed, delivery_charge, display_order, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET
-        name = excluded.name,
-        province = excluded.province,
-        allowed = excluded.allowed,
-        delivery_charge = excluded.delivery_charge,
-        display_order = excluded.display_order,
-        updated_at = excluded.updated_at
-    `).run(cityId, c.name, provinceVal, c.allowed ? 1 : 0, cityCharge, i + 1, now, now);
+
+    await db.run(upsertCitySql, [cityId, c.name, provinceVal, c.allowed ? 1 : 0, cityCharge, i + 1, now, now]);
 
     if (c.areas && c.areas.length > 0) {
       for (const a of c.areas) {
-        const existingArea = db
-          .prepare('SELECT id FROM city_areas WHERE city_id = ? AND LOWER(name) = LOWER(?)')
-          .get(cityId, a.name) as { id: string } | undefined;
+        const existingArea = await db.get<{ id: string }>(
+          'SELECT id FROM city_areas WHERE city_id = ? AND LOWER(name) = LOWER(?)',
+          [cityId, a.name]
+        );
         const areaId = existingArea?.id || a.id || slugifyId('area', `${c.name}_${a.name}`);
         const areaCharge =
           typeof a.deliveryCharge === 'number' && Number.isFinite(a.deliveryCharge) && a.deliveryCharge >= 0
             ? Math.round(a.deliveryCharge)
             : null;
-        db.prepare(`
-          INSERT INTO city_areas (id, city_id, name, allowed, delivery_charge, area_type, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-          ON CONFLICT(id) DO UPDATE SET
-            name = excluded.name,
-            allowed = excluded.allowed,
-            delivery_charge = excluded.delivery_charge,
-            area_type = COALESCE(excluded.area_type, city_areas.area_type),
-            updated_at = excluded.updated_at
-        `).run(areaId, cityId, a.name, a.allowed ? 1 : 0, areaCharge, a.areaType || null, now, now);
+        await db.run(upsertAreaSql, [
+          areaId,
+          cityId,
+          a.name,
+          a.allowed ? 1 : 0,
+          areaCharge,
+          a.areaType || null,
+          now,
+          now,
+        ]);
       }
     }
   }
 }
 
-export function getAllProductsFromDb(db = getDb()): ProductItem[] {
-  const rows = db
-    .prepare('SELECT * FROM products ORDER BY created_at DESC, rowid DESC')
-    .all() as Array<Record<string, unknown>>;
+export async function getAllProductsFromDb(dbArg?: DbExecutor): Promise<ProductItem[]> {
+  const db = dbArg || (await getDb());
+  const orderSql =
+    db.driver === 'sqlite'
+      ? 'SELECT * FROM products ORDER BY created_at DESC, rowid DESC'
+      : 'SELECT * FROM products ORDER BY created_at DESC, updated_at DESC, id DESC';
+  const rows = await db.all<Record<string, unknown>>(orderSql);
 
   return rows.map((r) => {
     let parsed: ProductItem;
     try {
-      parsed = JSON.parse(String(r.data_json)) as ProductItem;
+      parsed = parseJsonSafe<ProductItem>(r.data_json);
     } catch {
       parsed = {
         id: String(r.id),
@@ -1370,21 +1501,23 @@ export function getAllProductsFromDb(db = getDb()): ProductItem[] {
       expectedArrivalDate: r.expected_arrival_date
         ? String(r.expected_arrival_date)
         : parsed.expectedArrivalDate,
-      deliveryFeeType: ((r.delivery_fee_type ? String(r.delivery_fee_type) : parsed.deliveryFeeType) || 'default') as ProductItem['deliveryFeeType'],
+      deliveryFeeType: ((r.delivery_fee_type ? String(r.delivery_fee_type) : parsed.deliveryFeeType) ||
+        'default') as ProductItem['deliveryFeeType'],
       customDeliveryCharge:
         r.custom_delivery_charge !== null && r.custom_delivery_charge !== undefined
           ? Number(r.custom_delivery_charge)
           : parsed.customDeliveryCharge,
-      status: (String(r.status || parsed.status || 'published') as 'draft' | 'published'),
+      status: String(r.status || parsed.status || 'published') as 'draft' | 'published',
       updatedAt: r.updated_at ? String(r.updated_at) : parsed.updatedAt,
     };
   });
 }
 
-export function upsertProductRow(db: DatabaseSync, product: ProductItem): ProductItem {
-  const allCats = getAllCategoriesFromDb(db);
+export async function upsertProductRow(db: DbExecutor, product: ProductItem): Promise<ProductItem> {
+  const allCats = await getAllCategoriesFromDb(db);
   const blockedUpcoming = isProductPurchaseBlocked(product);
-  const now = new Date().toISOString();
+  const nowIso = new Date().toISOString();
+  const nowSql = db.formatTimestamp(nowIso);
 
   const resolvedIds = blockedUpcoming
     ? { parentCategoryId: UPCOMING_CATEGORY_ID, subcategoryId: undefined, childSubcategoryId: undefined }
@@ -1429,38 +1562,62 @@ export function upsertProductRow(db: DatabaseSync, product: ProductItem): Produc
     upcomingStatus: blockedUpcoming ? 'coming_soon' : 'available',
     stockQty: blockedUpcoming ? 0 : Math.max(0, Number(product.stockQty || 0)),
     status: product.status || 'published',
-    updatedAt: now,
+    updatedAt: nowIso,
   };
 
-  db.prepare(`
-    INSERT INTO products (
-      id, name, urdu_name, category, parent_category_id, subcategory_id, child_subcategory_id,
-      sku, cost_price, market_price, our_price, stock_qty, min_stock_alert,
-      is_upcoming, upcoming_status, expected_arrival_date, delivery_fee_type, custom_delivery_charge,
-      status, created_at, updated_at, data_json
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(id) DO UPDATE SET
-      name = excluded.name,
-      urdu_name = excluded.urdu_name,
-      category = excluded.category,
-      parent_category_id = excluded.parent_category_id,
-      subcategory_id = excluded.subcategory_id,
-      child_subcategory_id = excluded.child_subcategory_id,
-      sku = excluded.sku,
-      cost_price = excluded.cost_price,
-      market_price = excluded.market_price,
-      our_price = excluded.our_price,
-      stock_qty = excluded.stock_qty,
-      min_stock_alert = excluded.min_stock_alert,
-      is_upcoming = excluded.is_upcoming,
-      upcoming_status = excluded.upcoming_status,
-      expected_arrival_date = excluded.expected_arrival_date,
-      delivery_fee_type = excluded.delivery_fee_type,
-      custom_delivery_charge = excluded.custom_delivery_charge,
-      status = excluded.status,
-      updated_at = excluded.updated_at,
-      data_json = excluded.data_json
-  `).run(
+  const sql = buildUpsertSql({
+    driver: db.driver,
+    table: 'products',
+    insertColumns: [
+      'id',
+      'name',
+      'urdu_name',
+      'category',
+      'parent_category_id',
+      'subcategory_id',
+      'child_subcategory_id',
+      'sku',
+      'cost_price',
+      'market_price',
+      'our_price',
+      'stock_qty',
+      'min_stock_alert',
+      'is_upcoming',
+      'upcoming_status',
+      'expected_arrival_date',
+      'delivery_fee_type',
+      'custom_delivery_charge',
+      'status',
+      'created_at',
+      'updated_at',
+      'data_json',
+    ],
+    conflictColumn: 'id',
+    updateAssignments: [
+      { column: 'name' },
+      { column: 'urdu_name' },
+      { column: 'category' },
+      { column: 'parent_category_id' },
+      { column: 'subcategory_id' },
+      { column: 'child_subcategory_id' },
+      { column: 'sku' },
+      { column: 'cost_price' },
+      { column: 'market_price' },
+      { column: 'our_price' },
+      { column: 'stock_qty' },
+      { column: 'min_stock_alert' },
+      { column: 'is_upcoming' },
+      { column: 'upcoming_status' },
+      { column: 'expected_arrival_date' },
+      { column: 'delivery_fee_type' },
+      { column: 'custom_delivery_charge' },
+      { column: 'status' },
+      { column: 'updated_at' },
+      { column: 'data_json' },
+    ],
+  });
+
+  await db.run(sql, [
     normalizedProduct.id,
     normalizedProduct.name,
     normalizedProduct.urduName || null,
@@ -1480,23 +1637,26 @@ export function upsertProductRow(db: DatabaseSync, product: ProductItem): Produc
     normalizedProduct.deliveryFeeType || 'default',
     normalizedProduct.customDeliveryCharge ?? null,
     normalizedProduct.status || 'published',
-    normalizedProduct.createdAt || now.split('T')[0],
-    now,
-    JSON.stringify(normalizedProduct)
-  );
+    normalizedProduct.createdAt || nowIso.split('T')[0],
+    nowSql,
+    JSON.stringify(normalizedProduct),
+  ]);
 
   return normalizedProduct;
 }
 
-export function getAllCustomersFromDb(db = getDb()): Customer[] {
-  const rows = db
-    .prepare('SELECT * FROM customers ORDER BY created_at DESC, rowid DESC')
-    .all() as Array<Record<string, unknown>>;
+export async function getAllCustomersFromDb(dbArg?: DbExecutor): Promise<Customer[]> {
+  const db = dbArg || (await getDb());
+  const orderSql =
+    db.driver === 'sqlite'
+      ? 'SELECT * FROM customers ORDER BY created_at DESC, rowid DESC'
+      : 'SELECT * FROM customers ORDER BY created_at DESC, updated_at DESC, id DESC';
+  const rows = await db.all<Record<string, unknown>>(orderSql);
 
   return rows.map((r) => {
     let parsed: Customer;
     try {
-      parsed = JSON.parse(String(r.data_json)) as Customer;
+      parsed = parseJsonSafe<Customer>(r.data_json);
     } catch {
       parsed = {
         id: String(r.id),
@@ -1507,7 +1667,7 @@ export function getAllCustomersFromDb(db = getDb()): Customer[] {
         paymentTermsDays: 7,
         createdAt: String(r.created_at),
         balance: Number(r.balance || 0),
-        status: (String(r.status || 'active') as 'active' | 'archived'),
+        status: String(r.status || 'active') as 'active' | 'archived',
       };
     }
     return {
@@ -1521,13 +1681,14 @@ export function getAllCustomersFromDb(db = getDb()): Customer[] {
       landmark: r.landmark ? String(r.landmark) : parsed.landmark,
       address: r.address ? String(r.address) : parsed.address,
       balance: Number(r.balance ?? parsed.balance ?? 0),
-      status: (String(r.status || parsed.status || 'active') as 'active' | 'archived'),
+      status: String(r.status || parsed.status || 'active') as 'active' | 'archived',
     };
   });
 }
 
-export function upsertCustomerRow(db: DatabaseSync, customer: Customer): Customer {
-  const now = new Date().toISOString();
+export async function upsertCustomerRow(db: DbExecutor, customer: Customer): Promise<Customer> {
+  const nowIso = new Date().toISOString();
+  const nowSql = db.formatTimestamp(nowIso);
   const normalized: Customer = {
     ...customer,
     city: customer.city?.trim() || undefined,
@@ -1537,22 +1698,41 @@ export function upsertCustomerRow(db: DatabaseSync, customer: Customer): Custome
     address: customer.address?.trim() || undefined,
   };
 
-  db.prepare(`
-    INSERT INTO customers (id, name, phone, city, area, mohalla, landmark, address, balance, status, created_at, updated_at, data_json)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(id) DO UPDATE SET
-      name = excluded.name,
-      phone = excluded.phone,
-      city = excluded.city,
-      area = excluded.area,
-      mohalla = excluded.mohalla,
-      landmark = excluded.landmark,
-      address = excluded.address,
-      balance = excluded.balance,
-      status = excluded.status,
-      updated_at = excluded.updated_at,
-      data_json = excluded.data_json
-  `).run(
+  const sql = buildUpsertSql({
+    driver: db.driver,
+    table: 'customers',
+    insertColumns: [
+      'id',
+      'name',
+      'phone',
+      'city',
+      'area',
+      'mohalla',
+      'landmark',
+      'address',
+      'balance',
+      'status',
+      'created_at',
+      'updated_at',
+      'data_json',
+    ],
+    conflictColumn: 'id',
+    updateAssignments: [
+      { column: 'name' },
+      { column: 'phone' },
+      { column: 'city' },
+      { column: 'area' },
+      { column: 'mohalla' },
+      { column: 'landmark' },
+      { column: 'address' },
+      { column: 'balance' },
+      { column: 'status' },
+      { column: 'updated_at' },
+      { column: 'data_json' },
+    ],
+  });
+
+  await db.run(sql, [
     normalized.id,
     normalized.name,
     normalized.phone,
@@ -1563,63 +1743,71 @@ export function upsertCustomerRow(db: DatabaseSync, customer: Customer): Custome
     normalized.address || null,
     Number(normalized.balance || 0),
     normalized.status || 'active',
-    normalized.createdAt || now.split('T')[0],
-    now,
-    JSON.stringify(normalized)
-  );
+    normalized.createdAt || nowIso.split('T')[0],
+    nowSql,
+    JSON.stringify(normalized),
+  ]);
   return normalized;
 }
 
-export function getCollectionValue<T>(db: DatabaseSync, key: string, fallback: T): T {
-  const row = db
-    .prepare('SELECT data_json FROM app_collections WHERE collection_key = ?')
-    .get(key) as { data_json: string } | undefined;
-  if (!row) return fallback;
+export async function getCollectionValue<T>(db: DbExecutor, key: string, fallback: T): Promise<T> {
+  const row = await db.get<{ data_json: unknown }>(
+    'SELECT data_json FROM app_collections WHERE collection_key = ?',
+    [key]
+  );
+  if (!row || row.data_json === null || row.data_json === undefined) return fallback;
   try {
-    return JSON.parse(row.data_json) as T;
+    return parseJsonSafe<T>(row.data_json, fallback);
   } catch {
     return fallback;
   }
 }
 
-export function saveCollectionValue(db: DatabaseSync, key: string, value: unknown) {
-  const now = new Date().toISOString();
-  db.prepare(`
-    INSERT INTO app_collections (collection_key, data_json, updated_at)
-    VALUES (?, ?, ?)
-    ON CONFLICT(collection_key) DO UPDATE SET
-      data_json = excluded.data_json,
-      updated_at = excluded.updated_at
-  `).run(key, JSON.stringify(value), now);
+export async function saveCollectionValue(db: DbExecutor, key: string, value: unknown): Promise<void> {
+  const nowSql = db.formatTimestamp();
+  const sql = buildUpsertSql({
+    driver: db.driver,
+    table: 'app_collections',
+    insertColumns: ['collection_key', 'data_json', 'updated_at'],
+    conflictColumn: 'collection_key',
+    updateAssignments: [{ column: 'data_json' }, { column: 'updated_at' }],
+  });
+  await db.run(sql, [key, JSON.stringify(value), nowSql]);
 }
 
-export function insertAdminAuditLog(db: DatabaseSync, log: Omit<AdminAuditLog, 'id' | 'createdAt'>): AdminAuditLog {
+export async function insertAdminAuditLog(
+  db: DbExecutor,
+  log: Omit<AdminAuditLog, 'id' | 'createdAt'>
+): Promise<AdminAuditLog> {
+  const createdAtIso = new Date().toISOString();
   const entry: AdminAuditLog = {
     id: `aud_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
     ...log,
-    createdAt: new Date().toISOString(),
+    createdAt: createdAtIso,
   };
-  db.prepare(`
-    INSERT INTO admin_audit_logs (id, action, entity_type, entity_id, actor_id, actor_name, actor_role, details_json, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    entry.id,
-    entry.action,
-    entry.entityType,
-    entry.entityId,
-    entry.actorId || null,
-    entry.actorName || null,
-    entry.actorRole || null,
-    entry.details ? JSON.stringify(entry.details) : null,
-    entry.createdAt
+  await db.run(
+    `INSERT INTO admin_audit_logs (id, action, entity_type, entity_id, actor_id, actor_name, actor_role, details_json, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      entry.id,
+      entry.action,
+      entry.entityType,
+      entry.entityId,
+      entry.actorId || null,
+      entry.actorName || null,
+      entry.actorRole || null,
+      entry.details ? JSON.stringify(entry.details) : null,
+      db.formatTimestamp(createdAtIso),
+    ]
   );
   return entry;
 }
 
-export function getAdminAuditLogs(db = getDb()): AdminAuditLog[] {
-  const rows = db
-    .prepare('SELECT * FROM admin_audit_logs ORDER BY created_at DESC LIMIT 200')
-    .all() as Array<Record<string, unknown>>;
+export async function getAdminAuditLogs(dbArg?: DbExecutor): Promise<AdminAuditLog[]> {
+  const db = dbArg || (await getDb());
+  const rows = await db.all<Record<string, unknown>>(
+    'SELECT * FROM admin_audit_logs ORDER BY created_at DESC LIMIT 200'
+  );
   return rows.map((r) => ({
     id: String(r.id),
     action: String(r.action),
@@ -1628,7 +1816,7 @@ export function getAdminAuditLogs(db = getDb()): AdminAuditLog[] {
     actorId: r.actor_id ? String(r.actor_id) : undefined,
     actorName: r.actor_name ? String(r.actor_name) : undefined,
     actorRole: r.actor_role ? String(r.actor_role) : undefined,
-    details: r.details_json ? (JSON.parse(String(r.details_json)) as Record<string, unknown>) : undefined,
+    details: r.details_json ? parseJsonSafe<Record<string, unknown>>(r.details_json) : undefined,
     createdAt: String(r.created_at),
   }));
 }
@@ -1661,7 +1849,6 @@ export function verifyServerSecret(
   if (!plainText || !storedHash) return false;
   const trimmed = plainText.trim();
 
-  // 1. Node scrypt format
   if (storedHash.startsWith('scrypt:') && storedSalt?.startsWith('scrypt:')) {
     const rawSalt = storedSalt.slice('scrypt:'.length);
     const expectedHex = storedHash.slice('scrypt:'.length);
@@ -1671,7 +1858,6 @@ export function verifyServerSecret(
     return crypto.timingSafeEqual(derived, expected);
   }
 
-  // 2. Client WebCrypto SHA-256 salted format (64 hex chars + random salt)
   if (storedSalt && !storedSalt.startsWith('scrypt:')) {
     const digest = crypto.createHash('sha256').update(`${storedSalt}:${trimmed}`).digest('hex');
     if (digest.length === storedHash.length) {
@@ -1679,7 +1865,6 @@ export function verifyServerSecret(
     }
   }
 
-  // 3. Plaintext fallback ONLY for pre-hash compatibility if any external record still uses plain PIN
   if (!storedSalt) {
     const a = Buffer.from(trimmed, 'utf8');
     const b = Buffer.from(storedHash, 'utf8');
@@ -1882,79 +2067,112 @@ export function computeLoyaltyTier(pointsEarned: number, cfg: CRMLoyaltyConfig =
   return 'Bronze';
 }
 
-export function getCrmLoyaltyConfig(db = getDb()): CRMLoyaltyConfig {
+export async function getCrmLoyaltyConfig(dbArg?: DbExecutor): Promise<CRMLoyaltyConfig> {
+  const db = dbArg || (await getDb());
   return getCollectionValue<CRMLoyaltyConfig>(db, 'crm_loyalty_config', DEFAULT_CRM_LOYALTY_CONFIG);
 }
 
-export function saveCrmLoyaltyConfig(db: DatabaseSync, config: CRMLoyaltyConfig) {
-  saveCollectionValue(db, 'crm_loyalty_config', config);
+export async function saveCrmLoyaltyConfig(db: DbExecutor, config: CRMLoyaltyConfig): Promise<void> {
+  await saveCollectionValue(db, 'crm_loyalty_config', config);
 }
 
-export function seedCrmDefaultsIfEmpty(db: DatabaseSync) {
-  const existingCfg = db.prepare("SELECT collection_key FROM app_collections WHERE collection_key = 'crm_loyalty_config'").get();
+export async function seedCrmDefaultsIfEmpty(db: DbExecutor): Promise<void> {
+  const existingCfg = await db.get(
+    "SELECT collection_key FROM app_collections WHERE collection_key = 'crm_loyalty_config'"
+  );
   if (!existingCfg) {
-    saveCollectionValue(db, 'crm_loyalty_config', DEFAULT_CRM_LOYALTY_CONFIG);
+    await saveCollectionValue(db, 'crm_loyalty_config', DEFAULT_CRM_LOYALTY_CONFIG);
   }
 
-  const ruleCount = Number((db.prepare('SELECT COUNT(*) as c FROM crm_automation_rules').get() as { c: number }).c);
-  if (ruleCount === 0) {
-    const stmt = db.prepare(`
-      INSERT OR IGNORE INTO crm_automation_rules (id, trigger_type, enabled, last_run_at, total_triggered_count, data_json)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `);
+  const ruleCountRow = await db.get<{ c: number }>('SELECT COUNT(*) as c FROM crm_automation_rules');
+  if (Number(ruleCountRow?.c || 0) === 0) {
     for (const rule of DEFAULT_CRM_AUTOMATION_RULES) {
-      stmt.run(rule.id, rule.triggerType, rule.enabled ? 1 : 0, rule.lastRunAt || null, rule.totalTriggeredCount || 0, JSON.stringify(rule));
+      await db.run(
+        `${insertIgnoreKeyword(db.driver)} INTO crm_automation_rules (id, trigger_type, enabled, last_run_at, total_triggered_count, data_json)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [
+          rule.id,
+          rule.triggerType,
+          rule.enabled ? 1 : 0,
+          rule.lastRunAt ? db.formatTimestamp(rule.lastRunAt) : null,
+          rule.totalTriggeredCount || 0,
+          JSON.stringify(rule),
+        ]
+      );
     }
   }
 
-  // Initialize loyalty accounts non-destructively from existing historical customer spend
-  const loyaltyCount = Number((db.prepare('SELECT COUNT(*) as c FROM crm_loyalty_accounts').get() as { c: number }).c);
-  if (loyaltyCount === 0) {
-    const custs = getAllCustomersFromDb(db);
-    const now = new Date().toISOString();
+  const loyaltyCountRow = await db.get<{ c: number }>('SELECT COUNT(*) as c FROM crm_loyalty_accounts');
+  if (Number(loyaltyCountRow?.c || 0) === 0) {
+    const custs = await getAllCustomersFromDb(db);
+    const now = db.formatTimestamp();
     for (const c of custs) {
-      const earned = Math.max(0, Math.floor(Number(c.totalPurchases || 0) / 1000) * DEFAULT_CRM_LOYALTY_CONFIG.pointsPerThousandPkr);
+      const earned = Math.max(
+        0,
+        Math.floor(Number(c.totalPurchases || 0) / 1000) * DEFAULT_CRM_LOYALTY_CONFIG.pointsPerThousandPkr
+      );
       const tier = computeLoyaltyTier(earned, DEFAULT_CRM_LOYALTY_CONFIG);
-      db.prepare(`
-        INSERT OR IGNORE INTO crm_loyalty_accounts (customer_id, points_balance, lifetime_points_earned, lifetime_points_redeemed, tier, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-      `).run(c.id, earned, earned, 0, tier, now);
+      await db.run(
+        `${insertIgnoreKeyword(db.driver)} INTO crm_loyalty_accounts (customer_id, points_balance, lifetime_points_earned, lifetime_points_redeemed, tier, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [c.id, earned, earned, 0, tier, now]
+      );
       if (earned > 0) {
-        db.prepare(`
-          INSERT OR IGNORE INTO crm_loyalty_ledger (id, customer_id, type, points, notes, created_at)
-          VALUES (?, ?, ?, ?, ?, ?)
-        `).run(`lyl_seed_${c.id}`, c.id, 'earned', earned, 'Historical purchase loyalty points sync', now);
+        await db.run(
+          `${insertIgnoreKeyword(db.driver)} INTO crm_loyalty_ledger (id, customer_id, type, points, notes, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+          [`lyl_seed_${c.id}`, c.id, 'earned', earned, 'Historical purchase loyalty points sync', now]
+        );
       }
     }
   }
 }
 
-export function getAllCrmFollowUps(db = getDb()): CRMFollowUpTask[] {
-  const rows = db.prepare('SELECT data_json FROM crm_follow_ups ORDER BY follow_up_date ASC, created_at DESC').all() as Array<{ data_json: string }>;
-  return rows.map((r) => JSON.parse(r.data_json) as CRMFollowUpTask);
+export async function getAllCrmFollowUps(dbArg?: DbExecutor): Promise<CRMFollowUpTask[]> {
+  const db = dbArg || (await getDb());
+  const rows = await db.all<{ data_json: unknown }>(
+    'SELECT data_json FROM crm_follow_ups ORDER BY follow_up_date ASC, created_at DESC'
+  );
+  return rows.map((r) => parseJsonSafe<CRMFollowUpTask>(r.data_json));
 }
 
-export function upsertCrmFollowUp(db: DatabaseSync, task: CRMFollowUpTask): CRMFollowUpTask {
-  const now = new Date().toISOString();
+export async function upsertCrmFollowUp(db: DbExecutor, task: CRMFollowUpTask): Promise<CRMFollowUpTask> {
+  const nowIso = new Date().toISOString();
+  const nowSql = db.formatTimestamp(nowIso);
   const saved: CRMFollowUpTask = {
     ...task,
-    createdAt: task.createdAt || now,
-    updatedAt: now,
-    completedAt: task.status === 'Completed' ? task.completedAt || now : task.completedAt,
+    createdAt: task.createdAt || nowIso,
+    updatedAt: nowIso,
+    completedAt: task.status === 'Completed' ? task.completedAt || nowIso : task.completedAt,
   };
-  db.prepare(`
-    INSERT INTO crm_follow_ups (id, customer_id, lead_id, assigned_employee_id, follow_up_date, priority, status, created_at, updated_at, data_json)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(id) DO UPDATE SET
-      customer_id = excluded.customer_id,
-      lead_id = excluded.lead_id,
-      assigned_employee_id = excluded.assigned_employee_id,
-      follow_up_date = excluded.follow_up_date,
-      priority = excluded.priority,
-      status = excluded.status,
-      updated_at = excluded.updated_at,
-      data_json = excluded.data_json
-  `).run(
+  const sql = buildUpsertSql({
+    driver: db.driver,
+    table: 'crm_follow_ups',
+    insertColumns: [
+      'id',
+      'customer_id',
+      'lead_id',
+      'assigned_employee_id',
+      'follow_up_date',
+      'priority',
+      'status',
+      'created_at',
+      'updated_at',
+      'data_json',
+    ],
+    conflictColumn: 'id',
+    updateAssignments: [
+      { column: 'customer_id' },
+      { column: 'lead_id' },
+      { column: 'assigned_employee_id' },
+      { column: 'follow_up_date' },
+      { column: 'priority' },
+      { column: 'status' },
+      { column: 'updated_at' },
+      { column: 'data_json' },
+    ],
+  });
+  await db.run(sql, [
     saved.id,
     saved.customerId || null,
     saved.leadId || null,
@@ -1962,107 +2180,154 @@ export function upsertCrmFollowUp(db: DatabaseSync, task: CRMFollowUpTask): CRMF
     saved.followUpDate,
     saved.priority,
     saved.status,
-    saved.createdAt,
-    now,
-    JSON.stringify(saved)
-  );
+    db.formatTimestamp(saved.createdAt),
+    nowSql,
+    JSON.stringify(saved),
+  ]);
   return saved;
 }
 
-export function deleteCrmFollowUp(db: DatabaseSync, id: string) {
-  db.prepare('DELETE FROM crm_follow_ups WHERE id = ?').run(id);
+export async function deleteCrmFollowUp(db: DbExecutor, id: string): Promise<void> {
+  await db.run('DELETE FROM crm_follow_ups WHERE id = ?', [id]);
 }
 
-export function getAllCrmLeads(db = getDb()): CRMLead[] {
-  const rows = db.prepare('SELECT data_json FROM crm_leads ORDER BY updated_at DESC, created_at DESC').all() as Array<{ data_json: string }>;
-  return rows.map((r) => JSON.parse(r.data_json) as CRMLead);
+export async function getAllCrmLeads(dbArg?: DbExecutor): Promise<CRMLead[]> {
+  const db = dbArg || (await getDb());
+  const rows = await db.all<{ data_json: unknown }>(
+    'SELECT data_json FROM crm_leads ORDER BY updated_at DESC, created_at DESC'
+  );
+  return rows.map((r) => parseJsonSafe<CRMLead>(r.data_json));
 }
 
-export function upsertCrmLead(db: DatabaseSync, lead: CRMLead): CRMLead {
-  const now = new Date().toISOString();
+export async function upsertCrmLead(db: DbExecutor, lead: CRMLead): Promise<CRMLead> {
+  const nowIso = new Date().toISOString();
+  const nowSql = db.formatTimestamp(nowIso);
   const saved: CRMLead = {
     ...lead,
-    createdAt: lead.createdAt || now,
-    updatedAt: now,
+    createdAt: lead.createdAt || nowIso,
+    updatedAt: nowIso,
   };
-  db.prepare(`
-    INSERT INTO crm_leads (id, phone, stage, source, assigned_salesperson_id, converted_customer_id, created_at, updated_at, data_json)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(id) DO UPDATE SET
-      phone = excluded.phone,
-      stage = excluded.stage,
-      source = excluded.source,
-      assigned_salesperson_id = excluded.assigned_salesperson_id,
-      converted_customer_id = excluded.converted_customer_id,
-      updated_at = excluded.updated_at,
-      data_json = excluded.data_json
-  `).run(
+  const sql = buildUpsertSql({
+    driver: db.driver,
+    table: 'crm_leads',
+    insertColumns: [
+      'id',
+      'phone',
+      'stage',
+      'source',
+      'assigned_salesperson_id',
+      'converted_customer_id',
+      'created_at',
+      'updated_at',
+      'data_json',
+    ],
+    conflictColumn: 'id',
+    updateAssignments: [
+      { column: 'phone' },
+      { column: 'stage' },
+      { column: 'source' },
+      { column: 'assigned_salesperson_id' },
+      { column: 'converted_customer_id' },
+      { column: 'updated_at' },
+      { column: 'data_json' },
+    ],
+  });
+  await db.run(sql, [
     saved.id,
     saved.phone,
     saved.stage,
     saved.source,
     saved.assignedSalespersonId || null,
     saved.convertedCustomerId || null,
-    saved.createdAt,
-    now,
-    JSON.stringify(saved)
-  );
+    db.formatTimestamp(saved.createdAt),
+    nowSql,
+    JSON.stringify(saved),
+  ]);
   return saved;
 }
 
-export function getAllCrmCampaigns(db = getDb()): CRMCampaign[] {
-  const rows = db.prepare('SELECT data_json FROM crm_campaigns ORDER BY created_at DESC').all() as Array<{ data_json: string }>;
-  return rows.map((r) => JSON.parse(r.data_json) as CRMCampaign);
+export async function getAllCrmCampaigns(dbArg?: DbExecutor): Promise<CRMCampaign[]> {
+  const db = dbArg || (await getDb());
+  const rows = await db.all<{ data_json: unknown }>(
+    'SELECT data_json FROM crm_campaigns ORDER BY created_at DESC'
+  );
+  return rows.map((r) => parseJsonSafe<CRMCampaign>(r.data_json));
 }
 
-export function upsertCrmCampaign(db: DatabaseSync, campaign: CRMCampaign): CRMCampaign {
-  const now = new Date().toISOString();
+export async function upsertCrmCampaign(db: DbExecutor, campaign: CRMCampaign): Promise<CRMCampaign> {
+  const nowIso = new Date().toISOString();
+  const nowSql = db.formatTimestamp(nowIso);
   const saved: CRMCampaign = {
     ...campaign,
-    createdAt: campaign.createdAt || now,
-    updatedAt: now,
+    createdAt: campaign.createdAt || nowIso,
+    updatedAt: nowIso,
   };
-  db.prepare(`
-    INSERT INTO crm_campaigns (id, status, created_at, updated_at, data_json)
-    VALUES (?, ?, ?, ?, ?)
-    ON CONFLICT(id) DO UPDATE SET
-      status = excluded.status,
-      updated_at = excluded.updated_at,
-      data_json = excluded.data_json
-  `).run(saved.id, saved.status, saved.createdAt, now, JSON.stringify(saved));
+  const sql = buildUpsertSql({
+    driver: db.driver,
+    table: 'crm_campaigns',
+    insertColumns: ['id', 'status', 'created_at', 'updated_at', 'data_json'],
+    conflictColumn: 'id',
+    updateAssignments: [{ column: 'status' }, { column: 'updated_at' }, { column: 'data_json' }],
+  });
+  await db.run(sql, [
+    saved.id,
+    saved.status,
+    db.formatTimestamp(saved.createdAt),
+    nowSql,
+    JSON.stringify(saved),
+  ]);
   return saved;
 }
 
-export function getAllCrmTickets(db = getDb()): CRMSupportTicket[] {
-  const rows = db.prepare('SELECT data_json FROM crm_support_tickets ORDER BY created_at DESC').all() as Array<{ data_json: string }>;
-  return rows.map((r) => JSON.parse(r.data_json) as CRMSupportTicket);
+export async function getAllCrmTickets(dbArg?: DbExecutor): Promise<CRMSupportTicket[]> {
+  const db = dbArg || (await getDb());
+  const rows = await db.all<{ data_json: unknown }>(
+    'SELECT data_json FROM crm_support_tickets ORDER BY created_at DESC'
+  );
+  return rows.map((r) => parseJsonSafe<CRMSupportTicket>(r.data_json));
 }
 
-export function upsertCrmTicket(db: DatabaseSync, ticket: CRMSupportTicket): CRMSupportTicket {
-  const now = new Date().toISOString();
+export async function upsertCrmTicket(db: DbExecutor, ticket: CRMSupportTicket): Promise<CRMSupportTicket> {
+  const nowIso = new Date().toISOString();
+  const nowSql = db.formatTimestamp(nowIso);
   const saved: CRMSupportTicket = {
     ...ticket,
-    createdAt: ticket.createdAt || now,
-    updatedAt: now,
+    createdAt: ticket.createdAt || nowIso,
+    updatedAt: nowIso,
     resolvedAt:
-      ticket.status === 'Resolved' || ticket.status === 'Closed'
-        ? ticket.resolvedAt || now
-        : ticket.resolvedAt,
+      ticket.status === 'Resolved' || ticket.status === 'Closed' ? ticket.resolvedAt || nowIso : ticket.resolvedAt,
   };
-  db.prepare(`
-    INSERT INTO crm_support_tickets (id, ticket_number, customer_id, order_id, category, priority, status, assigned_employee_id, due_at, created_at, updated_at, data_json)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(id) DO UPDATE SET
-      customer_id = excluded.customer_id,
-      order_id = excluded.order_id,
-      category = excluded.category,
-      priority = excluded.priority,
-      status = excluded.status,
-      assigned_employee_id = excluded.assigned_employee_id,
-      due_at = excluded.due_at,
-      updated_at = excluded.updated_at,
-      data_json = excluded.data_json
-  `).run(
+  const sql = buildUpsertSql({
+    driver: db.driver,
+    table: 'crm_support_tickets',
+    insertColumns: [
+      'id',
+      'ticket_number',
+      'customer_id',
+      'order_id',
+      'category',
+      'priority',
+      'status',
+      'assigned_employee_id',
+      'due_at',
+      'created_at',
+      'updated_at',
+      'data_json',
+    ],
+    conflictColumn: 'id',
+    updateAssignments: [
+      { column: 'customer_id' },
+      { column: 'order_id' },
+      { column: 'category' },
+      { column: 'priority' },
+      { column: 'status' },
+      { column: 'assigned_employee_id' },
+      { column: 'due_at' },
+      { column: 'updated_at' },
+      { column: 'data_json' },
+    ],
+  });
+  await db.run(sql, [
     saved.id,
     saved.ticketNumber,
     saved.customerId || null,
@@ -2071,16 +2336,19 @@ export function upsertCrmTicket(db: DatabaseSync, ticket: CRMSupportTicket): CRM
     saved.priority,
     saved.status,
     saved.assignedEmployeeId || null,
-    saved.dueAt,
-    saved.createdAt,
-    now,
-    JSON.stringify(saved)
-  );
+    db.formatTimestamp(saved.dueAt),
+    db.formatTimestamp(saved.createdAt),
+    nowSql,
+    JSON.stringify(saved),
+  ]);
   return saved;
 }
 
-export function getAllCrmLoyaltyAccounts(db = getDb()): CRMLoyaltyAccount[] {
-  const rows = db.prepare('SELECT * FROM crm_loyalty_accounts ORDER BY lifetime_points_earned DESC').all() as Array<Record<string, unknown>>;
+export async function getAllCrmLoyaltyAccounts(dbArg?: DbExecutor): Promise<CRMLoyaltyAccount[]> {
+  const db = dbArg || (await getDb());
+  const rows = await db.all<Record<string, unknown>>(
+    'SELECT * FROM crm_loyalty_accounts ORDER BY lifetime_points_earned DESC'
+  );
   return rows.map((r) => ({
     customerId: String(r.customer_id),
     pointsBalance: Number(r.points_balance || 0),
@@ -2091,12 +2359,16 @@ export function getAllCrmLoyaltyAccounts(db = getDb()): CRMLoyaltyAccount[] {
   }));
 }
 
-export function getAllCrmLoyaltyLedger(db = getDb(), customerId?: string): CRMLoyaltyLedgerEntry[] {
-  const rows = (
-    customerId
-      ? db.prepare('SELECT * FROM crm_loyalty_ledger WHERE customer_id = ? ORDER BY created_at DESC LIMIT 200').all(customerId)
-      : db.prepare('SELECT * FROM crm_loyalty_ledger ORDER BY created_at DESC LIMIT 300').all()
-  ) as Array<Record<string, unknown>>;
+export async function getAllCrmLoyaltyLedger(dbArg?: DbExecutor, customerId?: string): Promise<CRMLoyaltyLedgerEntry[]> {
+  const db = dbArg || (await getDb());
+  const rows = customerId
+    ? await db.all<Record<string, unknown>>(
+        'SELECT * FROM crm_loyalty_ledger WHERE customer_id = ? ORDER BY created_at DESC LIMIT 200',
+        [customerId]
+      )
+    : await db.all<Record<string, unknown>>(
+        'SELECT * FROM crm_loyalty_ledger ORDER BY created_at DESC LIMIT 300'
+      );
   return rows.map((r) => ({
     id: String(r.id),
     customerId: String(r.customer_id),
@@ -2109,8 +2381,8 @@ export function getAllCrmLoyaltyLedger(db = getDb(), customerId?: string): CRMLo
   }));
 }
 
-export function adjustCustomerLoyaltyPoints(
-  db: DatabaseSync,
+export async function adjustCustomerLoyaltyPoints(
+  db: DbExecutor,
   params: {
     customerId: string;
     pointsDelta: number;
@@ -2119,10 +2391,14 @@ export function adjustCustomerLoyaltyPoints(
     couponCode?: string;
     notes?: string;
   }
-): CRMLoyaltyAccount {
-  const cfg = getCrmLoyaltyConfig(db);
-  const now = new Date().toISOString();
-  const existing = db.prepare('SELECT * FROM crm_loyalty_accounts WHERE customer_id = ?').get(params.customerId) as Record<string, unknown> | undefined;
+): Promise<CRMLoyaltyAccount> {
+  const cfg = await getCrmLoyaltyConfig(db);
+  const nowIso = new Date().toISOString();
+  const nowSql = db.formatTimestamp(nowIso);
+  const existing = await db.get<Record<string, unknown>>(
+    'SELECT * FROM crm_loyalty_accounts WHERE customer_id = ?',
+    [params.customerId]
+  );
   const curBal = Number(existing?.points_balance || 0);
   const curEarned = Number(existing?.lifetime_points_earned || 0);
   const curRedeemed = Number(existing?.lifetime_points_redeemed || 0);
@@ -2132,30 +2408,42 @@ export function adjustCustomerLoyaltyPoints(
   const nextRedeemed = params.pointsDelta < 0 ? curRedeemed + Math.abs(params.pointsDelta) : curRedeemed;
   const nextTier = computeLoyaltyTier(nextEarned, cfg);
 
-  db.prepare(`
-    INSERT INTO crm_loyalty_accounts (customer_id, points_balance, lifetime_points_earned, lifetime_points_redeemed, tier, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?)
-    ON CONFLICT(customer_id) DO UPDATE SET
-      points_balance = excluded.points_balance,
-      lifetime_points_earned = excluded.lifetime_points_earned,
-      lifetime_points_redeemed = excluded.lifetime_points_redeemed,
-      tier = excluded.tier,
-      updated_at = excluded.updated_at
-  `).run(params.customerId, nextBal, nextEarned, nextRedeemed, nextTier, now);
+  const upsertSql = buildUpsertSql({
+    driver: db.driver,
+    table: 'crm_loyalty_accounts',
+    insertColumns: [
+      'customer_id',
+      'points_balance',
+      'lifetime_points_earned',
+      'lifetime_points_redeemed',
+      'tier',
+      'updated_at',
+    ],
+    conflictColumn: 'customer_id',
+    updateAssignments: [
+      { column: 'points_balance' },
+      { column: 'lifetime_points_earned' },
+      { column: 'lifetime_points_redeemed' },
+      { column: 'tier' },
+      { column: 'updated_at' },
+    ],
+  });
+  await db.run(upsertSql, [params.customerId, nextBal, nextEarned, nextRedeemed, nextTier, nowSql]);
 
   const entryId = `lyl_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-  db.prepare(`
-    INSERT INTO crm_loyalty_ledger (id, customer_id, type, points, order_number, coupon_code, notes, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    entryId,
-    params.customerId,
-    params.type,
-    Math.abs(params.pointsDelta),
-    params.orderNumber || null,
-    params.couponCode || null,
-    params.notes || null,
-    now
+  await db.run(
+    `INSERT INTO crm_loyalty_ledger (id, customer_id, type, points, order_number, coupon_code, notes, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      entryId,
+      params.customerId,
+      params.type,
+      Math.abs(params.pointsDelta),
+      params.orderNumber || null,
+      params.couponCode || null,
+      params.notes || null,
+      nowSql,
+    ]
   );
 
   return {
@@ -2164,70 +2452,93 @@ export function adjustCustomerLoyaltyPoints(
     lifetimePointsEarned: nextEarned,
     lifetimePointsRedeemed: nextRedeemed,
     tier: nextTier,
-    updatedAt: now,
+    updatedAt: nowIso,
   };
 }
 
-export function getAllCrmCoupons(db = getDb()): CRMLoyaltyCoupon[] {
-  const rows = db.prepare('SELECT data_json FROM crm_coupons ORDER BY created_at DESC').all() as Array<{ data_json: string }>;
-  return rows.map((r) => JSON.parse(r.data_json) as CRMLoyaltyCoupon);
+export async function getAllCrmCoupons(dbArg?: DbExecutor): Promise<CRMLoyaltyCoupon[]> {
+  const db = dbArg || (await getDb());
+  const rows = await db.all<{ data_json: unknown }>('SELECT data_json FROM crm_coupons ORDER BY created_at DESC');
+  return rows.map((r) => parseJsonSafe<CRMLoyaltyCoupon>(r.data_json));
 }
 
-export function upsertCrmCoupon(db: DatabaseSync, coupon: CRMLoyaltyCoupon): CRMLoyaltyCoupon {
+export async function upsertCrmCoupon(db: DbExecutor, coupon: CRMLoyaltyCoupon): Promise<CRMLoyaltyCoupon> {
   const saved: CRMLoyaltyCoupon = {
     ...coupon,
     code: coupon.code.trim().toUpperCase(),
     createdAt: coupon.createdAt || new Date().toISOString(),
   };
-  db.prepare(`
-    INSERT INTO crm_coupons (id, code, customer_id, status, expires_at, created_at, data_json)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(id) DO UPDATE SET
-      code = excluded.code,
-      customer_id = excluded.customer_id,
-      status = excluded.status,
-      expires_at = excluded.expires_at,
-      data_json = excluded.data_json
-  `).run(
+  const sql = buildUpsertSql({
+    driver: db.driver,
+    table: 'crm_coupons',
+    insertColumns: ['id', 'code', 'customer_id', 'status', 'expires_at', 'created_at', 'data_json'],
+    conflictColumn: 'id',
+    updateAssignments: [
+      { column: 'code' },
+      { column: 'customer_id' },
+      { column: 'status' },
+      { column: 'expires_at' },
+      { column: 'data_json' },
+    ],
+  });
+  await db.run(sql, [
     saved.id,
     saved.code,
     saved.customerId || null,
     saved.status,
-    saved.expiresAt || null,
-    saved.createdAt,
-    JSON.stringify(saved)
+    saved.expiresAt ? db.formatTimestamp(saved.expiresAt) : null,
+    db.formatTimestamp(saved.createdAt),
+    JSON.stringify(saved),
+  ]);
+  return saved;
+}
+
+export async function getAllCrmCustomSegments(dbArg?: DbExecutor): Promise<CRMCustomSegmentRule[]> {
+  const db = dbArg || (await getDb());
+  const rows = await db.all<{ data_json: unknown }>(
+    'SELECT data_json FROM crm_custom_segments ORDER BY created_at DESC'
   );
+  return rows.map((r) => parseJsonSafe<CRMCustomSegmentRule>(r.data_json));
+}
+
+export async function upsertCrmCustomSegment(db: DbExecutor, rule: CRMCustomSegmentRule): Promise<CRMCustomSegmentRule> {
+  const nowIso = new Date().toISOString();
+  const nowSql = db.formatTimestamp(nowIso);
+  const saved: CRMCustomSegmentRule = { ...rule, createdAt: rule.createdAt || nowIso, updatedAt: nowIso };
+  const sql = buildUpsertSql({
+    driver: db.driver,
+    table: 'crm_custom_segments',
+    insertColumns: ['id', 'name', 'is_active', 'created_at', 'updated_at', 'data_json'],
+    conflictColumn: 'id',
+    updateAssignments: [
+      { column: 'name' },
+      { column: 'is_active' },
+      { column: 'updated_at' },
+      { column: 'data_json' },
+    ],
+  });
+  await db.run(sql, [
+    saved.id,
+    saved.name,
+    saved.isActive ? 1 : 0,
+    db.formatTimestamp(saved.createdAt),
+    nowSql,
+    JSON.stringify(saved),
+  ]);
   return saved;
 }
 
-export function getAllCrmCustomSegments(db = getDb()): CRMCustomSegmentRule[] {
-  const rows = db.prepare('SELECT data_json FROM crm_custom_segments ORDER BY created_at DESC').all() as Array<{ data_json: string }>;
-  return rows.map((r) => JSON.parse(r.data_json) as CRMCustomSegmentRule);
+export async function deleteCrmCustomSegment(db: DbExecutor, id: string): Promise<void> {
+  await db.run('DELETE FROM crm_custom_segments WHERE id = ?', [id]);
 }
 
-export function upsertCrmCustomSegment(db: DatabaseSync, rule: CRMCustomSegmentRule): CRMCustomSegmentRule {
-  const now = new Date().toISOString();
-  const saved: CRMCustomSegmentRule = { ...rule, createdAt: rule.createdAt || now, updatedAt: now };
-  db.prepare(`
-    INSERT INTO crm_custom_segments (id, name, is_active, created_at, updated_at, data_json)
-    VALUES (?, ?, ?, ?, ?, ?)
-    ON CONFLICT(id) DO UPDATE SET
-      name = excluded.name,
-      is_active = excluded.is_active,
-      updated_at = excluded.updated_at,
-      data_json = excluded.data_json
-  `).run(saved.id, saved.name, saved.isActive ? 1 : 0, saved.createdAt, now, JSON.stringify(saved));
-  return saved;
-}
-
-export function deleteCrmCustomSegment(db: DatabaseSync, id: string) {
-  db.prepare('DELETE FROM crm_custom_segments WHERE id = ?').run(id);
-}
-
-export function getAllCrmAutomationRules(db = getDb()): CRMAutomationRule[] {
-  const rows = db.prepare('SELECT data_json, enabled, last_run_at, total_triggered_count FROM crm_automation_rules').all() as Array<Record<string, unknown>>;
+export async function getAllCrmAutomationRules(dbArg?: DbExecutor): Promise<CRMAutomationRule[]> {
+  const db = dbArg || (await getDb());
+  const rows = await db.all<Record<string, unknown>>(
+    'SELECT data_json, enabled, last_run_at, total_triggered_count FROM crm_automation_rules'
+  );
   return rows.map((r) => {
-    const parsed = JSON.parse(String(r.data_json)) as CRMAutomationRule;
+    const parsed = parseJsonSafe<CRMAutomationRule>(r.data_json);
     return {
       ...parsed,
       enabled: Boolean(r.enabled),
@@ -2237,83 +2548,108 @@ export function getAllCrmAutomationRules(db = getDb()): CRMAutomationRule[] {
   });
 }
 
-export function upsertCrmAutomationRule(db: DatabaseSync, rule: CRMAutomationRule): CRMAutomationRule {
-  db.prepare(`
-    INSERT INTO crm_automation_rules (id, trigger_type, enabled, last_run_at, total_triggered_count, data_json)
-    VALUES (?, ?, ?, ?, ?, ?)
-    ON CONFLICT(id) DO UPDATE SET
-      enabled = excluded.enabled,
-      last_run_at = excluded.last_run_at,
-      total_triggered_count = excluded.total_triggered_count,
-      data_json = excluded.data_json
-  `).run(
+export async function upsertCrmAutomationRule(db: DbExecutor, rule: CRMAutomationRule): Promise<CRMAutomationRule> {
+  const sql = buildUpsertSql({
+    driver: db.driver,
+    table: 'crm_automation_rules',
+    insertColumns: ['id', 'trigger_type', 'enabled', 'last_run_at', 'total_triggered_count', 'data_json'],
+    conflictColumn: 'id',
+    updateAssignments: [
+      { column: 'enabled' },
+      { column: 'last_run_at' },
+      { column: 'total_triggered_count' },
+      { column: 'data_json' },
+    ],
+  });
+  await db.run(sql, [
     rule.id,
     rule.triggerType,
     rule.enabled ? 1 : 0,
-    rule.lastRunAt || null,
+    rule.lastRunAt ? db.formatTimestamp(rule.lastRunAt) : null,
     rule.totalTriggeredCount || 0,
-    JSON.stringify(rule)
-  );
+    JSON.stringify(rule),
+  ]);
   return rule;
 }
 
-export function getAllCrmAutomationLogs(db = getDb(), limit = 200): CRMAutomationLog[] {
-  const rows = db.prepare('SELECT data_json FROM crm_automation_logs ORDER BY created_at DESC LIMIT ?').all(limit) as Array<{ data_json: string }>;
-  return rows.map((r) => JSON.parse(r.data_json) as CRMAutomationLog);
+export async function getAllCrmAutomationLogs(dbArg?: DbExecutor, limit = 200): Promise<CRMAutomationLog[]> {
+  const db = dbArg || (await getDb());
+  const safeLimit = Math.max(1, Math.min(2000, Math.trunc(Number(limit) || 200)));
+  const rows = await db.all<{ data_json: unknown }>(
+    'SELECT data_json FROM crm_automation_logs ORDER BY created_at DESC LIMIT ?',
+    [safeLimit]
+  );
+  return rows.map((r) => parseJsonSafe<CRMAutomationLog>(r.data_json));
 }
 
-export function insertCrmAutomationLog(db: DatabaseSync, log: CRMAutomationLog): boolean {
-  const info = db.prepare(`
-    INSERT OR IGNORE INTO crm_automation_logs (id, rule_id, trigger_type, customer_id, idempotency_key, status, created_at, data_json)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    log.id,
-    log.ruleId,
-    log.triggerType,
-    log.customerId,
-    log.idempotencyKey,
-    log.status,
-    log.createdAt,
-    JSON.stringify(log)
+export async function insertCrmAutomationLog(db: DbExecutor, log: CRMAutomationLog): Promise<boolean> {
+  const info = await db.run(
+    `${insertIgnoreKeyword(db.driver)} INTO crm_automation_logs (id, rule_id, trigger_type, customer_id, idempotency_key, status, created_at, data_json)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      log.id,
+      log.ruleId,
+      log.triggerType,
+      log.customerId,
+      log.idempotencyKey,
+      log.status,
+      db.formatTimestamp(log.createdAt),
+      JSON.stringify(log),
+    ]
   );
   return Number(info.changes || 0) > 0;
 }
 
-export function hasCrmAutomationIdempotencyKey(db: DatabaseSync, key: string): boolean {
-  const row = db.prepare('SELECT id FROM crm_automation_logs WHERE idempotency_key = ?').get(key);
+export async function hasCrmAutomationIdempotencyKey(db: DbExecutor, key: string): Promise<boolean> {
+  const row = await db.get('SELECT id FROM crm_automation_logs WHERE idempotency_key = ? LIMIT 1', [key]);
   return Boolean(row);
 }
 
-export function insertCrmActivityEvent(db: DatabaseSync, event: Omit<CRMActivityEvent, 'id' | 'createdAt'> & { id?: string; createdAt?: string }): CRMActivityEvent {
+export async function insertCrmActivityEvent(
+  db: DbExecutor,
+  event: Omit<CRMActivityEvent, 'id' | 'createdAt'> & { id?: string; createdAt?: string }
+): Promise<CRMActivityEvent> {
+  const createdAtIso = event.createdAt || new Date().toISOString();
   const entry: CRMActivityEvent = {
     ...event,
     id: event.id || `act_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-    createdAt: event.createdAt || new Date().toISOString(),
+    createdAt: createdAtIso,
   };
-  db.prepare(`
-    INSERT INTO crm_activity_events (id, customer_id, phone, event_type, product_id, category, order_number, created_at, data_json)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    entry.id,
-    entry.customerId || null,
-    entry.phone || null,
-    entry.eventType,
-    entry.productId || null,
-    entry.category || null,
-    entry.orderNumber || null,
-    entry.createdAt,
-    JSON.stringify(entry)
+  await db.run(
+    `INSERT INTO crm_activity_events (id, customer_id, phone, event_type, product_id, category, order_number, created_at, data_json)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      entry.id,
+      entry.customerId || null,
+      entry.phone || null,
+      entry.eventType,
+      entry.productId || null,
+      entry.category || null,
+      entry.orderNumber || null,
+      db.formatTimestamp(createdAtIso),
+      JSON.stringify(entry),
+    ]
   );
   return entry;
 }
 
-export function getAllCrmActivityEvents(db = getDb(), customerId?: string, limit = 500): CRMActivityEvent[] {
-  const rows = (
-    customerId
-      ? db.prepare('SELECT data_json FROM crm_activity_events WHERE customer_id = ? ORDER BY created_at DESC LIMIT ?').all(customerId, limit)
-      : db.prepare('SELECT data_json FROM crm_activity_events ORDER BY created_at DESC LIMIT ?').all(limit)
-  ) as Array<{ data_json: string }>;
-  return rows.map((r) => JSON.parse(r.data_json) as CRMActivityEvent);
+export async function getAllCrmActivityEvents(
+  dbArg?: DbExecutor,
+  customerId?: string,
+  limit = 500
+): Promise<CRMActivityEvent[]> {
+  const db = dbArg || (await getDb());
+  const safeLimit = Math.max(1, Math.min(5000, Math.trunc(Number(limit) || 500)));
+  const rows = customerId
+    ? await db.all<{ data_json: unknown }>(
+        'SELECT data_json FROM crm_activity_events WHERE customer_id = ? ORDER BY created_at DESC LIMIT ?',
+        [customerId, safeLimit]
+      )
+    : await db.all<{ data_json: unknown }>(
+        'SELECT data_json FROM crm_activity_events ORDER BY created_at DESC LIMIT ?',
+        [safeLimit]
+      );
+  return rows.map((r) => parseJsonSafe<CRMActivityEvent>(r.data_json));
 }
 
 function maskPhone(phone?: string): string {
@@ -2337,7 +2673,6 @@ export function redactStateForRole(
 
   const cloned: Record<string, unknown> = { ...state };
 
-  // Never expose adminPin or shipping API key over API
   if (cloned.business_profile && typeof cloned.business_profile === 'object') {
     const bp = { ...(cloned.business_profile as BusinessProfile) };
     delete bp.adminPin;
@@ -2350,7 +2685,6 @@ export function redactStateForRole(
     cloned.business_profile = bp;
   }
 
-  // Never expose credential hashes, salts, reset tokens, or suggested default PINs
   if (Array.isArray(cloned.user_accounts)) {
     if (isAdmin) {
       cloned.user_accounts = (cloned.user_accounts as UserAccount[]).map((u) => {
@@ -2367,7 +2701,6 @@ export function redactStateForRole(
     }
   }
 
-  // Strip costPrice & margin metrics from products unless Admin/Manager/Investor
   if (Array.isArray(cloned.products) && !isAdmin && !isManager && role !== 'investor') {
     cloned.products = (cloned.products as ProductItem[]).map((p) => ({
       ...p,
@@ -2378,7 +2711,6 @@ export function redactStateForRole(
   }
 
   if (isInternalOps) {
-    // Strip PINs from customer/reseller lists even for staff/managers
     if (Array.isArray(cloned.customers)) {
       cloned.customers = (cloned.customers as Customer[]).map((c) => {
         const clean = { ...c };
@@ -2405,7 +2737,6 @@ export function redactStateForRole(
     return cloned;
   }
 
-  // Scoped visibility for Customer / Reseller / Investor / Unauthenticated Guest
   const normPhone = (val?: string) => (val || '').replace(/\D/g, '');
   const actorPhoneDigits = normPhone(actor.phone);
 
@@ -2422,7 +2753,6 @@ export function redactStateForRole(
     : [];
   const allDraws = Array.isArray(cloned.lucky_draws) ? (cloned.lucky_draws as Array<Record<string, unknown>>) : [];
 
-  // Default zero-leak private collections
   const privateKeys = [
     'customers',
     'transactions',
@@ -2453,7 +2783,6 @@ export function redactStateForRole(
     cloned[k] = [];
   }
 
-  // Public lucky draws: mask winner phone digits
   cloned.lucky_draws = allDraws.map((d) => ({
     ...d,
     winners: Array.isArray(d.winners)
@@ -2470,7 +2799,6 @@ export function redactStateForRole(
       : [],
   }));
 
-  // Public reviews: approved only + masked phone
   cloned.review_rewards = allReviews
     .filter((r) => r.status === 'approved' || (isAuthenticated && r.customerId === actor.customerId))
     .map((r) => ({ ...r, phone: isAuthenticated && r.customerId === actor.customerId ? r.phone : maskPhone(r.phone) }));
@@ -2531,14 +2859,17 @@ export function redactStateForRole(
   return cloned;
 }
 
-export function getFullSyncState(actorOrRole?: ActorContext | string): Record<string, unknown> {
-  const db = getDb();
-  const cities = getAllCitiesFromDb(db);
-  const categories = getAllCategoriesFromDb(db);
-  const products = getAllProductsFromDb(db);
-  const customers = getAllCustomersFromDb(db);
+export async function getFullSyncState(actorOrRole?: ActorContext | string): Promise<Record<string, unknown>> {
+  const db = await getDb();
+  const [cities, categories, products, customers, profile, auditLogs] = await Promise.all([
+    getAllCitiesFromDb(db),
+    getAllCategoriesFromDb(db),
+    getAllProductsFromDb(db),
+    getAllCustomersFromDb(db),
+    getCollectionValue<BusinessProfile>(db, 'business_profile', defaultBusinessProfile),
+    getAdminAuditLogs(db),
+  ]);
 
-  const profile = getCollectionValue<BusinessProfile>(db, 'business_profile', defaultBusinessProfile);
   const profileWithCities: BusinessProfile = {
     ...profile,
     deliveryCities: ensureCityAreasShape(cities.length > 0 ? cities : profile.deliveryCities || defaultDeliveryCities),
@@ -2551,38 +2882,35 @@ export function getFullSyncState(actorOrRole?: ActorContext | string): Record<st
     cities: profileWithCities.deliveryCities,
     customers,
     business_profile: profileWithCities,
-    admin_audit_logs: getAdminAuditLogs(db),
+    admin_audit_logs: auditLogs,
   };
 
-  for (const [key, fallback] of Object.entries(DEFAULT_COLLECTION_MAP)) {
-    if (key === 'business_profile') continue;
-    state[key] = getCollectionValue(db, key, fallback);
-  }
+  const keys = Object.keys(DEFAULT_COLLECTION_MAP).filter((k) => k !== 'business_profile');
+  const collectionValues = await Promise.all(
+    keys.map((key) => getCollectionValue(db, key, DEFAULT_COLLECTION_MAP[key]))
+  );
+  keys.forEach((key, idx) => {
+    state[key] = collectionValues[idx];
+  });
 
   return redactStateForRole(state, actorOrRole);
 }
 
-/**
- * Non-destructive one-time localStorage -> SQLite merge.
- * Strictly inserts missing IDs only and never overwrites or deletes existing database rows.
- */
-export function mergeLocalSnapshotNonDestructively(localCollections: Record<string, unknown>): {
+export async function mergeLocalSnapshotNonDestructively(localCollections: Record<string, unknown>): Promise<{
   mergedCounts: Record<string, number>;
-} {
-  const db = getDb();
+}> {
   const mergedCounts: Record<string, number> = {};
   const hasAnyData = Object.keys(localCollections || {}).length > 0;
   if (!hasAnyData) return { mergedCounts };
 
-  createVerifiedBackup('before_local_merge');
+  await createVerifiedBackup('before_local_merge');
 
-  db.exec('BEGIN IMMEDIATE;');
-  try {
-    // 1. Categories
+  await withDbTransaction(async (db) => {
     if (Array.isArray(localCollections.categories)) {
-      const existingIds = new Set(getAllCategoriesFromDb(db).map((c) => c.id));
+      const currentCats = await getAllCategoriesFromDb(db);
+      const existingIds = new Set(currentCats.map((c) => c.id));
       const existingNameParent = new Set(
-        getAllCategoriesFromDb(db).map((c) => `${normalizeTextKey(c.name)}::${c.parentCategoryId || ''}`)
+        currentCats.map((c) => `${normalizeTextKey(c.name)}::${c.parentCategoryId || ''}`)
       );
       let added = 0;
       for (const raw of localCollections.categories as CategoryRecord[]) {
@@ -2590,7 +2918,7 @@ export function mergeLocalSnapshotNonDestructively(localCollections: Record<stri
         const norm = normalizeUpcomingCategoryRecord(raw);
         const key = `${normalizeTextKey(norm.name)}::${norm.parentCategoryId || ''}`;
         if (!existingIds.has(norm.id) && !existingNameParent.has(key) && !isUpcomingCategoryName(norm.name)) {
-          upsertCategoryRow(db, norm);
+          await upsertCategoryRow(db, norm);
           existingIds.add(norm.id);
           existingNameParent.add(key);
           added++;
@@ -2599,13 +2927,12 @@ export function mergeLocalSnapshotNonDestructively(localCollections: Record<stri
       if (added > 0) mergedCounts.categories = added;
     }
 
-    // 2. Products
     if (Array.isArray(localCollections.products)) {
-      const existingIds = new Set(getAllProductsFromDb(db).map((p) => p.id));
+      const existingIds = new Set((await getAllProductsFromDb(db)).map((p) => p.id));
       let added = 0;
       for (const p of localCollections.products as ProductItem[]) {
         if (p?.id && p?.name && !existingIds.has(p.id)) {
-          upsertProductRow(db, p);
+          await upsertProductRow(db, p);
           existingIds.add(p.id);
           added++;
         }
@@ -2613,13 +2940,12 @@ export function mergeLocalSnapshotNonDestructively(localCollections: Record<stri
       if (added > 0) mergedCounts.products = added;
     }
 
-    // 3. Customers
     if (Array.isArray(localCollections.customers)) {
-      const existingIds = new Set(getAllCustomersFromDb(db).map((c) => c.id));
+      const existingIds = new Set((await getAllCustomersFromDb(db)).map((c) => c.id));
       let added = 0;
       for (const c of localCollections.customers as Customer[]) {
         if (c?.id && c?.name && !existingIds.has(c.id)) {
-          upsertCustomerRow(db, c);
+          await upsertCustomerRow(db, c);
           existingIds.add(c.id);
           added++;
         }
@@ -2627,39 +2953,28 @@ export function mergeLocalSnapshotNonDestructively(localCollections: Record<stri
       if (added > 0) mergedCounts.customers = added;
     }
 
-    // 4. Cities / Delivery Cities (add missing cities/areas only)
     const localProfile = localCollections.business_profile as BusinessProfile | undefined;
     const localCities = (localCollections.cities as DeliveryCityConfig[] | undefined) || localProfile?.deliveryCities;
     if (Array.isArray(localCities) && localCities.length > 0) {
-      const existingCities = getAllCitiesFromDb(db);
+      const existingCities = await getAllCitiesFromDb(db);
       const byName = new Map(existingCities.map((c) => [normalizeTextKey(c.name), c]));
       let added = 0;
-      const now = new Date().toISOString();
+      const now = db.formatTimestamp();
       for (const lc of localCities) {
         if (!lc?.name) continue;
         const existing = byName.get(normalizeTextKey(lc.name));
         if (!existing) {
           const cid = lc.id || slugifyId('city', lc.name);
           const prov = inferProvinceForCity(lc.name, lc.province);
-          db.prepare('INSERT OR IGNORE INTO cities (id, name, province, allowed, display_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run(
-            cid,
-            lc.name.trim(),
-            prov,
-            lc.allowed !== false ? 1 : 0,
-            existingCities.length + added + 1,
-            now,
-            now
+          await db.run(
+            `${insertIgnoreKeyword(db.driver)} INTO cities (id, name, province, allowed, display_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            [cid, lc.name.trim(), prov, lc.allowed !== false ? 1 : 0, existingCities.length + added + 1, now, now]
           );
           for (const a of lc.areas || []) {
             if (!a?.name) continue;
-            db.prepare('INSERT OR IGNORE INTO city_areas (id, city_id, name, allowed, area_type, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)').run(
-              a.id || slugifyId('area', `${lc.name}_${a.name}`),
-              cid,
-              a.name.trim(),
-              a.allowed !== false ? 1 : 0,
-              a.areaType || null,
-              now,
-              now
+            await db.run(
+              `${insertIgnoreKeyword(db.driver)} INTO city_areas (id, city_id, name, allowed, area_type, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+              [a.id || slugifyId('area', `${lc.name}_${a.name}`), cid, a.name.trim(), a.allowed !== false ? 1 : 0, a.areaType || null, now, now]
             );
           }
           added++;
@@ -2667,13 +2982,9 @@ export function mergeLocalSnapshotNonDestructively(localCollections: Record<stri
           const existingAreaNames = new Set((existing.areas || []).map((a) => normalizeTextKey(a.name)));
           for (const a of lc.areas) {
             if (a?.name && !existingAreaNames.has(normalizeTextKey(a.name))) {
-              db.prepare('INSERT OR IGNORE INTO city_areas (id, city_id, name, allowed, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)').run(
-                a.id || slugifyId('area', `${existing.name}_${a.name}`),
-                existing.id!,
-                a.name.trim(),
-                a.allowed !== false ? 1 : 0,
-                now,
-                now
+              await db.run(
+                `${insertIgnoreKeyword(db.driver)} INTO city_areas (id, city_id, name, allowed, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`,
+                [a.id || slugifyId('area', `${existing.name}_${a.name}`), existing.id!, a.name.trim(), a.allowed !== false ? 1 : 0, now, now]
               );
               existingAreaNames.add(normalizeTextKey(a.name));
             }
@@ -2682,16 +2993,15 @@ export function mergeLocalSnapshotNonDestructively(localCollections: Record<stri
       }
       if (added > 0) {
         mergedCounts.cities = added;
-        syncDeliveryCitiesIntoBusinessProfile(db);
+        await syncDeliveryCitiesIntoBusinessProfile(db);
       }
     }
 
-    // 5. Generic array collections
     for (const key of Object.keys(DEFAULT_COLLECTION_MAP)) {
       if (key === 'business_profile') continue;
       const incomingArr = localCollections[key];
       if (!Array.isArray(incomingArr) || incomingArr.length === 0) continue;
-      const currentArr = getCollectionValue<Array<Record<string, unknown>>>(db, key, []);
+      const currentArr = await getCollectionValue<Array<Record<string, unknown>>>(db, key, []);
       const existingIds = new Set(currentArr.map((item) => String(item.id || '')));
       let added = 0;
       for (const item of incomingArr as Array<Record<string, unknown>>) {
@@ -2703,16 +3013,11 @@ export function mergeLocalSnapshotNonDestructively(localCollections: Record<stri
         }
       }
       if (added > 0) {
-        saveCollectionValue(db, key, currentArr);
+        await saveCollectionValue(db, key, currentArr);
         mergedCounts[key] = added;
       }
     }
-
-    db.exec('COMMIT;');
-  } catch (err) {
-    db.exec('ROLLBACK;');
-    throw err;
-  }
+  });
 
   touchSyncVersion();
   return { mergedCounts };
@@ -2726,25 +3031,23 @@ export interface OrderHistoryAuditResult {
   summary: string;
 }
 
-export function auditAndRepairOrderHistory(db = getDb()): OrderHistoryAuditResult {
-  let repairedOrders = 0;
-  let linkedCustomersCreated = 0;
-  let repairedTransactions = 0;
-  let migratedUrlsCount = 0;
-  const now = new Date().toISOString();
-  const todayStr = now.split('T')[0];
+export async function auditAndRepairOrderHistory(dbArg?: DbExecutor): Promise<OrderHistoryAuditResult> {
+  const runAudit = async (db: DbExecutor): Promise<OrderHistoryAuditResult> => {
+    let repairedOrders = 0;
+    let linkedCustomersCreated = 0;
+    let repairedTransactions = 0;
+    let migratedUrlsCount = 0;
+    const now = new Date().toISOString();
+    const todayStr = now.split('T')[0];
 
-  const normalizeDigits = (val?: string) => (val || '').replace(/\D/g, '');
-  const replaceLegacyDomain = (val: string) =>
-    val
-      .replace(/https?:\/\/(?:www\.)?100dagar\.pk/gi, 'https://www.madinamarket.pk')
-      .replace(/https?:\/\/(?:www\.)?example\.com/gi, 'https://www.madinamarket.pk')
-      .replace(/@100dagar\.pk/gi, '@madinamarket.pk');
+    const normalizeDigits = (val?: string) => (val || '').replace(/\D/g, '');
+    const replaceLegacyDomain = (val: string) =>
+      val
+        .replace(/https?:\/\/(?:www\.)?100dagar\.pk/gi, 'https://www.madinamarket.pk')
+        .replace(/https?:\/\/(?:www\.)?example\.com/gi, 'https://www.madinamarket.pk')
+        .replace(/@100dagar\.pk/gi, '@madinamarket.pk');
 
-  db.exec('BEGIN IMMEDIATE;');
-  try {
-    // 1. Clean legacy domain links in products
-    const allProds = getAllProductsFromDb(db);
+    const allProds = await getAllProductsFromDb(db);
     for (const p of allProds) {
       let dirty = false;
       const nextProd = { ...p };
@@ -2757,13 +3060,12 @@ export function auditAndRepairOrderHistory(db = getDb()): OrderHistoryAuditResul
         dirty = true;
       }
       if (dirty) {
-        upsertProductRow(db, nextProd);
+        await upsertProductRow(db, nextProd);
         migratedUrlsCount++;
       }
     }
 
-    // 2. Clean business_profile, investors, user_accounts, import_logs URLs/emails (preserving internal owner alias in code)
-    const bp = getCollectionValue<BusinessProfile>(db, 'business_profile', defaultBusinessProfile);
+    const bp = await getCollectionValue<BusinessProfile>(db, 'business_profile', defaultBusinessProfile);
     let bpChanged = false;
     const nextBp: BusinessProfile = { ...bp };
     if (nextBp.email && /100dagar\.pk/i.test(nextBp.email)) {
@@ -2775,12 +3077,12 @@ export function auditAndRepairOrderHistory(db = getDb()): OrderHistoryAuditResul
       bpChanged = true;
     }
     if (bpChanged) {
-      saveCollectionValue(db, 'business_profile', nextBp);
+      await saveCollectionValue(db, 'business_profile', nextBp);
       migratedUrlsCount++;
     }
 
     for (const colKey of ['investors', 'user_accounts', 'import_logs']) {
-      const arr = getCollectionValue<Array<Record<string, unknown>>>(db, colKey, []);
+      const arr = await getCollectionValue<Array<Record<string, unknown>>>(db, colKey, []);
       let arrDirty = false;
       const cleanedArr = arr.map((item) => {
         const nextItem = { ...item };
@@ -2795,17 +3097,15 @@ export function auditAndRepairOrderHistory(db = getDb()): OrderHistoryAuditResul
         return nextItem;
       });
       if (arrDirty) {
-        saveCollectionValue(db, colKey, cleanedArr);
+        await saveCollectionValue(db, colKey, cleanedArr);
       }
     }
 
-    // 3. Audit customers, cod_orders, and transactions
-    const customers = getAllCustomersFromDb(db);
+    const customers = await getAllCustomersFromDb(db);
     const customerById = new Map<string, Customer>(customers.map((c) => [c.id, c]));
-    const rawOrders = getCollectionValue<CODOrder[]>(db, 'cod_orders', []);
-    const rawTxs = getCollectionValue<Transaction[]>(db, 'transactions', []);
+    const rawOrders = await getCollectionValue<CODOrder[]>(db, 'cod_orders', []);
+    const rawTxs = await getCollectionValue<Transaction[]>(db, 'transactions', []);
 
-    // Deduplicate COD orders by id
     const seenOrderIds = new Set<string>();
     const dedupedOrders: CODOrder[] = [];
     for (const ord of rawOrders) {
@@ -2817,7 +3117,6 @@ export function auditAndRepairOrderHistory(db = getDb()): OrderHistoryAuditResul
       dedupedOrders.push(ord);
     }
 
-    // Deduplicate & sanitize transactions
     const seenTxIds = new Set<string>();
     const cleanTxs: Transaction[] = [];
     for (const tx of rawTxs) {
@@ -2836,12 +3135,9 @@ export function auditAndRepairOrderHistory(db = getDb()): OrderHistoryAuditResul
           ? Math.max(0, safeAmount - safePaid)
           : 0;
       const validCustomer =
-        tx.customerId && customerById.has(tx.customerId)
-          ? customerById.get(tx.customerId)
-          : undefined;
+        tx.customerId && customerById.has(tx.customerId) ? customerById.get(tx.customerId) : undefined;
       let resolvedCustomerId = tx.customerId || '';
       if (!validCustomer) {
-        // Attempt match via notes / order reference
         const matchedOrd = dedupedOrders.find(
           (o) =>
             (o.orderNumber && tx.notes?.includes(o.orderNumber)) ||
@@ -2872,16 +3168,14 @@ export function auditAndRepairOrderHistory(db = getDb()): OrderHistoryAuditResul
       });
     }
 
-    // Audit every COD order -> resolve or create Customer & link pending/delivered COD transaction if missing
-    const fixedOrders: CODOrder[] = dedupedOrders.map((ord) => {
+    const fixedOrders: CODOrder[] = [];
+    for (const ord of dedupedOrders) {
       let ordDirty = false;
       const cleanPhoneDigits = normalizeDigits(ord.phone);
       let matchedCust =
         (ord.customerId && customerById.get(ord.customerId)) ||
         (cleanPhoneDigits
-          ? Array.from(customerById.values()).find(
-              (c) => normalizeDigits(c.phone) === cleanPhoneDigits
-            )
+          ? Array.from(customerById.values()).find((c) => normalizeDigits(c.phone) === cleanPhoneDigits)
           : undefined);
 
       if (!matchedCust && ord.customerName) {
@@ -2905,7 +3199,7 @@ export function auditAndRepairOrderHistory(db = getDb()): OrderHistoryAuditResul
           pin: defaultPin,
           createdAt: (ord.createdAt || now).split('T')[0],
         };
-        upsertCustomerRow(db, newCust);
+        await upsertCustomerRow(db, newCust);
         customerById.set(newCust.id, newCust);
         matchedCust = newCust;
         linkedCustomersCreated++;
@@ -2938,7 +3232,6 @@ export function auditAndRepairOrderHistory(db = getDb()): OrderHistoryAuditResul
         ordDirty = true;
       }
 
-      // Ensure corresponding credit Transaction exists in ledger for order history traceability
       const orderNum = ord.orderNumber || `COD-${ord.id}`;
       const hasLinkedOrderTx = cleanTxs.some(
         (t) =>
@@ -2984,7 +3277,7 @@ export function auditAndRepairOrderHistory(db = getDb()): OrderHistoryAuditResul
       }
 
       if (ordDirty) repairedOrders++;
-      return {
+      fixedOrders.push({
         ...ord,
         orderNumber: orderNum,
         customerId: nextCustomerId,
@@ -2993,10 +3286,9 @@ export function auditAndRepairOrderHistory(db = getDb()): OrderHistoryAuditResul
         subtotal: computedSubtotal,
         deliveryFee: safeDeliveryFee,
         totalAmount: safeTotal,
-      };
-    });
+      });
+    }
 
-    // 4. Recalculate customer balances & purchases cleanly from cleanTxs
     for (const cust of customerById.values()) {
       const custTxs = cleanTxs.filter((t) => t.customerId === cust.id && t.status !== 'cancelled');
       const totalCredit = custTxs
@@ -3010,7 +3302,7 @@ export function auditAndRepairOrderHistory(db = getDb()): OrderHistoryAuditResul
         .reduce((s, t) => s + Number(t.amount || 0), 0);
       const ordersCount = custTxs.filter((t) => t.type === 'credit').length;
       const computedBal = Math.max(0, totalCredit - totalPaidDirect - totalDebit);
-      upsertCustomerRow(db, {
+      await upsertCustomerRow(db, {
         ...cust,
         balance: computedBal,
         totalPurchases: totalCredit,
@@ -3018,44 +3310,72 @@ export function auditAndRepairOrderHistory(db = getDb()): OrderHistoryAuditResul
       });
     }
 
-    saveCollectionValue(db, 'cod_orders', fixedOrders);
-    saveCollectionValue(db, 'transactions', cleanTxs);
+    await saveCollectionValue(db, 'cod_orders', fixedOrders);
+    await saveCollectionValue(db, 'transactions', cleanTxs);
 
-    db.exec('COMMIT;');
-  } catch (err) {
-    db.exec('ROLLBACK;');
-    throw err;
-  }
-
-  touchSyncVersion();
-  const summary = `Audit complete: ${repairedOrders} order fixes, ${linkedCustomersCreated} linked customer records created, ${repairedTransactions} ledger transactions synced, ${migratedUrlsCount} legacy URLs updated to madinamarket.pk.`;
-  return {
-    repairedOrders,
-    linkedCustomersCreated,
-    repairedTransactions,
-    migratedUrlsCount,
-    summary,
+    const summary = `Audit complete: ${repairedOrders} order fixes, ${linkedCustomersCreated} linked customer records created, ${repairedTransactions} ledger transactions synced, ${migratedUrlsCount} legacy URLs updated to madinamarket.pk.`;
+    return {
+      repairedOrders,
+      linkedCustomersCreated,
+      repairedTransactions,
+      migratedUrlsCount,
+      summary,
+    };
   };
+
+  if (dbArg) {
+    return runAudit(dbArg);
+  }
+  const result = await withDbTransaction(runAudit);
+  touchSyncVersion();
+  return result;
 }
 
-export function getDatabaseHealthSummary() {
-  const db = getDb();
-  const counts = {
-    categories: Number((db.prepare('SELECT COUNT(*) as c FROM categories').get() as { c: number }).c),
-    cities: Number((db.prepare('SELECT COUNT(*) as c FROM cities').get() as { c: number }).c),
-    cityAreas: Number((db.prepare('SELECT COUNT(*) as c FROM city_areas').get() as { c: number }).c),
-    products: Number((db.prepare('SELECT COUNT(*) as c FROM products').get() as { c: number }).c),
-    customers: Number((db.prepare('SELECT COUNT(*) as c FROM customers').get() as { c: number }).c),
-    transactions: getCollectionValue<Transaction[]>(db, 'transactions', []).length,
-    codOrders: getCollectionValue<CODOrder[]>(db, 'cod_orders', []).length,
-    monthlyExpenses: getCollectionValue<MonthlyExpense[]>(db, 'monthly_expenses', []).length,
-    auditLogs: Number((db.prepare('SELECT COUNT(*) as c FROM admin_audit_logs').get() as { c: number }).c),
+export interface HealthCheckResponse {
+  app: 'ok';
+  database: DbDriver;
+  status: 'ok' | 'error';
+  tables: {
+    products: boolean;
+    customers: boolean;
+    schema_migrations: boolean;
   };
-  return {
-    status: 'ok',
-    dbPath: DB_PATH,
-    syncVersion: lastSyncVersion,
-    counts,
-    backups: listBackups().slice(0, 5),
-  };
+  syncVersion: string;
+}
+
+export async function checkDatabaseHealth(): Promise<HealthCheckResponse> {
+  const driver = resolveDbDriver();
+  try {
+    const db = await getDb();
+    await db.ping();
+    const [products, customers, schemaMigrations] = await Promise.all([
+      db.tableExists('products'),
+      db.tableExists('customers'),
+      db.tableExists('schema_migrations'),
+    ]);
+    const allPresent = products && customers && schemaMigrations;
+    return {
+      app: 'ok',
+      database: db.driver,
+      status: allPresent ? 'ok' : 'error',
+      tables: {
+        products,
+        customers,
+        schema_migrations: schemaMigrations,
+      },
+      syncVersion: lastSyncVersion,
+    };
+  } catch {
+    return {
+      app: 'ok',
+      database: driver,
+      status: 'error',
+      tables: {
+        products: false,
+        customers: false,
+        schema_migrations: false,
+      },
+      syncVersion: lastSyncVersion,
+    };
+  }
 }
