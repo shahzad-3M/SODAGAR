@@ -39,6 +39,7 @@ export interface Customer {
   lastPurchaseDate?: string;
   // Optional CRM 360 & Segmentation Metadata
   whatsapp?: string;
+  whatsappSameAsPhone?: boolean;
   customerSource?: CRMSourceChannel | string;
   referralCode?: string;
   referredBy?: string;
@@ -517,6 +518,8 @@ export interface AppUser {
   urduName?: string;
   role: UserRole;
   phone: string;
+  whatsapp?: string;
+  whatsappSameAsPhone?: boolean;
   email?: string;
   resellerCode?: string;
   customerId?: string;
@@ -538,6 +541,8 @@ export interface UserAccount {
   fullName: string;
   urduName?: string;
   phone: string;
+  whatsapp?: string;
+  whatsappSameAsPhone?: boolean;
   email?: string;
   role: UserRole;
   status: 'active' | 'suspended' | 'inactive';

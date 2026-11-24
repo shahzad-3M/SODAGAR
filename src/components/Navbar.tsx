@@ -31,6 +31,7 @@ import {
   CreditCard,
   Tag,
   HeartHandshake,
+  LifeBuoy,
 } from 'lucide-react';
 import { AppUser, BusinessProfile, CategoryRecord, ProductItem, UserRole } from '../types/index.ts';
 import { openWhatsAppDirect } from '../utils/whatsapp.ts';
@@ -124,6 +125,7 @@ export const Navbar: React.FC<NavbarProps> = ({
     { id: 'store', label: 'Shop & Catalog', urdu: 'مارکیٹ کیٹلاگ', icon: ShoppingBag },
   ];
   const guestDropdownItems: NavItem[] = [
+    { id: 'customer_tickets', label: 'Support Tickets (Sign In)', urdu: 'سپورٹ ٹکٹ (لاگ ان کریں)', icon: LifeBuoy },
     { id: 'lucky_draw', label: 'Lucky Draw & Rewards', urdu: 'لکی ڈرا اور انعامات', icon: Trophy },
   ];
 
@@ -131,6 +133,7 @@ export const Navbar: React.FC<NavbarProps> = ({
   const customerNavItems: NavItem[] = [
     { id: 'store', label: 'Shop & Catalog', urdu: 'مارکیٹ کیٹلاگ', icon: ShoppingBag },
     { id: 'customer_portal', label: 'My Portal', urdu: 'کسٹمر پورٹل و سیکیورٹی', icon: User },
+    { id: 'customer_tickets', label: 'Support Tickets', urdu: 'سپورٹ ٹکٹ', icon: LifeBuoy },
     { id: 'history', label: 'My Orders & Khata', urdu: 'کھاتہ و ہسٹری', icon: Clock },
     { id: 'reports', label: 'My Reports & Savings', urdu: 'میرا خلاصہ و بچت', icon: BarChart3 },
   ];

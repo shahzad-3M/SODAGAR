@@ -1,4 +1,4 @@
-import {
+import type {
   AdminAuditLog,
   AppUser,
   AttendanceRecord,
@@ -51,7 +51,7 @@ import {
   CRMReportKey,
   CRMSupportTicket,
   Customer360Profile,
-} from '../types';
+} from '../types/index.ts';
 import {
   defaultAttendance,
   defaultBranches,
@@ -83,7 +83,7 @@ import {
   defaultWalkInSales,
   defaultWasalSettlements,
   defaultWhatsAppNotifications,
-} from './defaultData';
+} from './defaultData.ts';
 import {
   ensureCityAreasShape,
   isUpcomingCategoryName,
@@ -91,11 +91,11 @@ import {
   normalizeUpcomingCategoryRecord,
   UPCOMING_CATEGORY_ID,
   UPCOMING_CATEGORY_NAME,
-} from './locationCategoryHelpers';
+} from './locationCategoryHelpers.ts';
 import {
   parseProductFromHtmlInBrowser,
   tryFetchProductInBrowserFallback,
-} from './clientProductScraper';
+} from './clientProductScraper.ts';
 
 const STORAGE_KEYS = {
   PROFILE: '100dagar_business_profile_v5',
@@ -495,7 +495,7 @@ export function subscribeToServerSync(listener: () => void): () => void {
 export async function apiAuthenticateLogin(
   identifier: string,
   pin: string
-): Promise<{ ok: boolean; user?: Partial<AppUser>; sessionToken?: string }> {
+): Promise<{ ok: boolean; user?: Partial<AppUser>; sessionToken?: string; error?: string }> {
   try {
     const res = await fetch('/api/auth/login', {
       method: 'POST',
@@ -504,19 +504,26 @@ export async function apiAuthenticateLogin(
       body: JSON.stringify({ identifier, pin }),
     });
     const parsed = await safeParseJsonResponse<{
-      ok: boolean;
+      ok?: boolean;
       user?: Partial<AppUser>;
       sessionToken?: string;
+      error?: string;
     }>(res);
-    if (!parsed.ok || !parsed.data) return { ok: false };
+    if (!parsed.ok || !parsed.data?.ok) {
+      return { ok: false, error: parsed.data?.error || parsed.error };
+    }
     const data = parsed.data;
     if (data.ok && data.sessionToken) {
       setSessionToken(data.sessionToken);
       await refreshSyncState();
     }
-    return data;
-  } catch {
-    return { ok: false };
+    return {
+      ok: true,
+      user: data.user,
+      sessionToken: data.sessionToken,
+    };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
   }
 }
 
@@ -1522,20 +1529,41 @@ export function getOwnerPin(): string {
 export async function apiRegisterCustomer(payload: {
   fullName: string;
   phone: string;
-  pin: string;
+  email?: string;
   city?: string;
-}): Promise<{ ok: boolean; user?: Partial<AppUser>; sessionToken?: string; error?: string }> {
+  address?: string;
+  whatsappSameAsPhone?: boolean;
+  whatsapp?: string;
+  pin?: string;
+  generateTempPassword?: boolean;
+}): Promise<{
+  ok: boolean;
+  user?: Partial<AppUser>;
+  customer?: Customer;
+  sessionToken?: string;
+  temporaryPassword?: string;
+  whatsappNumber?: string;
+  email?: string;
+  error?: string;
+}> {
   try {
     const res = await fetch('/api/auth/register-customer', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-client-id': CLIENT_ID },
       cache: 'no-store',
-      body: JSON.stringify(payload),
+      body: JSON.stringify({
+        ...payload,
+        name: payload.fullName,
+      }),
     });
     const parsed = await safeParseJsonResponse<{
       ok?: boolean;
       user?: Partial<AppUser>;
+      customer?: Customer;
       sessionToken?: string;
+      temporaryPassword?: string;
+      whatsappNumber?: string;
+      email?: string;
       error?: string;
     }>(res);
     if (!parsed.ok || !parsed.data?.ok) {
@@ -1545,7 +1573,15 @@ export async function apiRegisterCustomer(payload: {
       setSessionToken(parsed.data.sessionToken);
       await refreshSyncState();
     }
-    return { ok: true, user: parsed.data.user, sessionToken: parsed.data.sessionToken };
+    return {
+      ok: true,
+      user: parsed.data.user,
+      customer: parsed.data.customer,
+      sessionToken: parsed.data.sessionToken,
+      temporaryPassword: parsed.data.temporaryPassword,
+      whatsappNumber: parsed.data.whatsappNumber,
+      email: parsed.data.email,
+    };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
   }
@@ -1866,6 +1902,53 @@ export async function apiSaveCrmLead(
   }
 }
 
+export async function apiBulkImportCrmLeads(payload: {
+  leads: Array<Partial<CRMLead>>;
+  defaultSource?: CRMLead['source'];
+  defaultStage?: CRMLead['stage'];
+  skipDuplicates?: boolean;
+  updateDuplicates?: boolean;
+}): Promise<{
+  ok: boolean;
+  importedCount?: number;
+  updatedCount?: number;
+  skippedDuplicatesCount?: number;
+  invalidCount?: number;
+  leads?: CRMLead[];
+  error?: string;
+}> {
+  try {
+    const res = await fetch('/api/crm/leads/bulk-import', {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      cache: 'no-store',
+      body: JSON.stringify(payload),
+    });
+    const parsed = await safeParseJsonResponse<{
+      ok?: boolean;
+      importedCount?: number;
+      updatedCount?: number;
+      skippedDuplicatesCount?: number;
+      invalidCount?: number;
+      leads?: CRMLead[];
+      error?: string;
+    }>(res);
+    if (!parsed.ok || !parsed.data?.ok) {
+      return { ok: false, error: parsed.data?.error || parsed.error || 'Bulk lead import failed.' };
+    }
+    return {
+      ok: true,
+      importedCount: parsed.data.importedCount ?? 0,
+      updatedCount: parsed.data.updatedCount ?? 0,
+      skippedDuplicatesCount: parsed.data.skippedDuplicatesCount ?? 0,
+      invalidCount: parsed.data.invalidCount ?? 0,
+      leads: parsed.data.leads,
+    };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
 export async function apiConvertCrmLead(
   leadId: string
 ): Promise<{ ok: boolean; customer?: Customer; reusedExisting?: boolean; lead?: CRMLead; error?: string }> {
@@ -1986,9 +2069,34 @@ export async function apiSaveCrmCoupon(
   }
 }
 
+export async function apiFetchCrmTickets(): Promise<{
+  ok: boolean;
+  tickets?: CRMSupportTicket[];
+  error?: string;
+}> {
+  try {
+    const res = await fetch('/api/crm/tickets', {
+      method: 'GET',
+      headers: getAuthHeaders(),
+      cache: 'no-store',
+    });
+    const parsed = await safeParseJsonResponse<{
+      ok?: boolean;
+      tickets?: CRMSupportTicket[];
+      error?: string;
+    }>(res);
+    if (!parsed.ok || !parsed.data?.ok) {
+      return { ok: false, error: parsed.data?.error || parsed.error || 'Could not load support tickets.' };
+    }
+    return { ok: true, tickets: parsed.data.tickets || [] };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
 export async function apiSaveCrmTicket(
-  ticket: Partial<CRMSupportTicket>
-): Promise<{ ok: boolean; ticket?: CRMSupportTicket; error?: string }> {
+  ticket: Partial<CRMSupportTicket> & { customerFollowUpNote?: string }
+): Promise<{ ok: boolean; ticket?: CRMSupportTicket; tickets?: CRMSupportTicket[]; error?: string }> {
   try {
     const isUpdate = Boolean(ticket.id);
     const res = await fetch(isUpdate ? `/api/crm/tickets/${encodeURIComponent(ticket.id!)}` : '/api/crm/tickets', {
@@ -1997,11 +2105,16 @@ export async function apiSaveCrmTicket(
       cache: 'no-store',
       body: JSON.stringify(ticket),
     });
-    const parsed = await safeParseJsonResponse<{ ok?: boolean; ticket?: CRMSupportTicket; error?: string }>(res);
+    const parsed = await safeParseJsonResponse<{
+      ok?: boolean;
+      ticket?: CRMSupportTicket;
+      tickets?: CRMSupportTicket[];
+      error?: string;
+    }>(res);
     if (!parsed.ok || !parsed.data?.ok) {
       return { ok: false, error: parsed.data?.error || parsed.error || 'Ticket save failed.' };
     }
-    return { ok: true, ticket: parsed.data.ticket };
+    return { ok: true, ticket: parsed.data.ticket, tickets: parsed.data.tickets };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
   }
@@ -2315,8 +2428,16 @@ export function resetUserPasswordToDefault(userId: string): { tempPin: string; a
 // CONFIGURABLE LOGIN FORM CONFIGURATION
 export function getLoginFormConfig(): LoginFormConfig {
   const prof = getBusinessProfile();
-  if (prof.loginFormConfig) return prof.loginFormConfig;
-  return loadFromStorage<LoginFormConfig>(STORAGE_KEYS.LOGIN_CONFIG, defaultLoginFormConfig);
+  const raw =
+    prof.loginFormConfig || loadFromStorage<LoginFormConfig>(STORAGE_KEYS.LOGIN_CONFIG, defaultLoginFormConfig);
+  const instructions = raw.loginInstructions || '';
+  if (/last\s*6\s*digits/i.test(instructions)) {
+    return {
+      ...raw,
+      loginInstructions: defaultLoginFormConfig.loginInstructions,
+    };
+  }
+  return raw;
 }
 
 export function saveLoginFormConfig(config: LoginFormConfig): void {

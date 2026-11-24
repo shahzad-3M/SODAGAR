@@ -939,7 +939,7 @@ export const defaultLoginFormConfig: LoginFormConfig = {
   allowSelfRegistration: true,
   supportContactNumber: '0312 5256 266',
   loginInstructions:
-    'Customers can log in using their registered mobile number and PIN. Default PIN is the last 6 digits of mobile number. Please change your temporary PIN immediately upon first sign in.',
+    'Customers can sign in using their registered mobile number, email, or username and password, or register a new account to receive a temporary password on WhatsApp and Email.',
 };
 
 export const defaultBusinessProfile: BusinessProfile = {

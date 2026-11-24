@@ -12,15 +12,17 @@ import {
   AlertCircle,
   Check,
   ShieldCheck,
-  Sparkles,
-  HelpCircle,
   ArrowLeft,
   CheckCircle2,
+  Mail,
+  MessageCircle,
+  Copy,
+  UserPlus,
+  MapPin,
 } from 'lucide-react';
 import { AppUser, Customer, LoginFormConfig, Reseller, UserAccount, UserRole } from '../types/index.ts';
 import {
   defaultGuestUser,
-  getDefaultPinForPhone,
   getLoginFormConfig,
   logUserLogin,
   apiAuthenticateLogin,
@@ -41,6 +43,23 @@ function normalizePhoneOrId(val: string): string {
   return clean;
 }
 
+type ModalMode =
+  | 'login'
+  | 'register'
+  | 'registration_confirmation'
+  | 'account'
+  | 'forgot_password'
+  | 'force_change_password';
+
+interface RegistrationConfirmationState {
+  fullName: string;
+  phone: string;
+  whatsappNumber: string;
+  email?: string;
+  temporaryPassword: string;
+  user: Partial<AppUser> & { role: UserRole };
+}
+
 interface LoginRoleModalProps {
   isOpen: boolean;
   onClose: () => void;
@@ -56,41 +75,52 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
   onClose,
   currentUser,
   onSelectRole,
-  customers = [],
-  resellers = [],
   onLogout,
 }) => {
   const isGuest = currentUser?.isAuthenticated !== true;
 
-  const [modalMode, setModalMode] = useState<'login' | 'account' | 'forgot_password' | 'force_change_password'>(
-    isGuest ? 'login' : 'account'
-  );
-
+  const [modalMode, setModalMode] = useState<ModalMode>(isGuest ? 'login' : 'account');
   const [loginConfig, setLoginConfig] = useState<LoginFormConfig>(getLoginFormConfig);
 
-  // Unified Single Login Inputs
+  // Unified Sign-In Inputs
   const [identifier, setIdentifier] = useState('');
   const [pin, setPin] = useState('');
-  const [fullName, setFullName] = useState('');
   const [rememberMe, setRememberMe] = useState(true);
   const [showPin, setShowPin] = useState(false);
+  const [isLoggingIn, setIsLoggingIn] = useState(false);
   const [errorMessage, setErrorMessage] = useState('');
   const [successMessage, setSuccessMessage] = useState('');
 
-  // Pending user when mandatory password change or new registration is required
+  // Customer Self-Registration Inputs
+  const [regName, setRegName] = useState('');
+  const [regPhone, setRegPhone] = useState('');
+  const [regWhatsappSameAsPhone, setRegWhatsappSameAsPhone] = useState(true);
+  const [regWhatsapp, setRegWhatsapp] = useState('');
+  const [regEmail, setRegEmail] = useState('');
+  const [regCity, setRegCity] = useState('Muzaffarabad');
+  const [isRegistering, setIsRegistering] = useState(false);
+  const [regError, setRegError] = useState('');
+
+  // Post-Registration Confirmation & Temporary Password Delivery
+  const [regConfirmation, setRegConfirmation] = useState<RegistrationConfirmationState | null>(null);
+  const [showTempPassword, setShowTempPassword] = useState(true);
+  const [copiedTempPass, setCopiedTempPass] = useState(false);
+  const [whatsappSentDone, setWhatsappSentDone] = useState(false);
+  const [emailOpenedDone, setEmailOpenedDone] = useState(false);
+
+  // Mandatory / Forced Password Change
   const [pendingUserAccount, setPendingUserAccount] = useState<UserAccount | null>(null);
   const [pendingCurrentPin, setPendingCurrentPin] = useState('');
-  const [pendingIsNewRegistration, setPendingIsNewRegistration] = useState(false);
   const [forcedNewPass, setForcedNewPass] = useState('');
   const [forcedConfirmPass, setForcedConfirmPass] = useState('');
   const [forcePassError, setForcePassError] = useState('');
 
-  // Forgot password helpline state
+  // Forgot Password / Support Helpline State
   const [forgotIdentifier, setForgotIdentifier] = useState('');
   const [forgotError, setForgotError] = useState('');
   const [forgotSuccess, setForgotSuccess] = useState('');
 
-  // Change PIN State inside Account Portal
+  // Change Password inside Account Portal
   const [currentPinInput, setCurrentPinInput] = useState('');
   const [newPinInput, setNewPinInput] = useState('');
   const [confirmPinInput, setConfirmPinInput] = useState('');
@@ -101,6 +131,7 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
     if (isOpen) {
       setErrorMessage('');
       setSuccessMessage('');
+      setRegError('');
       setChangePinError('');
       setChangePinSuccess('');
       setForgotError('');
@@ -109,6 +140,9 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
       setCurrentPinInput('');
       setNewPinInput('');
       setConfirmPinInput('');
+      setCopiedTempPass(false);
+      setWhatsappSentDone(false);
+      setEmailOpenedDone(false);
       setLoginConfig(getLoginFormConfig());
 
       if (currentUser?.isAuthenticated === true) {
@@ -121,7 +155,16 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
 
   if (!isOpen) return null;
 
-  // SERVER-AUTHORITATIVE COMBINED LOGIN HANDLER
+  const supportNumber = loginConfig.supportContactNumber || '03125256266';
+
+  const handleOpenSupport = (contextNote?: string) => {
+    const text =
+      contextNote ||
+      'السلام علیکم! مجھے 100DAGAR اکاؤنٹ میں لاگ ان، رجسٹریشن یا پاس ورڈ میں مدد چاہیے۔ شکریہ!';
+    openWhatsAppDirect(supportNumber, text);
+  };
+
+  // SERVER-AUTHORITATIVE SIGN-IN HANDLER
   const handleCombinedLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMessage('');
@@ -136,12 +179,14 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
     }
 
     if (!cleanPin || cleanPin.length < 4) {
-      setErrorMessage('Please enter your valid security PIN / password (min 4 characters).');
+      setErrorMessage('Please enter your valid password / PIN (min 4 characters).');
       return;
     }
 
-    // 1. Authenticate authoritatively with backend /api/auth/login (issues signed sessionToken & scrypt check)
+    setIsLoggingIn(true);
     const serverAuth = await apiAuthenticateLogin(identifier.trim(), cleanPin);
+    setIsLoggingIn(false);
+
     if (serverAuth.ok && serverAuth.user) {
       const authUser = serverAuth.user as Partial<AppUser> & { role: UserRole };
       if (authUser.mustChangePassword === true) {
@@ -151,6 +196,8 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
           fullName: authUser.name || 'User',
           urduName: authUser.urduName,
           phone: authUser.phone || cleanId,
+          whatsapp: authUser.whatsapp,
+          whatsappSameAsPhone: authUser.whatsappSameAsPhone,
           email: authUser.email,
           role: authUser.role,
           status: 'active',
@@ -167,7 +214,6 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
           createdAt: new Date().toISOString(),
         });
         setPendingCurrentPin(cleanPin);
-        setPendingIsNewRegistration(false);
         setModalMode('force_change_password');
         return;
       }
@@ -180,50 +226,104 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
       return;
     }
 
-    // 2. Check if already-known customer/reseller exists locally (do not auto-register existing numbers on wrong PIN)
-    const cleanIdLower = identifier.trim().toLowerCase();
-    const alreadyExists =
-      customers.some(
-        (c) => normalizePhoneOrId(c.phone) === cleanId || (c.email && c.email.toLowerCase() === cleanIdLower)
-      ) ||
-      resellers.some(
-        (r) => normalizePhoneOrId(r.phone) === cleanId || r.referralCode.toLowerCase() === cleanIdLower
-      );
+    setErrorMessage(
+      serverAuth.error ||
+        'Invalid credentials. Please check your mobile number / email / username and password, or register a new account.'
+    );
+  };
 
-    if (alreadyExists) {
-      setErrorMessage('Invalid PIN or password for this account. Please verify your credentials or contact support.');
+  // EXPLICIT CUSTOMER SELF-REGISTRATION HANDLER
+  const handleCustomerRegister = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setRegError('');
+
+    const cleanName = regName.trim();
+    const cleanPhone = regPhone.trim();
+    const cleanWhatsapp = regWhatsappSameAsPhone ? cleanPhone : regWhatsapp.trim();
+    const cleanEmail = regEmail.trim();
+    const cleanCity = regCity.trim() || 'Muzaffarabad';
+
+    if (cleanName.length < 2) {
+      setRegError('Please enter your full name (at least 2 characters).');
       return;
     }
 
-    // 3. Instant Customer Self-Registration (only for brand-new unregistered mobile numbers using default last-6-digits PIN)
-    const digitsOnly = cleanId.replace(/\D/g, '');
-    if (loginConfig.allowSelfRegistration && digitsOnly.length >= 10) {
-      const defaultPin = getDefaultPinForPhone(cleanId);
-      if (cleanPin === defaultPin) {
-        const newCustName = fullName.trim() || `Customer ${digitsOnly.slice(-4)}`;
-        const newAccount: UserAccount = {
-          id: `usr_${Date.now()}`,
-          username: cleanId,
-          fullName: newCustName,
-          phone: cleanId,
-          role: 'customer',
-          status: 'active',
-          mustChangePassword: true,
-          isTemporaryPassword: true,
-          createdAt: new Date().toISOString(),
-        };
-        setPendingUserAccount(newAccount);
-        setPendingCurrentPin(cleanPin);
-        setPendingIsNewRegistration(true);
-        setModalMode('force_change_password');
-        return;
-      }
+    if (cleanPhone.replace(/\D/g, '').length < 10) {
+      setRegError('Please enter a valid 11-digit mobile number (e.g. 0300 1234567).');
+      return;
     }
 
-    setErrorMessage('Invalid credentials. Please check your mobile number / username and password.');
+    if (!regWhatsappSameAsPhone && cleanWhatsapp.replace(/\D/g, '').length < 10) {
+      setRegError('Please enter a valid WhatsApp number (at least 10 digits) for notifications.');
+      return;
+    }
+
+    if (cleanEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+      setRegError('Please enter a valid email address.');
+      return;
+    }
+
+    setIsRegistering(true);
+    const regRes = await apiRegisterCustomer({
+      fullName: cleanName,
+      phone: cleanPhone,
+      email: cleanEmail || undefined,
+      city: cleanCity,
+      whatsappSameAsPhone: regWhatsappSameAsPhone,
+      whatsapp: cleanWhatsapp,
+      generateTempPassword: true,
+    });
+    setIsRegistering(false);
+
+    if (!regRes.ok || !regRes.user) {
+      setRegError(regRes.error || 'Registration failed. Please check your details and try again.');
+      return;
+    }
+
+    const tempPassword = regRes.temporaryPassword || '';
+    const resolvedWhatsapp = regRes.whatsappNumber || cleanWhatsapp;
+    const confirmedUser: Partial<AppUser> & { role: UserRole } = {
+      ...regRes.user,
+      role: 'customer',
+      whatsapp: resolvedWhatsapp,
+      whatsappSameAsPhone: regWhatsappSameAsPhone,
+      email: regRes.email || cleanEmail || undefined,
+      mustChangePassword: true,
+      isAuthenticated: true,
+    };
+
+    // Sign customer in right away, while displaying confirmation & temporary password delivery card
+    onSelectRole('customer', confirmedUser);
+
+    setRegConfirmation({
+      fullName: cleanName,
+      phone: cleanPhone,
+      whatsappNumber: resolvedWhatsapp,
+      email: regRes.email || cleanEmail || undefined,
+      temporaryPassword: tempPassword,
+      user: confirmedUser,
+    });
+    setWhatsappSentDone(false);
+    setEmailOpenedDone(false);
+    setCopiedTempPass(false);
+    setModalMode('registration_confirmation');
   };
 
-  // MANDATORY / FORCED PASSWORD CHANGE OR SELF-REGISTRATION COMPLETION HANDLER
+  const buildConfirmationText = (conf: RegistrationConfirmationState) => {
+    return [
+      `Assalam-o-Alaikum ${conf.fullName}!`,
+      `Your 100DAGAR / madinamarket.pk customer account is registered and confirmed.`,
+      ``,
+      `Login Mobile: ${conf.phone}`,
+      `Notification WhatsApp: ${conf.whatsappNumber}`,
+      ...(conf.email ? [`Email: ${conf.email}`] : []),
+      `Temporary Password: ${conf.temporaryPassword}`,
+      ``,
+      `Please sign in at https://www.madinamarket.pk and change your temporary password from your account settings.`,
+    ].join('\n');
+  };
+
+  // MANDATORY / FORCED PASSWORD CHANGE HANDLER
   const handleForcedPasswordSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setForcePassError('');
@@ -240,55 +340,39 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
     }
 
     if (pendingUserAccount) {
-      if (pendingIsNewRegistration) {
-        const regRes = await apiRegisterCustomer({
-          fullName: pendingUserAccount.fullName,
-          phone: pendingUserAccount.phone,
-          pin: nextPin,
-        });
-        if (!regRes.ok || !regRes.user) {
-          setForcePassError(regRes.error || 'Could not complete registration. Please check your details.');
-          return;
-        }
-        onSelectRole('customer', {
-          ...regRes.user,
-          mustChangePassword: false,
-          hasDefaultPin: false,
-          isAuthenticated: true,
-        });
-      } else {
-        const changeRes = await apiChangeOwnPassword(pendingCurrentPin, nextPin);
-        if (!changeRes.ok) {
-          setForcePassError(changeRes.error || 'Could not update your temporary password.');
-          return;
-        }
-        onSelectRole(pendingUserAccount.role, {
-          id: pendingUserAccount.id,
-          name: pendingUserAccount.fullName,
-          urduName: pendingUserAccount.urduName,
-          phone: pendingUserAccount.phone,
-          email: pendingUserAccount.email,
-          role: pendingUserAccount.role,
-          customerId: pendingUserAccount.linkedCustomerId,
-          investorId: pendingUserAccount.linkedInvestorId,
-          resellerCode: pendingUserAccount.linkedResellerCode,
-          branchId: pendingUserAccount.linkedBranchId,
-          branchName: pendingUserAccount.linkedBranchName,
-          managerAuthorities: pendingUserAccount.managerAuthorities,
-          crmRole: pendingUserAccount.crmRole,
-          crmPermissions: pendingUserAccount.crmPermissions,
-          canAuthorizeCreditSale: pendingUserAccount.canAuthorizeCreditSale,
-          mustChangePassword: false,
-          hasDefaultPin: false,
-          isAuthenticated: true,
-        });
+      const changeRes = await apiChangeOwnPassword(pendingCurrentPin, nextPin);
+      if (!changeRes.ok) {
+        setForcePassError(changeRes.error || 'Could not update your temporary password.');
+        return;
       }
+      onSelectRole(pendingUserAccount.role, {
+        id: pendingUserAccount.id,
+        name: pendingUserAccount.fullName,
+        urduName: pendingUserAccount.urduName,
+        phone: pendingUserAccount.phone,
+        whatsapp: pendingUserAccount.whatsapp,
+        whatsappSameAsPhone: pendingUserAccount.whatsappSameAsPhone,
+        email: pendingUserAccount.email,
+        role: pendingUserAccount.role,
+        customerId: pendingUserAccount.linkedCustomerId,
+        investorId: pendingUserAccount.linkedInvestorId,
+        resellerCode: pendingUserAccount.linkedResellerCode,
+        branchId: pendingUserAccount.linkedBranchId,
+        branchName: pendingUserAccount.linkedBranchName,
+        managerAuthorities: pendingUserAccount.managerAuthorities,
+        crmRole: pendingUserAccount.crmRole,
+        crmPermissions: pendingUserAccount.crmPermissions,
+        canAuthorizeCreditSale: pendingUserAccount.canAuthorizeCreditSale,
+        mustChangePassword: false,
+        hasDefaultPin: false,
+        isAuthenticated: true,
+      });
     }
 
-    setSuccessMessage('Password set successfully.');
+    setSuccessMessage('Private password set successfully.');
     setTimeout(() => {
       onClose();
-    }, 800);
+    }, 700);
   };
 
   // FORGOT PASSWORD HELPLINE HANDLER (Admin-verified reset only; no client-side token printing)
@@ -298,7 +382,7 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
     setForgotSuccess('');
     const clean = forgotIdentifier.trim();
     if (!clean) {
-      setForgotError('Please enter your registered mobile number or username.');
+      setForgotError('Please enter your registered mobile number, email, or username.');
       return;
     }
     logUserLogin({
@@ -310,34 +394,33 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
       notes: `User requested password reset verification via helpline (${clean})`,
       usedPin: '—',
     });
-    const supportNumber = loginConfig.supportContactNumber || '03125256266';
     openWhatsAppDirect(
       supportNumber,
-      `Assalam-o-Alaikum! I need an administrator-verified password reset for my 100DAGAR / madinamarket.pk account (${clean}). Please assist.`
+      `Assalam-o-Alaikum! I need an administrator-verified temporary password reset for my 100DAGAR / madinamarket.pk account (${clean}). Please send a temporary password to my registered WhatsApp / Email.`
     );
     setForgotSuccess(
-      `Recovery request logged for "${clean}". Store administration will verify your identity via WhatsApp (${supportNumber}) and issue a temporary PIN.`
+      `Recovery request opened for "${clean}". Store support (${supportNumber}) will verify your identity and send a temporary password to your registered WhatsApp / Email.`
     );
   };
 
-  // CHANGE PIN HANDLER INSIDE USER PORTAL (Supports ALL authenticated roles via server API)
+  // CHANGE PIN / PASSWORD INSIDE USER PORTAL
   const handleChangePin = async (e: React.FormEvent) => {
     e.preventDefault();
     setChangePinError('');
     setChangePinSuccess('');
 
     if (!currentPinInput.trim()) {
-      setChangePinError('Please enter your current PIN.');
+      setChangePinError('Please enter your current password / PIN.');
       return;
     }
 
     if (newPinInput.trim().length < 4) {
-      setChangePinError('New PIN must be at least 4 digits/characters long.');
+      setChangePinError('New password must be at least 4 characters long.');
       return;
     }
 
     if (newPinInput.trim() !== confirmPinInput.trim()) {
-      setChangePinError('Confirm PIN does not match.');
+      setChangePinError('Confirm password does not match.');
       return;
     }
 
@@ -359,11 +442,25 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
       hasDefaultPin: false,
       mustChangePassword: false,
     });
-    setChangePinSuccess('Password changed successfully.');
+    setChangePinSuccess('Password updated successfully.');
     setCurrentPinInput('');
     setNewPinInput('');
     setConfirmPinInput('');
   };
+
+  const renderSupportFooter = (hintText = 'Need help signing in or registering?') => (
+    <div className="pt-3 border-t border-slate-100 dark:border-slate-800 flex items-center justify-between gap-2">
+      <span className="text-[11px] text-slate-500 dark:text-slate-400">{hintText}</span>
+      <button
+        type="button"
+        onClick={() => handleOpenSupport()}
+        className="text-[11px] font-semibold text-emerald-600 dark:text-emerald-400 hover:underline flex items-center gap-1 cursor-pointer shrink-0"
+      >
+        <Phone className="w-3 h-3" />
+        <span>Support ({supportNumber})</span>
+      </button>
+    </div>
+  );
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/75 backdrop-blur-xs p-3 sm:p-4 overflow-y-auto">
@@ -378,26 +475,72 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
               <h2 className="text-base font-black tracking-tight leading-tight">
                 {modalMode === 'account'
                   ? 'My Account & Security'
+                  : modalMode === 'register'
+                  ? 'Register Customer Account'
+                  : modalMode === 'registration_confirmation'
+                  ? 'Account Confirmed'
                   : modalMode === 'forgot_password'
-                  ? 'Password Recovery'
+                  ? 'Password Recovery & Support'
                   : modalMode === 'force_change_password'
                   ? 'Set Your Private Password'
                   : loginConfig.title}
               </h2>
-              <span className="text-[11px] font-bold text-amber-900 dark:text-amber-300 block tracking-wider uppercase">
+              <span className="text-[11px] font-bold text-amber-900 block tracking-wider uppercase">
                 100DAGAR · WE BUY WE SELL
               </span>
             </div>
           </div>
           <button
+            type="button"
             onClick={onClose}
+            aria-label="Close login dialog"
             className="p-1.5 text-slate-800 hover:text-black rounded-lg hover:bg-amber-400/50 cursor-pointer"
           >
             <X className="w-5 h-5" />
           </button>
         </div>
 
-        {/* 1. LOGIN MODE: CONFIGURABLE UNIFIED LOGIN FORM */}
+        {/* Sign In / Register Mode Switcher */}
+        {(modalMode === 'login' || modalMode === 'register') && loginConfig.allowSelfRegistration !== false && (
+          <div className="px-5 pt-4 sm:px-6">
+            <div className="grid grid-cols-2 gap-1 p-1 rounded-xl bg-slate-100 dark:bg-slate-800">
+              <button
+                type="button"
+                onClick={() => {
+                  setModalMode('login');
+                  setErrorMessage('');
+                  setRegError('');
+                }}
+                className={`py-2 text-xs font-bold rounded-lg transition-colors flex items-center justify-center gap-1.5 cursor-pointer ${
+                  modalMode === 'login'
+                    ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-white shadow-xs'
+                    : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+                }`}
+              >
+                <LogIn className="w-3.5 h-3.5" />
+                <span>Sign In</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setModalMode('register');
+                  setErrorMessage('');
+                  setRegError('');
+                }}
+                className={`py-2 text-xs font-bold rounded-lg transition-colors flex items-center justify-center gap-1.5 cursor-pointer ${
+                  modalMode === 'register'
+                    ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-white shadow-xs'
+                    : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+                }`}
+              >
+                <UserPlus className="w-3.5 h-3.5" />
+                <span>Register</span>
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* 1. LOGIN MODE */}
         {modalMode === 'login' && (
           <div className="p-5 sm:p-6 space-y-4">
             <div>
@@ -409,7 +552,6 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
               </p>
             </div>
 
-            {/* Error Message */}
             {errorMessage && (
               <div className="p-3 bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-800 rounded-lg text-xs text-red-700 dark:text-red-300 flex items-start gap-2">
                 <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
@@ -417,7 +559,6 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
               </div>
             )}
 
-            {/* Success Message */}
             {successMessage && (
               <div className="p-3 bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 rounded-lg text-xs text-emerald-700 dark:text-emerald-300 flex items-center gap-2">
                 <CheckCircle2 className="w-4 h-4 shrink-0" />
@@ -428,14 +569,14 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
             <form onSubmit={handleCombinedLogin} className="space-y-3.5">
               <div>
                 <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1">
-                  Mobile Number / Username / Handle:
+                  Mobile Number / Email / Username:
                 </label>
                 <div className="relative">
                   <Phone className="w-4 h-4 absolute left-3 top-3 text-slate-400" />
                   <input
                     type="text"
                     required
-                    placeholder="0300 1234567 or username"
+                    placeholder="0300 1234567, email, or username"
                     value={identifier}
                     onChange={(e) => setIdentifier(e.target.value)}
                     className="w-full pl-9 pr-3 py-2 text-sm font-mono rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-amber-400 focus:outline-hidden"
@@ -446,7 +587,7 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
               <div>
                 <div className="flex items-center justify-between mb-1">
                   <label className="text-xs font-bold text-slate-700 dark:text-slate-300">
-                    Security PIN / Password:
+                    Password / Security PIN:
                   </label>
                   {loginConfig.showForgotPasswordLink && (
                     <button
@@ -463,8 +604,8 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
                   <input
                     type={showPin ? 'text' : 'password'}
                     required
-                    maxLength={20}
-                    placeholder="••••••"
+                    maxLength={32}
+                    placeholder="Enter your password"
                     value={pin}
                     onChange={(e) => setPin(e.target.value)}
                     className="w-full pl-9 pr-10 py-2 text-sm font-mono tracking-widest rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-amber-400 focus:outline-hidden"
@@ -481,26 +622,8 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
                 </div>
               </div>
 
-              {loginConfig.allowSelfRegistration && (
-                <div>
-                  <label className="block text-xs font-normal text-slate-500 dark:text-slate-400 mb-1">
-                    Your Full Name (اختیاری - نئے کسٹمرز کے لیے):
-                  </label>
-                  <div className="relative">
-                    <User className="w-4 h-4 absolute left-3 top-3 text-slate-400" />
-                    <input
-                      type="text"
-                      placeholder="e.g. Tariq Mehmood"
-                      value={fullName}
-                      onChange={(e) => setFullName(e.target.value)}
-                      className="w-full pl-9 pr-3 py-2 text-xs rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-amber-400 focus:outline-hidden"
-                    />
-                  </div>
-                </div>
-              )}
-
               {loginConfig.showRememberMe && (
-                <div className="flex items-center justify-between text-xs pt-1">
+                <div className="flex items-center justify-between text-xs pt-0.5">
                   <label className="flex items-center gap-2 cursor-pointer select-none text-slate-600 dark:text-slate-400">
                     <input
                       type="checkbox"
@@ -510,43 +633,348 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
                     />
                     <span>Remember Me</span>
                   </label>
-
-                  <span className="text-[11px] text-slate-400">
-                    Default PIN: Last 6 digits
-                  </span>
                 </div>
               )}
 
               <button
                 type="submit"
-                className="w-full py-2.5 px-4 bg-slate-900 hover:bg-slate-800 dark:bg-amber-500 dark:text-slate-950 dark:hover:bg-amber-400 text-white font-bold text-xs rounded-xl shadow-xs transition-colors flex items-center justify-center gap-2 cursor-pointer mt-2"
+                disabled={isLoggingIn}
+                className="w-full py-2.5 px-4 bg-slate-900 hover:bg-slate-800 dark:bg-amber-500 dark:text-slate-950 dark:hover:bg-amber-400 text-white font-bold text-xs rounded-xl shadow-xs transition-colors flex items-center justify-center gap-2 cursor-pointer mt-2 disabled:opacity-60"
               >
                 <LogIn className="w-4 h-4" />
-                <span>Sign In / لاگ ان کریں</span>
+                <span>{isLoggingIn ? 'Signing In...' : 'Sign In / لاگ ان کریں'}</span>
               </button>
             </form>
 
-            {/* Support Helpline Footer */}
-            <div className="pt-2 border-t border-slate-100 dark:border-slate-800 flex items-center justify-between">
-              <span className="text-[11px] text-slate-500 dark:text-slate-400">
-                Sign in with your account credentials
-              </span>
-              <button
-                type="button"
-                onClick={() => {
-                  const text = 'السلام علیکم! مجھے 100DAGAR اکاؤنٹ میں لاگ ان / پاس ورڈ میں مدد چاہیے۔ شکریہ!';
-                  openWhatsAppDirect(loginConfig.supportContactNumber || '03125256266', text);
-                }}
-                className="text-[11px] font-semibold text-emerald-600 dark:text-emerald-400 hover:underline flex items-center gap-1 cursor-pointer"
-              >
-                <Phone className="w-3 h-3" />
-                <span>Support ({loginConfig.supportContactNumber})</span>
-              </button>
-            </div>
+            {loginConfig.allowSelfRegistration !== false && (
+              <div className="p-3 rounded-xl bg-amber-50/70 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800/60 flex items-center justify-between gap-2">
+                <div className="text-[11px] text-slate-700 dark:text-slate-300">
+                  <span className="font-bold block">New customer? (نیا اکاؤنٹ؟)</span>
+                  <span className="text-slate-500 dark:text-slate-400">
+                    Register with WhatsApp &amp; Email confirmation.
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setModalMode('register')}
+                  className="px-3 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 font-black text-[11px] whitespace-nowrap cursor-pointer shrink-0"
+                >
+                  Register Now
+                </button>
+              </div>
+            )}
+
+            {renderSupportFooter('Need login help or password reset?')}
           </div>
         )}
 
-        {/* 2. FORCE CHANGE PASSWORD (First login with default/temporary PIN) */}
+        {/* 2. REGISTER MODE */}
+        {modalMode === 'register' && (
+          <div className="p-5 sm:p-6 space-y-4">
+            <div>
+              <h3 className="text-sm font-bold text-slate-900 dark:text-white">
+                Create Customer Account (نیا کسٹمر اکاؤنٹ)
+              </h3>
+              <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                Get instant confirmation and a temporary password for your WhatsApp &amp; Email.
+              </p>
+            </div>
+
+            {regError && (
+              <div className="p-3 bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-800 rounded-lg text-xs text-red-700 dark:text-red-300 flex items-start gap-2">
+                <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                <span>{regError}</span>
+              </div>
+            )}
+
+            <form onSubmit={handleCustomerRegister} className="space-y-3">
+              <div>
+                <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1">
+                  Full Name (پورا نام) *
+                </label>
+                <div className="relative">
+                  <User className="w-4 h-4 absolute left-3 top-2.5 text-slate-400" />
+                  <input
+                    type="text"
+                    required
+                    placeholder="e.g. Tariq Mehmood"
+                    value={regName}
+                    onChange={(e) => setRegName(e.target.value)}
+                    className="w-full pl-9 pr-3 py-2 text-xs rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-amber-400 focus:outline-hidden"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1">
+                  Mobile Number (موبائل نمبر) *
+                </label>
+                <div className="relative">
+                  <Phone className="w-4 h-4 absolute left-3 top-2.5 text-slate-400" />
+                  <input
+                    type="tel"
+                    required
+                    placeholder="0300 1234567"
+                    value={regPhone}
+                    onChange={(e) => setRegPhone(e.target.value)}
+                    className="w-full pl-9 pr-3 py-2 text-xs font-mono rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-amber-400 focus:outline-hidden"
+                  />
+                </div>
+              </div>
+
+              {/* WhatsApp Checkmark & Conditional Number */}
+              <div className="p-3 rounded-xl bg-emerald-50/80 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-800/70 space-y-2.5">
+                <label className="flex items-start gap-2.5 cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={regWhatsappSameAsPhone}
+                    onChange={(e) => {
+                      setRegWhatsappSameAsPhone(e.target.checked);
+                      if (e.target.checked) {
+                        setRegWhatsapp('');
+                      }
+                    }}
+                    className="mt-0.5 w-4 h-4 rounded text-emerald-600"
+                  />
+                  <span className="text-xs font-bold text-slate-800 dark:text-slate-100 leading-snug">
+                    Is this mobile number your WhatsApp number?
+                    <span className="block text-[11px] font-normal text-slate-600 dark:text-slate-400">
+                      کیا یہی نمبر آپ کا واٹس ایپ ہے؟ (تصدیق اور نوٹیفکیشن کے لیے)
+                    </span>
+                  </span>
+                </label>
+
+                {!regWhatsappSameAsPhone && (
+                  <div>
+                    <label className="block text-[11px] font-bold text-emerald-900 dark:text-emerald-300 mb-1">
+                      WhatsApp Number for Notifications (نوٹیفکیشن کے لیے واٹس ایپ نمبر) *
+                    </label>
+                    <div className="relative">
+                      <MessageCircle className="w-4 h-4 absolute left-3 top-2.5 text-emerald-600" />
+                      <input
+                        type="tel"
+                        required
+                        placeholder="03xx xxxxxxx"
+                        value={regWhatsapp}
+                        onChange={(e) => setRegWhatsapp(e.target.value)}
+                        className="w-full pl-9 pr-3 py-2 text-xs font-mono rounded-lg border border-emerald-300 dark:border-emerald-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-emerald-500 focus:outline-hidden"
+                      />
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                <div>
+                  <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1">
+                    Email (ای میل - عارضی پاس ورڈ کے لیے)
+                  </label>
+                  <div className="relative">
+                    <Mail className="w-4 h-4 absolute left-3 top-2.5 text-slate-400" />
+                    <input
+                      type="email"
+                      placeholder="name@example.com"
+                      value={regEmail}
+                      onChange={(e) => setRegEmail(e.target.value)}
+                      className="w-full pl-9 pr-3 py-2 text-xs rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-amber-400 focus:outline-hidden"
+                    />
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1">
+                    City (شہر)
+                  </label>
+                  <div className="relative">
+                    <MapPin className="w-4 h-4 absolute left-3 top-2.5 text-slate-400" />
+                    <input
+                      type="text"
+                      placeholder="Muzaffarabad"
+                      value={regCity}
+                      onChange={(e) => setRegCity(e.target.value)}
+                      className="w-full pl-9 pr-3 py-2 text-xs rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-amber-400 focus:outline-hidden"
+                    />
+                  </div>
+                </div>
+              </div>
+
+              <div className="p-2.5 rounded-lg bg-slate-50 dark:bg-slate-800/70 border border-slate-200 dark:border-slate-700 text-[11px] text-slate-600 dark:text-slate-300">
+                A secure temporary password will be created for your account so you can confirm on your own WhatsApp and Email right away.
+              </div>
+
+              <button
+                type="submit"
+                disabled={isRegistering}
+                className="w-full py-2.5 px-4 bg-slate-900 hover:bg-slate-800 dark:bg-amber-500 dark:text-slate-950 dark:hover:bg-amber-400 text-white font-bold text-xs rounded-xl shadow-xs transition-colors flex items-center justify-center gap-2 cursor-pointer disabled:opacity-60"
+              >
+                <UserPlus className="w-4 h-4" />
+                <span>
+                  {isRegistering
+                    ? 'Creating Account...'
+                    : 'Register & Get Temporary Password'}
+                </span>
+              </button>
+            </form>
+
+            {renderSupportFooter('Already have an account or need support?')}
+          </div>
+        )}
+
+        {/* 3. REGISTRATION CONFIRMATION & TEMPORARY PASSWORD DELIVERY */}
+        {modalMode === 'registration_confirmation' && regConfirmation && (
+          <div className="p-5 sm:p-6 space-y-4">
+            <div className="p-3.5 bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 rounded-xl space-y-1.5">
+              <div className="flex items-center gap-2 text-emerald-800 dark:text-emerald-300 font-black text-sm">
+                <CheckCircle2 className="w-4 h-4 shrink-0" />
+                <span>Registration Confirmed!</span>
+              </div>
+              <p className="text-[11px] text-emerald-900/80 dark:text-emerald-200/80 leading-relaxed">
+                Welcome <span className="font-bold">{regConfirmation.fullName}</span>. Your account is active. Send your confirmation &amp; temporary password to your own WhatsApp and Email below.
+              </p>
+            </div>
+
+            <div className="p-3.5 rounded-xl bg-slate-50 dark:bg-slate-800/70 border border-slate-200 dark:border-slate-700 space-y-2 text-xs">
+              <div className="flex items-center justify-between">
+                <span className="text-slate-500 dark:text-slate-400">Mobile Login ID:</span>
+                <span className="font-mono font-bold text-slate-900 dark:text-white">
+                  {regConfirmation.phone}
+                </span>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-slate-500 dark:text-slate-400">WhatsApp Notification No:</span>
+                <span className="font-mono font-bold text-emerald-700 dark:text-emerald-300">
+                  {regConfirmation.whatsappNumber}
+                </span>
+              </div>
+              {regConfirmation.email && (
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-slate-500 dark:text-slate-400 shrink-0">Email:</span>
+                  <span className="font-mono font-semibold text-slate-800 dark:text-slate-200 truncate">
+                    {regConfirmation.email}
+                  </span>
+                </div>
+              )}
+
+              <div className="pt-2 border-t border-slate-200 dark:border-slate-700">
+                <span className="text-[11px] font-bold text-slate-600 dark:text-slate-300 block mb-1">
+                  Temporary Password (عارضی پاس ورڈ):
+                </span>
+                <div className="flex items-center gap-2">
+                  <div className="flex-1 px-3 py-2 rounded-lg bg-white dark:bg-slate-900 border border-amber-300 dark:border-amber-700 font-mono text-sm font-black tracking-widest text-slate-900 dark:text-amber-300 flex items-center justify-between">
+                    <span>
+                      {showTempPassword ? regConfirmation.temporaryPassword : '••••••••'}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setShowTempPassword(!showTempPassword)}
+                      className="text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 cursor-pointer"
+                      aria-label="Toggle temporary password visibility"
+                    >
+                      {showTempPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                    </button>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      navigator.clipboard?.writeText(regConfirmation.temporaryPassword);
+                      setCopiedTempPass(true);
+                      setTimeout(() => setCopiedTempPass(false), 2000);
+                    }}
+                    className="px-3 py-2 rounded-lg bg-slate-200 hover:bg-slate-300 dark:bg-slate-700 dark:hover:bg-slate-600 text-slate-800 dark:text-white text-xs font-bold flex items-center gap-1 cursor-pointer shrink-0"
+                  >
+                    {copiedTempPass ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
+                    <span>{copiedTempPass ? 'Copied' : 'Copy'}</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              <button
+                type="button"
+                onClick={() => {
+                  openWhatsAppDirect(
+                    regConfirmation.whatsappNumber,
+                    buildConfirmationText(regConfirmation)
+                  );
+                  setWhatsappSentDone(true);
+                }}
+                className="w-full py-2.5 px-4 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs rounded-xl shadow-xs transition-colors flex items-center justify-center gap-2 cursor-pointer"
+              >
+                <MessageCircle className="w-4 h-4" />
+                <span>
+                  {whatsappSentDone
+                    ? `WhatsApp Confirmation Opened (${regConfirmation.whatsappNumber})`
+                    : `Confirm & Send Temp Password to My WhatsApp (${regConfirmation.whatsappNumber})`}
+                </span>
+              </button>
+
+              {regConfirmation.email ? (
+                <a
+                  href={`mailto:${encodeURIComponent(
+                    regConfirmation.email
+                  )}?subject=${encodeURIComponent(
+                    '100DAGAR Account Confirmation & Temporary Password'
+                  )}&body=${encodeURIComponent(buildConfirmationText(regConfirmation))}`}
+                  onClick={() => setEmailOpenedDone(true)}
+                  className="w-full py-2.5 px-4 bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs rounded-xl shadow-xs transition-colors flex items-center justify-center gap-2 cursor-pointer"
+                >
+                  <Mail className="w-4 h-4" />
+                  <span>
+                    {emailOpenedDone
+                      ? `Email Draft Opened (${regConfirmation.email})`
+                      : `Send Temp Password to My Email (${regConfirmation.email})`}
+                  </span>
+                </a>
+              ) : (
+                <div className="p-2 rounded-lg bg-slate-50 dark:bg-slate-800/50 text-[11px] text-slate-500 dark:text-slate-400 text-center">
+                  No email address entered — use WhatsApp confirmation or copy your temporary password above.
+                </div>
+              )}
+            </div>
+
+            <div className="grid grid-cols-2 gap-2 pt-1">
+              <button
+                type="button"
+                onClick={() => {
+                  setPendingUserAccount({
+                    id: regConfirmation.user.id || `usr_${Date.now()}`,
+                    username: regConfirmation.phone,
+                    fullName: regConfirmation.fullName,
+                    phone: regConfirmation.phone,
+                    whatsapp: regConfirmation.whatsappNumber,
+                    whatsappSameAsPhone: regConfirmation.user.whatsappSameAsPhone,
+                    email: regConfirmation.email,
+                    role: 'customer',
+                    status: 'active',
+                    linkedCustomerId: regConfirmation.user.customerId,
+                    mustChangePassword: true,
+                    createdAt: new Date().toISOString(),
+                  });
+                  setPendingCurrentPin(regConfirmation.temporaryPassword);
+                  setForcedNewPass('');
+                  setForcedConfirmPass('');
+                  setForcePassError('');
+                  setModalMode('force_change_password');
+                }}
+                className="py-2 px-3 border border-slate-300 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800 text-slate-800 dark:text-slate-200 font-bold text-xs rounded-xl cursor-pointer"
+              >
+                Set Private Password
+              </button>
+              <button
+                type="button"
+                onClick={onClose}
+                className="py-2 px-3 bg-slate-900 hover:bg-slate-800 dark:bg-amber-500 dark:text-slate-950 dark:hover:bg-amber-400 text-white font-bold text-xs rounded-xl cursor-pointer"
+              >
+                Continue to Portal
+              </button>
+            </div>
+
+            {renderSupportFooter('Need assistance with confirmation?')}
+          </div>
+        )}
+
+        {/* 4. FORCE CHANGE PASSWORD (First login with temporary password) */}
         {modalMode === 'force_change_password' && (
           <div className="p-5 sm:p-6 space-y-4">
             <div className="p-3 bg-amber-50 dark:bg-amber-950/40 border border-amber-300 dark:border-amber-700 rounded-xl space-y-1 text-xs text-amber-900 dark:text-amber-200">
@@ -555,7 +983,7 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
                 <span>Set Your New Private Password</span>
               </div>
               <p className="text-[11px] leading-relaxed">
-                Welcome to 100DAGAR! Since you logged in using a temporary or default PIN, please establish a secure new password for your account.
+                Since you signed in with a temporary password, please set your own private password to secure your account.
               </p>
             </div>
 
@@ -576,13 +1004,13 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
             <form onSubmit={handleForcedPasswordSubmit} className="space-y-3">
               <div>
                 <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1">
-                  New Private Password / PIN (نیا پاس ورڈ):
+                  New Private Password (نیا پرائیویٹ پاس ورڈ):
                 </label>
                 <input
                   type="password"
                   required
                   minLength={4}
-                  placeholder="Min 4 to 6 characters"
+                  placeholder="Min 4 characters"
                   value={forcedNewPass}
                   onChange={(e) => setForcedNewPass(e.target.value)}
                   className="w-full px-3 py-2 text-xs font-mono rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-amber-400 focus:outline-hidden"
@@ -611,10 +1039,12 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
                 Save Password &amp; Proceed to Portal
               </button>
             </form>
+
+            {renderSupportFooter('Having trouble updating password?')}
           </div>
         )}
 
-        {/* 3. FORGOT PASSWORD ADMIN-VERIFIED RECOVERY FLOW */}
+        {/* 5. FORGOT PASSWORD & SUPPORT RECOVERY FLOW */}
         {modalMode === 'forgot_password' && (
           <div className="p-5 sm:p-6 space-y-4">
             <div className="flex items-center gap-2">
@@ -626,7 +1056,7 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
                 <ArrowLeft className="w-4 h-4" />
               </button>
               <h3 className="text-sm font-bold text-slate-900 dark:text-white">
-                Account Recovery (پاس ورڈ بحالی)
+                Account Recovery &amp; Support (پاس ورڈ بحالی)
               </h3>
             </div>
 
@@ -646,17 +1076,17 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
 
             <form onSubmit={handleRequestAdminReset} className="space-y-3.5">
               <p className="text-xs text-slate-500 dark:text-slate-400 leading-relaxed">
-                For account security, password resets are verified by Store Administration via your registered WhatsApp number ({loginConfig.supportContactNumber || '03125256266'}).
+                For account security, temporary password resets are verified by Store Support ({supportNumber}) and delivered to your registered WhatsApp or Email.
               </p>
 
               <div>
                 <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1">
-                  Registered Mobile / Username:
+                  Registered Mobile / Email / Username:
                 </label>
                 <input
                   type="text"
                   required
-                  placeholder="0300 1234567"
+                  placeholder="0300 1234567 or email"
                   value={forgotIdentifier}
                   onChange={(e) => setForgotIdentifier(e.target.value)}
                   className="w-full px-3 py-2 text-xs font-mono rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-amber-400 focus:outline-hidden"
@@ -665,19 +1095,22 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
 
               <button
                 type="submit"
-                className="w-full py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs rounded-xl shadow-xs transition-colors cursor-pointer"
+                className="w-full py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs rounded-xl shadow-xs transition-colors flex items-center justify-center gap-2 cursor-pointer"
               >
-                Request Verified Reset on WhatsApp
+                <MessageCircle className="w-4 h-4" />
+                <span>Request Temporary Password via Support WhatsApp</span>
               </button>
             </form>
+
+            {renderSupportFooter('Direct helpline always available')}
           </div>
         )}
 
-        {/* 4. ACCOUNT PORTAL (For Authenticated Users) */}
+        {/* 6. ACCOUNT PORTAL (For Authenticated Users) */}
         {modalMode === 'account' && (
           <div className="p-5 sm:p-6 space-y-5">
             <div className="p-4 bg-slate-50 dark:bg-slate-800 rounded-xl border border-slate-200 dark:border-slate-700 space-y-2">
-              <div className="flex items-center justify-between">
+              <div className="flex items-center justify-between gap-2">
                 <div>
                   <h3 className="font-extrabold text-sm text-slate-900 dark:text-white flex items-center gap-2">
                     {currentUser.name}
@@ -687,12 +1120,23 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
                   </h3>
                   {currentUser.phone && (
                     <span className="text-xs font-mono text-slate-500 dark:text-slate-400 block mt-0.5">
-                      📱 {currentUser.phone}
+                      Mobile: {currentUser.phone}
+                    </span>
+                  )}
+                  {(currentUser.whatsapp || currentUser.phone) && (
+                    <span className="text-xs font-mono text-emerald-700 dark:text-emerald-300 block mt-0.5">
+                      WhatsApp Alerts: {currentUser.whatsapp || currentUser.phone}
+                    </span>
+                  )}
+                  {currentUser.email && (
+                    <span className="text-xs text-slate-500 dark:text-slate-400 block mt-0.5">
+                      Email: {currentUser.email}
                     </span>
                   )}
                 </div>
 
                 <button
+                  type="button"
                   onClick={() => {
                     if (onLogout) {
                       onLogout();
@@ -703,7 +1147,7 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
                     setPin('');
                     setModalMode('login');
                   }}
-                  className="px-2.5 py-1 text-xs text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/50 rounded-lg border border-red-200 dark:border-red-900 flex items-center gap-1 cursor-pointer font-semibold"
+                  className="px-2.5 py-1 text-xs text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/50 rounded-lg border border-red-200 dark:border-red-900 flex items-center gap-1 cursor-pointer font-semibold shrink-0"
                 >
                   <LogOut className="w-3.5 h-3.5" />
                   <span>Logout</span>
@@ -711,7 +1155,7 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
               </div>
             </div>
 
-            {/* In-Portal Change PIN Form */}
+            {/* In-Portal Change Password Form */}
             <div className="border-t border-slate-200 dark:border-slate-800 pt-4 space-y-3">
               <div className="flex items-center gap-1.5 text-xs font-bold text-slate-900 dark:text-white">
                 <Lock className="w-4 h-4 text-amber-600" />
@@ -735,12 +1179,12 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
               <form onSubmit={handleChangePin} className="space-y-2.5 text-xs">
                 <div>
                   <label className="block text-slate-600 dark:text-slate-400 mb-0.5">
-                    Current PIN:
+                    Current Password / PIN:
                   </label>
                   <input
                     type="password"
                     required
-                    maxLength={20}
+                    maxLength={32}
                     value={currentPinInput}
                     onChange={(e) => setCurrentPinInput(e.target.value)}
                     className="w-full px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white font-mono tracking-widest text-xs"
@@ -750,7 +1194,7 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
                 <div className="grid grid-cols-2 gap-2">
                   <div>
                     <label className="block text-slate-600 dark:text-slate-400 mb-0.5">
-                      New PIN:
+                      New Password:
                     </label>
                     <input
                       type="password"
@@ -763,7 +1207,7 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
                   </div>
                   <div>
                     <label className="block text-slate-600 dark:text-slate-400 mb-0.5">
-                      Confirm PIN:
+                      Confirm Password:
                     </label>
                     <input
                       type="password"
@@ -780,10 +1224,12 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
                   type="submit"
                   className="w-full py-2 bg-slate-900 hover:bg-slate-800 dark:bg-amber-500 dark:text-slate-950 dark:hover:bg-amber-400 text-white font-bold rounded-lg cursor-pointer transition-colors"
                 >
-                  Update &amp; Save New PIN
+                  Update &amp; Save New Password
                 </button>
               </form>
             </div>
+
+            {renderSupportFooter('Customer Support Helpline')}
           </div>
         )}
       </div>

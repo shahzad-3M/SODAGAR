@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import {
   Activity,
   Award,
@@ -11,6 +11,7 @@ import {
   Download,
   ExternalLink,
   FileSpreadsheet,
+  FileText,
   Filter,
   HeartHandshake,
   Image as ImageIcon,
@@ -31,6 +32,7 @@ import {
   Ticket,
   Trash2,
   TrendingUp,
+  Upload,
   UserCheck,
   UserPlus,
   Users,
@@ -66,10 +68,20 @@ import {
   ALL_AUTO_SEGMENTS,
   CRM_REPORT_CATALOG,
   CRM_WHATSAPP_TEMPLATES,
+  normalizeDigits,
   renderCrmWhatsAppTemplate,
 } from '../utils/crmEngine.ts';
 import {
+  buildSampleLeadsCsv,
+  buildSampleLeadsTxt,
+  LeadImportParseResult,
+  matrixToLeadDrafts,
+  parseCsvOrNotepadTextToMatrix,
+  parseLeadUploadFile,
+} from '../utils/leadImportParser.ts';
+import {
   CRMStateBundle,
+  apiBulkImportCrmLeads,
   apiConvertCrmLead,
   apiDeleteCrmCustomSegment,
   apiDeleteCrmTask,
@@ -222,6 +234,17 @@ export const CRMWorkspaceView: React.FC<CRMWorkspaceViewProps> = ({
   const [leadEstValue, setLeadEstValue] = useState('');
   const [leadFollowDate, setLeadFollowDate] = useState('');
   const [leadNotes, setLeadNotes] = useState('');
+
+  // Bulk Lead File Upload state (CSV / Excel / Notepad)
+  const [isLeadUploadOpen, setIsLeadUploadOpen] = useState(false);
+  const [leadUploadSource, setLeadUploadSource] = useState<CRMSourceChannel>('WhatsApp');
+  const [leadUploadStage, setLeadUploadStage] = useState<CRMLeadStage>('New');
+  const [leadUploadDuplicateMode, setLeadUploadDuplicateMode] = useState<'skip' | 'update' | 'all'>('skip');
+  const [leadUploadPasteText, setLeadUploadPasteText] = useState('');
+  const [leadImportPreview, setLeadImportPreview] = useState<LeadImportParseResult | null>(null);
+  const [leadImportParsing, setLeadImportParsing] = useState(false);
+  const [leadImporting, setLeadImporting] = useState(false);
+  const leadFileInputRef = useRef<HTMLInputElement>(null);
 
   // WhatsApp & Campaigns state
   const [waTemplateType, setWaTemplateType] = useState<CRMWhatsAppTemplateType>('welcome');
@@ -669,6 +692,124 @@ export const CRMWorkspaceView: React.FC<CRMWorkspaceViewProps> = ({
     );
     await loadCrmData();
     onRefreshGlobalData?.();
+  };
+
+  const existingCustomerPhoneSet = useMemo(() => {
+    const set = new Set<string>();
+    for (const p of crmState?.profiles || []) {
+      const digits = normalizeDigits(p.customer.phone);
+      if (digits.length >= 7) set.add(digits);
+    }
+    return set;
+  }, [crmState?.profiles]);
+
+  const handleLeadFileSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    setLeadImportParsing(true);
+    try {
+      const parsed = await parseLeadUploadFile(file, {
+        defaultSource: leadUploadSource,
+        defaultStage: leadUploadStage,
+        existingLeads: crmState?.leads || [],
+        existingCustomerPhones: existingCustomerPhoneSet,
+      });
+      setLeadImportPreview(parsed);
+      if (parsed.rows.length === 0 && parsed.warnings.length > 0) {
+        showNotice(parsed.warnings[0], 'error');
+      }
+    } catch (err) {
+      showNotice(
+        err instanceof Error ? `Failed to parse file: ${err.message}` : 'Failed to parse uploaded file.',
+        'error'
+      );
+    } finally {
+      setLeadImportParsing(false);
+    }
+  };
+
+  const handleParsePastedLeadText = () => {
+    if (!leadUploadPasteText.trim()) {
+      showNotice('Paste CSV, tab-separated, or Notepad lines first.', 'error');
+      return;
+    }
+    const matrix = parseCsvOrNotepadTextToMatrix(leadUploadPasteText);
+    const parsed = matrixToLeadDrafts(matrix, {
+      defaultSource: leadUploadSource,
+      defaultStage: leadUploadStage,
+      existingLeads: crmState?.leads || [],
+      existingCustomerPhones: existingCustomerPhoneSet,
+    });
+    setLeadImportPreview({
+      fileName: 'Pasted Notepad / CSV Text',
+      formatLabel: 'Notepad / Text Paste',
+      ...parsed,
+    });
+  };
+
+  const handleDownloadSampleLeadFile = (kind: 'csv' | 'txt') => {
+    const content = kind === 'csv' ? buildSampleLeadsCsv() : buildSampleLeadsTxt();
+    const blob = new Blob([content], {
+      type: kind === 'csv' ? 'text/csv;charset=utf-8' : 'text/plain;charset=utf-8',
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = kind === 'csv' ? '100dagar-leads-template.csv' : '100dagar-leads-notepad.txt';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  };
+
+  const handleConfirmLeadImport = async () => {
+    if (!leadImportPreview) return;
+    const validRows = leadImportPreview.rows.filter((r) => r.isValid);
+    if (validRows.length === 0) {
+      showNotice('No valid lead rows found to import.', 'error');
+      return;
+    }
+
+    setLeadImporting(true);
+    const res = await apiBulkImportCrmLeads({
+      leads: validRows.map((r) => ({
+        leadName: r.leadName,
+        phone: r.phone,
+        whatsapp: r.whatsapp,
+        email: r.email,
+        city: r.city,
+        source: r.source,
+        interestedProductName: r.interestedProductName,
+        estimatedValue: r.estimatedValue,
+        followUpDate: r.followUpDate,
+        notes: r.notes,
+        stage: r.stage,
+      })),
+      defaultSource: leadUploadSource,
+      defaultStage: leadUploadStage,
+      skipDuplicates: leadUploadDuplicateMode === 'skip',
+      updateDuplicates: leadUploadDuplicateMode === 'update',
+    });
+    setLeadImporting(false);
+
+    if (!res.ok) {
+      showNotice(res.error || 'Bulk lead import failed.', 'error');
+      return;
+    }
+
+    const parts = [
+      `Imported ${res.importedCount ?? 0} new lead(s)`,
+      res.updatedCount ? `updated ${res.updatedCount}` : '',
+      res.skippedDuplicatesCount ? `skipped ${res.skippedDuplicatesCount} duplicate(s)` : '',
+      res.invalidCount ? `${res.invalidCount} invalid row(s) ignored` : '',
+    ].filter(Boolean);
+
+    showNotice(`${parts.join(' · ')}.`, 'success');
+    setLeadImportPreview(null);
+    setLeadUploadPasteText('');
+    setIsLeadUploadOpen(false);
+    await loadCrmData();
   };
 
   // WhatsApp composer + Campaign handlers
@@ -1985,46 +2126,279 @@ export const CRMWorkspaceView: React.FC<CRMWorkspaceViewProps> = ({
       {activeSubTab === 'leads' && crmState && (
         <div className="space-y-4">
           {can('canManageLeads') && (
-            <form onSubmit={handleCreateLead} className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-7 gap-2.5 items-end text-xs">
-              <div>
-                <label className="block text-[10px] font-bold uppercase text-slate-500 mb-1">Lead Name *</label>
-                <input type="text" value={leadName} onChange={(e) => setLeadName(e.target.value)} placeholder="Prospect Name" className="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800" />
-              </div>
-              <div>
-                <label className="block text-[10px] font-bold uppercase text-slate-500 mb-1">Phone *</label>
-                <input type="text" value={leadPhone} onChange={(e) => setLeadPhone(e.target.value)} placeholder="03XX-XXXXXXX" className="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800" />
-              </div>
-              <div>
-                <label className="block text-[10px] font-bold uppercase text-slate-500 mb-1">Source Channel</label>
-                <select value={leadSource} onChange={(e) => setLeadSource(e.target.value as CRMSourceChannel)} className="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800">
-                  {LEAD_SOURCES.map((s) => <option key={s} value={s}>{s}</option>)}
-                </select>
-              </div>
-              <div>
-                <label className="block text-[10px] font-bold uppercase text-slate-500 mb-1">Interested Product</label>
-                <select value={leadProductId} onChange={(e) => setLeadProductId(e.target.value)} className="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800">
-                  <option value="">General Inquiry</option>
-                  {products.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
-                </select>
-              </div>
-              <div>
-                <label className="block text-[10px] font-bold uppercase text-slate-500 mb-1">Est. Value &amp; City</label>
-                <div className="flex gap-1">
-                  <input type="number" value={leadEstValue} onChange={(e) => setLeadEstValue(e.target.value)} placeholder="PKR" className="w-20 px-2 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800" />
-                  <input type="text" value={leadCity} onChange={(e) => setLeadCity(e.target.value)} placeholder="City" className="flex-1 px-2 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800" />
+            <>
+              <form onSubmit={handleCreateLead} className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-7 gap-2.5 items-end text-xs">
+                <div>
+                  <label className="block text-[10px] font-bold uppercase text-slate-500 mb-1">Lead Name *</label>
+                  <input type="text" value={leadName} onChange={(e) => setLeadName(e.target.value)} placeholder="Prospect Name" className="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800" />
                 </div>
-              </div>
-              <div>
-                <label className="block text-[10px] font-bold uppercase text-slate-500 mb-1">Follow-Up Date &amp; Notes</label>
-                <div className="flex gap-1">
-                  <input type="date" value={leadFollowDate} onChange={(e) => setLeadFollowDate(e.target.value)} className="w-28 px-2 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800" />
-                  <input type="text" value={leadNotes} onChange={(e) => setLeadNotes(e.target.value)} placeholder="Notes" className="flex-1 px-2 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800" />
+                <div>
+                  <label className="block text-[10px] font-bold uppercase text-slate-500 mb-1">Phone *</label>
+                  <input type="text" value={leadPhone} onChange={(e) => setLeadPhone(e.target.value)} placeholder="03XX-XXXXXXX" className="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800" />
                 </div>
+                <div>
+                  <label className="block text-[10px] font-bold uppercase text-slate-500 mb-1">Source Channel</label>
+                  <select value={leadSource} onChange={(e) => setLeadSource(e.target.value as CRMSourceChannel)} className="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800">
+                    {LEAD_SOURCES.map((s) => <option key={s} value={s}>{s}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-[10px] font-bold uppercase text-slate-500 mb-1">Interested Product</label>
+                  <select value={leadProductId} onChange={(e) => setLeadProductId(e.target.value)} className="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800">
+                    <option value="">General Inquiry</option>
+                    {products.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-[10px] font-bold uppercase text-slate-500 mb-1">Est. Value &amp; City</label>
+                  <div className="flex gap-1">
+                    <input type="number" value={leadEstValue} onChange={(e) => setLeadEstValue(e.target.value)} placeholder="PKR" className="w-20 px-2 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800" />
+                    <input type="text" value={leadCity} onChange={(e) => setLeadCity(e.target.value)} placeholder="City" className="flex-1 px-2 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800" />
+                  </div>
+                </div>
+                <div>
+                  <label className="block text-[10px] font-bold uppercase text-slate-500 mb-1">Follow-Up Date &amp; Notes</label>
+                  <div className="flex gap-1">
+                    <input type="date" value={leadFollowDate} onChange={(e) => setLeadFollowDate(e.target.value)} className="w-28 px-2 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800" />
+                    <input type="text" value={leadNotes} onChange={(e) => setLeadNotes(e.target.value)} placeholder="Notes" className="flex-1 px-2 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800" />
+                  </div>
+                </div>
+                <button type="submit" className="px-3 py-1.5 rounded-lg bg-slate-900 dark:bg-amber-500 text-white dark:text-slate-950 font-bold cursor-pointer inline-flex items-center justify-center gap-1">
+                  <UserPlus className="w-3.5 h-3.5" /> Add Lead
+                </button>
+              </form>
+
+              {/* Manual Lead Upload Panel (CSV / Excel .xlsx / .xls / Notepad .txt) */}
+              <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-4 space-y-3 text-xs">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                  <div>
+                    <h3 className="text-sm font-bold text-slate-900 dark:text-white flex items-center gap-1.5">
+                      <Upload className="w-4 h-4 text-amber-500" />
+                      <span>Manual Lead Upload (CSV, Excel .xlsx/.xls, or Notepad .txt)</span>
+                    </h3>
+                    <p className="text-[11px] text-slate-500 mt-0.5">
+                      Bulk upload leads from spreadsheets or Notepad lists with automatic column mapping &amp; phone duplicate checks.
+                    </p>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => handleDownloadSampleLeadFile('csv')}
+                      className="px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 font-bold inline-flex items-center gap-1 cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-800"
+                    >
+                      <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-600" />
+                      <span>Sample CSV</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleDownloadSampleLeadFile('txt')}
+                      className="px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 font-bold inline-flex items-center gap-1 cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-800"
+                    >
+                      <FileText className="w-3.5 h-3.5 text-blue-600" />
+                      <span>Sample Notepad (.txt)</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setIsLeadUploadOpen((prev) => !prev)}
+                      className="px-3 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 font-black inline-flex items-center gap-1 cursor-pointer"
+                    >
+                      <Upload className="w-3.5 h-3.5" />
+                      <span>{isLeadUploadOpen ? 'Hide Upload Panel' : 'Upload Lead File'}</span>
+                    </button>
+                  </div>
+                </div>
+
+                {isLeadUploadOpen && (
+                  <div className="space-y-3 pt-2 border-t border-slate-100 dark:border-slate-800">
+                    <div className="grid grid-cols-1 md:grid-cols-4 gap-2.5 items-end">
+                      <div>
+                        <label className="block text-[10px] font-bold uppercase text-slate-500 mb-1">
+                          Select File (.csv, .xlsx, .xls, .txt)
+                        </label>
+                        <input
+                          ref={leadFileInputRef}
+                          type="file"
+                          accept=".csv,.xlsx,.xls,.txt,.tsv,text/csv,text/plain,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel"
+                          onChange={(e) => void handleLeadFileSelected(e)}
+                          className="hidden"
+                        />
+                        <button
+                          type="button"
+                          disabled={leadImportParsing}
+                          onClick={() => leadFileInputRef.current?.click()}
+                          className="w-full px-3 py-2 rounded-lg border-2 border-dashed border-amber-400 dark:border-amber-600 bg-amber-50/50 dark:bg-amber-950/20 text-amber-900 dark:text-amber-200 font-bold cursor-pointer inline-flex items-center justify-center gap-1.5 hover:bg-amber-100/60 dark:hover:bg-amber-950/40"
+                        >
+                          <Upload className="w-3.5 h-3.5" />
+                          <span>{leadImportParsing ? 'Reading File...' : 'Choose CSV / Excel / Notepad File'}</span>
+                        </button>
+                      </div>
+
+                      <div>
+                        <label className="block text-[10px] font-bold uppercase text-slate-500 mb-1">
+                          Default Source (if blank)
+                        </label>
+                        <select
+                          value={leadUploadSource}
+                          onChange={(e) => setLeadUploadSource(e.target.value as CRMSourceChannel)}
+                          className="w-full px-2.5 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800"
+                        >
+                          {LEAD_SOURCES.map((s) => (
+                            <option key={s} value={s}>{s}</option>
+                          ))}
+                        </select>
+                      </div>
+
+                      <div>
+                        <label className="block text-[10px] font-bold uppercase text-slate-500 mb-1">
+                          Default Stage (if blank)
+                        </label>
+                        <select
+                          value={leadUploadStage}
+                          onChange={(e) => setLeadUploadStage(e.target.value as CRMLeadStage)}
+                          className="w-full px-2.5 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800"
+                        >
+                          {LEAD_STAGES.map((st) => (
+                            <option key={st} value={st}>{st}</option>
+                          ))}
+                        </select>
+                      </div>
+
+                      <div>
+                        <label className="block text-[10px] font-bold uppercase text-slate-500 mb-1">
+                          Duplicate Phone Handling
+                        </label>
+                        <select
+                          value={leadUploadDuplicateMode}
+                          onChange={(e) => setLeadUploadDuplicateMode(e.target.value as 'skip' | 'update' | 'all')}
+                          className="w-full px-2.5 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800"
+                        >
+                          <option value="skip">Skip existing phone duplicates</option>
+                          <option value="update">Update existing matching leads</option>
+                          <option value="all">Import all rows anyway</option>
+                        </select>
+                      </div>
+                    </div>
+
+                    {/* Direct Notepad / CSV Paste Box */}
+                    <div className="space-y-1.5">
+                      <label className="block text-[10px] font-bold uppercase text-slate-500">
+                        Or Paste Notepad / CSV Lines Directly (comma, tab, pipe |, or dash - supported)
+                      </label>
+                      <div className="flex flex-col sm:flex-row gap-2">
+                        <textarea
+                          rows={3}
+                          value={leadUploadPasteText}
+                          onChange={(e) => setLeadUploadPasteText(e.target.value)}
+                          placeholder={'Ali Raza, 03001234567, Muzaffarabad, WhatsApp, Smart Watch, 4500\nSara Bibi | 03125556677 | Lahore | Facebook | Bridal Bundle | 8200'}
+                          className="flex-1 px-2.5 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 font-mono text-[11px]"
+                        />
+                        <button
+                          type="button"
+                          onClick={handleParsePastedLeadText}
+                          className="px-3 py-2 rounded-lg bg-slate-900 dark:bg-slate-700 text-white font-bold cursor-pointer self-end sm:self-stretch shrink-0"
+                        >
+                          Preview Pasted Leads
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Preview Table */}
+                    {leadImportPreview && (
+                      <div className="p-3 rounded-xl bg-slate-50 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-700 space-y-2.5">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <div>
+                            <div className="font-bold text-slate-900 dark:text-white">
+                              Preview: {leadImportPreview.fileName} ({leadImportPreview.formatLabel})
+                            </div>
+                            <div className="text-[11px] text-slate-500">
+                              Valid: <strong className="text-emerald-600">{leadImportPreview.rows.filter((r) => r.isValid).length}</strong>
+                              {' · '}Duplicates: <strong className="text-amber-600">{leadImportPreview.rows.filter((r) => r.isExistingLead || r.isDuplicateInFile).length}</strong>
+                              {' · '}Invalid: <strong className="text-red-600">{leadImportPreview.rows.filter((r) => !r.isValid).length}</strong>
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={() => setLeadImportPreview(null)}
+                              className="px-2.5 py-1.5 rounded-lg border border-slate-300 dark:border-slate-600 font-bold cursor-pointer"
+                            >
+                              Clear Preview
+                            </button>
+                            <button
+                              type="button"
+                              disabled={leadImporting || leadImportPreview.rows.filter((r) => r.isValid).length === 0}
+                              onClick={() => void handleConfirmLeadImport()}
+                              className="px-4 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-black cursor-pointer disabled:opacity-50"
+                            >
+                              {leadImporting
+                                ? 'Importing...'
+                                : `Import ${leadImportPreview.rows.filter((r) => r.isValid).length} Valid Lead(s)`}
+                            </button>
+                          </div>
+                        </div>
+
+                        {leadImportPreview.warnings.map((w, wi) => (
+                          <div key={wi} className="p-2 rounded bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800 text-[11px] text-amber-800 dark:text-amber-300">
+                            {w}
+                          </div>
+                        ))}
+
+                        {leadImportPreview.rows.length > 0 && (
+                          <div className="max-h-64 overflow-auto border border-slate-200 dark:border-slate-700 rounded-lg bg-white dark:bg-slate-900">
+                            <table className="w-full text-left text-[11px] border-collapse">
+                              <thead>
+                                <tr className="bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 border-b border-slate-200 dark:border-slate-700">
+                                  <th className="py-1.5 px-2.5">#</th>
+                                  <th className="py-1.5 px-2.5">Lead Name</th>
+                                  <th className="py-1.5 px-2.5">Phone</th>
+                                  <th className="py-1.5 px-2.5">City</th>
+                                  <th className="py-1.5 px-2.5">Source / Stage</th>
+                                  <th className="py-1.5 px-2.5">Interest / Value</th>
+                                  <th className="py-1.5 px-2.5">Check</th>
+                                </tr>
+                              </thead>
+                              <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
+                                {leadImportPreview.rows.slice(0, 60).map((row) => (
+                                  <tr key={row.rowNumber} className={!row.isValid ? 'bg-red-50/50 dark:bg-red-950/20' : ''}>
+                                    <td className="py-1.5 px-2.5 font-mono text-slate-400">{row.rowNumber}</td>
+                                    <td className="py-1.5 px-2.5 font-bold text-slate-900 dark:text-white">{row.leadName || '—'}</td>
+                                    <td className="py-1.5 px-2.5 font-mono">{row.phone || '—'}</td>
+                                    <td className="py-1.5 px-2.5">{row.city || '—'}</td>
+                                    <td className="py-1.5 px-2.5">{row.source} · {row.stage}</td>
+                                    <td className="py-1.5 px-2.5">
+                                      {row.interestedProductName || 'General'}
+                                      {row.estimatedValue > 0 ? ` (${profile.currencySymbol}${row.estimatedValue.toLocaleString('en-PK')})` : ''}
+                                    </td>
+                                    <td className="py-1.5 px-2.5">
+                                      {!row.isValid ? (
+                                        <span className="px-1.5 py-0.5 rounded bg-red-100 text-red-700 font-bold">{row.errorReason}</span>
+                                      ) : row.isExistingLead || row.isDuplicateInFile ? (
+                                        <span className="px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 font-bold">
+                                          {row.isDuplicateInFile ? 'Duplicate in File' : 'Duplicate Lead'}
+                                        </span>
+                                      ) : row.isExistingCustomer ? (
+                                        <span className="px-1.5 py-0.5 rounded bg-blue-100 text-blue-800 font-bold">Existing Customer</span>
+                                      ) : (
+                                        <span className="px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-800 font-bold">Ready</span>
+                                      )}
+                                    </td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                            {leadImportPreview.rows.length > 60 && (
+                              <div className="p-2 text-center text-[11px] text-slate-500">
+                                Showing first 60 of {leadImportPreview.rows.length} rows (all valid rows will be imported).
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
-              <button type="submit" className="px-3 py-1.5 rounded-lg bg-slate-900 dark:bg-amber-500 text-white dark:text-slate-950 font-bold cursor-pointer inline-flex items-center justify-center gap-1">
-                <UserPlus className="w-3.5 h-3.5" /> Add Lead
-              </button>
-            </form>
+            </>
           )}
 
           {/* Pipeline Filter & Cards */}
@@ -2880,7 +3254,7 @@ export const CRMWorkspaceView: React.FC<CRMWorkspaceViewProps> = ({
                         <div className="text-[11px] text-slate-500 mt-0.5">
                           Customer: <strong>{t.customerName}</strong> {t.orderNumber ? `· Order #${t.orderNumber}` : ''} · Priority: <strong>{t.priority}</strong> · SLA Due: {t.dueAt.slice(0, 16).replace('T', ' ')}
                         </div>
-                        {t.description && <div className="text-[11px] text-slate-600 dark:text-slate-400 mt-1">{t.description}</div>}
+                        {t.description && <div className="text-[11px] text-slate-600 dark:text-slate-400 mt-1 whitespace-pre-line">{t.description}</div>}
                       </div>
                       <div className="flex items-center gap-1.5 shrink-0">
                         <select value={t.status} onChange={(e) => void handleUpdateTicketStatus(t, e.target.value as CRMTicketStatus)} className="px-2 py-1 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 font-semibold">

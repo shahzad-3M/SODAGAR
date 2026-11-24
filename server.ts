@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import express, { NextFunction, Request, Response } from 'express';
-import {
+import type {
   BusinessProfile,
   CategoryRecord,
   CODOrder,
@@ -13,10 +13,12 @@ import {
   CRMCustomSegmentRule,
   CRMFollowUpTask,
   CRMLead,
+  CRMLeadStage,
   CRMLoyaltyConfig,
   CRMLoyaltyCoupon,
   CRMPermissions,
   CRMRoleSpecialization,
+  CRMSourceChannel,
   CRMSupportTicket,
   Customer,
   DeliveryCityConfig,
@@ -26,10 +28,10 @@ import {
   ReviewRewardSubmission,
   Transaction,
   UserAccount,
-} from './src/types';
+} from './src/types/index.ts';
 import {
   defaultBusinessProfile,
-} from './src/utils/defaultData';
+} from './src/utils/defaultData.ts';
 import {
   computeCategoryLevel,
   getCategoryBreadcrumb,
@@ -46,7 +48,7 @@ import {
   slugifyId,
   UPCOMING_CATEGORY_ID,
   UPCOMING_CATEGORY_NAME,
-} from './src/utils/locationCategoryHelpers';
+} from './src/utils/locationCategoryHelpers.ts';
 import {
   type ActorContext,
   adjustCustomerLoyaltyPoints,
@@ -104,7 +106,7 @@ import {
   upsertProductRow,
   verifyServerSecret,
   withDbTransaction,
-} from './src/server/db';
+} from './src/server/db.ts';
 import {
   ALL_AUTO_SEGMENTS,
   buildCsvContent,
@@ -118,12 +120,12 @@ import {
   generateCrmReportDataset,
   normalizeDigits as normalizePhoneDigits,
   renderCrmWhatsAppTemplate,
-} from './src/utils/crmEngine';
+} from './src/utils/crmEngine.ts';
 import {
   downloadAndCacheExternalImage,
   IMPORTED_MEDIA_DIR,
   scrapeProductFromUrl,
-} from './src/server/productScraper';
+} from './src/server/productScraper.ts';
 
 function readCliArg(flag: string): string | undefined {
   const idx = process.argv.indexOf(flag);
@@ -525,6 +527,15 @@ async function startServer() {
   );
 
   // 4. AUTHENTICATION & ACCOUNT SECURITY ENDPOINTS
+  const generateTemporaryPassword = (length = 8): string => {
+    const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    let out = '';
+    for (let i = 0; i < length; i++) {
+      out += alphabet[crypto.randomInt(0, alphabet.length)];
+    }
+    return out;
+  };
+
   const recordLoginAudit = async (
     db: DbExecutor,
     entry: {
@@ -666,6 +677,8 @@ async function startServer() {
             name: acc.fullName,
             urduName: acc.urduName,
             phone: acc.phone,
+            whatsapp: acc.whatsapp || acc.phone,
+            whatsappSameAsPhone: acc.whatsappSameAsPhone ?? true,
             email: acc.email,
             role: acc.role,
             customerId: acc.linkedCustomerId,
@@ -741,7 +754,10 @@ async function startServer() {
 
       const customers = await getAllCustomersFromDb(db);
       const matchedCustomer = customers.find(
-        (c) => normalizePhoneOrId(c.phone) === cleanId || c.id === cleanId
+        (c) =>
+          normalizePhoneOrId(c.phone) === cleanId ||
+          c.id === cleanId ||
+          (c.email && c.email.toLowerCase() === cleanIdLower)
       );
       if (matchedCustomer) {
         const digits = matchedCustomer.phone.replace(/\D/g, '');
@@ -759,6 +775,8 @@ async function startServer() {
             name: matchedCustomer.name,
             urduName: matchedCustomer.urduName,
             phone: matchedCustomer.phone,
+            whatsapp: matchedCustomer.whatsapp || matchedCustomer.phone,
+            whatsappSameAsPhone: matchedCustomer.whatsappSameAsPhone ?? true,
             email: matchedCustomer.email,
             role: 'customer',
             customerId: matchedCustomer.id,
@@ -805,35 +823,100 @@ async function startServer() {
         return;
       }
 
-      const { name, phone, city, address, pin } = (req.body || {}) as {
+      const {
+        name,
+        fullName,
+        phone,
+        email,
+        city,
+        address,
+        whatsappSameAsPhone,
+        whatsapp,
+        pin,
+        generateTempPassword,
+      } = (req.body || {}) as {
         name?: string;
+        fullName?: string;
         phone?: string;
+        email?: string;
         city?: string;
         address?: string;
+        whatsappSameAsPhone?: boolean;
+        whatsapp?: string;
         pin?: string;
+        generateTempPassword?: boolean;
       };
-      const cleanName = (name || '').trim();
+
+      const cleanName = (name || fullName || '').trim();
       const cleanPhone = (phone || '').trim();
+      const cleanEmail = (email || '').trim().toLowerCase();
+      const sameAsPhone = whatsappSameAsPhone !== false;
+      const cleanWhatsappInput = (whatsapp || '').trim();
+      const resolvedWhatsapp = sameAsPhone ? cleanPhone : cleanWhatsappInput;
       const cleanPin = (pin || '').trim();
-      if (!cleanName || cleanPhone.replace(/\D/g, '').length < 10 || cleanPin.length < 4) {
-        res.status(400).json({ error: 'Valid name, phone number (10+ digits), and PIN (4+ chars) are required.' });
+
+      if (!cleanName || cleanName.length < 2) {
+        res.status(400).json({ error: 'Please enter your full name (at least 2 characters).' });
+        return;
+      }
+      if (cleanPhone.replace(/\D/g, '').length < 10) {
+        res.status(400).json({ error: 'Please enter a valid mobile number (at least 10 digits).' });
+        return;
+      }
+      if (!sameAsPhone && resolvedWhatsapp.replace(/\D/g, '').length < 10) {
+        res.status(400).json({
+          error: 'Please enter a valid WhatsApp number (at least 10 digits) for notifications.',
+        });
+        return;
+      }
+      if (cleanEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+        res.status(400).json({ error: 'Please enter a valid email address.' });
+        return;
+      }
+
+      const shouldGenerateTemp = generateTempPassword !== false || !cleanPin;
+      if (!shouldGenerateTemp && cleanPin.length < 4) {
+        res.status(400).json({ error: 'Password must be at least 4 characters long.' });
         return;
       }
 
       const normPhone = normalizePhoneDigits(cleanPhone);
       const existingCustomers = await getAllCustomersFromDb(db);
+      const accounts = await getCollectionValue<UserAccount[]>(db, 'user_accounts', []);
+
       const dupCust = existingCustomers.find((c) => normalizePhoneDigits(c.phone) === normPhone);
-      if (dupCust) {
-        res.status(409).json({ error: 'An account with this phone number already exists. Please sign in.' });
+      const dupAccPhone = accounts.find((u) => normalizePhoneDigits(u.phone) === normPhone);
+      if (dupCust || dupAccPhone) {
+        res.status(409).json({
+          error: 'An account with this mobile number already exists. Please sign in or contact support.',
+        });
         return;
       }
 
+      if (cleanEmail) {
+        const dupEmailCust = existingCustomers.find(
+          (c) => c.email && c.email.trim().toLowerCase() === cleanEmail
+        );
+        const dupEmailAcc = accounts.find((u) => u.email && u.email.trim().toLowerCase() === cleanEmail);
+        if (dupEmailCust || dupEmailAcc) {
+          res.status(409).json({
+            error: 'An account with this email address already exists. Please sign in or contact support.',
+          });
+          return;
+        }
+      }
+
+      const effectiveSecret = shouldGenerateTemp ? generateTemporaryPassword(8) : cleanPin;
       const now = new Date().toISOString();
       const custId = `cust_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
       const newCust: Customer = {
         id: custId,
         name: cleanName,
         phone: cleanPhone,
+        whatsapp: resolvedWhatsapp,
+        whatsappSameAsPhone: sameAsPhone,
+        whatsappConsent: true,
+        email: cleanEmail || undefined,
         city: (city || 'Muzaffarabad').trim(),
         address: (address || city || 'Pakistan').trim(),
         customerType: 'individual',
@@ -846,18 +929,22 @@ async function startServer() {
         createdAt: now.split('T')[0],
       };
 
-      const hashed = hashServerSecret(cleanPin);
-      const accounts = await getCollectionValue<UserAccount[]>(db, 'user_accounts', []);
-      const accId = `usr_cust_${Date.now()}`;
+      const hashed = hashServerSecret(effectiveSecret);
+      const accId = `usr_cust_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`;
       const newAccount: UserAccount = {
         id: accId,
         fullName: cleanName,
         username: normPhone || cleanPhone,
         phone: cleanPhone,
+        whatsapp: resolvedWhatsapp,
+        whatsappSameAsPhone: sameAsPhone,
+        email: cleanEmail || undefined,
         role: 'customer',
         status: 'active',
         passwordHash: hashed.hash,
         passwordSalt: hashed.salt,
+        mustChangePassword: shouldGenerateTemp,
+        isTemporaryPassword: shouldGenerateTemp,
         linkedCustomerId: custId,
         createdAt: now,
         createdBy: 'self_registration',
@@ -869,21 +956,35 @@ async function startServer() {
         customerId: custId,
         phone: cleanPhone,
         eventType: 'note_added',
-        notes: 'Customer registered via Storefront Portal',
+        notes: `Customer self-registered via portal. Notification WhatsApp: ${resolvedWhatsapp}${
+          cleanEmail ? ` | Email: ${cleanEmail}` : ''
+        }${shouldGenerateTemp ? ' (Temporary password issued)' : ''}`,
       });
 
       const userObj = {
         id: accId,
         name: cleanName,
         phone: cleanPhone,
+        whatsapp: resolvedWhatsapp,
+        whatsappSameAsPhone: sameAsPhone,
+        email: cleanEmail || undefined,
         role: 'customer',
         customerId: custId,
         canAuthorizeCreditSale: false,
+        mustChangePassword: shouldGenerateTemp,
         isAuthenticated: true,
       };
       const sessionToken = signSessionToken({ userId: accId, role: 'customer', name: cleanName });
       broadcastSyncEvent('customers', req.header('x-client-id'));
-      res.json({ ok: true, user: userObj, customer: newCust, sessionToken });
+      res.json({
+        ok: true,
+        user: userObj,
+        customer: newCust,
+        sessionToken,
+        temporaryPassword: shouldGenerateTemp ? effectiveSecret : undefined,
+        whatsappNumber: resolvedWhatsapp,
+        email: cleanEmail || undefined,
+      });
     })
   );
 
@@ -3332,6 +3433,189 @@ async function startServer() {
     })
   );
 
+  app.post(
+    '/api/crm/leads/bulk-import',
+    asyncRoute(async (req, res) => {
+      const actor = await requireCrmActor(req, res, 'canManageLeads');
+      if (!actor) return;
+
+      const body = (req.body || {}) as {
+        leads?: Array<Partial<CRMLead>>;
+        defaultSource?: CRMSourceChannel;
+        defaultStage?: CRMLeadStage;
+        skipDuplicates?: boolean;
+        updateDuplicates?: boolean;
+      };
+
+      const rawRows = Array.isArray(body.leads) ? body.leads : [];
+      if (rawRows.length === 0) {
+        res.status(400).json({ error: 'No leads provided for import.' });
+        return;
+      }
+      if (rawRows.length > 2000) {
+        res.status(400).json({ error: 'Batch size exceeds 2,000 leads per upload. Please split into smaller files.' });
+        return;
+      }
+
+      const ALLOWED_SOURCES = new Set<CRMSourceChannel>([
+        'WhatsApp',
+        'Website',
+        'Facebook',
+        'Instagram',
+        'Walk-in',
+        'Phone',
+        'Referral',
+        'Reseller Network',
+      ]);
+      const ALLOWED_STAGES = new Set<CRMLeadStage>([
+        'New',
+        'Contacted',
+        'Interested',
+        'Follow-up',
+        'Converted',
+        'Lost',
+      ]);
+
+      const defaultSource: CRMSourceChannel = ALLOWED_SOURCES.has(body.defaultSource as CRMSourceChannel)
+        ? (body.defaultSource as CRMSourceChannel)
+        : 'WhatsApp';
+      const defaultStage: CRMLeadStage = ALLOWED_STAGES.has(body.defaultStage as CRMLeadStage)
+        ? (body.defaultStage as CRMLeadStage)
+        : 'New';
+      const skipDuplicates = body.skipDuplicates !== false;
+      const updateDuplicates = body.updateDuplicates === true;
+
+      const result = await withDbTransaction(async (txDb) => {
+        const existingLeads = await getAllCrmLeads(txDb);
+        const allProducts = await getAllProductsFromDb(txDb);
+        const phoneMap = new Map<string, CRMLead>();
+        for (const existing of existingLeads) {
+          const digits = normalizePhoneDigits(existing.phone);
+          if (digits.length >= 7) {
+            phoneMap.set(digits, existing);
+          }
+        }
+
+        let importedCount = 0;
+        let updatedCount = 0;
+        let skippedDuplicatesCount = 0;
+        let invalidCount = 0;
+        const nowIso = new Date().toISOString();
+
+        for (let i = 0; i < rawRows.length; i++) {
+          const row = rawRows[i];
+          const leadName = typeof row?.leadName === 'string' ? row.leadName.trim() : '';
+          const phone = typeof row?.phone === 'string' ? row.phone.trim() : '';
+          const digits = normalizePhoneDigits(phone);
+
+          if (!leadName || digits.length < 7) {
+            invalidCount++;
+            continue;
+          }
+
+          const source: CRMSourceChannel = ALLOWED_SOURCES.has(row.source as CRMSourceChannel)
+            ? (row.source as CRMSourceChannel)
+            : defaultSource;
+          const stage: CRMLeadStage = ALLOWED_STAGES.has(row.stage as CRMLeadStage)
+            ? (row.stage as CRMLeadStage)
+            : defaultStage;
+
+          const rawProductName =
+            typeof row.interestedProductName === 'string' ? row.interestedProductName.trim() : '';
+          const matchedProduct =
+            (row.interestedProductId && allProducts.find((p) => p.id === row.interestedProductId)) ||
+            (rawProductName
+              ? allProducts.find((p) => p.name.toLowerCase() === rawProductName.toLowerCase())
+              : undefined);
+
+          const existingMatch = phoneMap.get(digits);
+          if (existingMatch) {
+            if (updateDuplicates) {
+              const updated = await upsertCrmLead(txDb, {
+                ...existingMatch,
+                leadName: leadName || existingMatch.leadName,
+                city: (typeof row.city === 'string' && row.city.trim()) || existingMatch.city,
+                whatsapp: (typeof row.whatsapp === 'string' && row.whatsapp.trim()) || existingMatch.whatsapp,
+                email: (typeof row.email === 'string' && row.email.trim()) || existingMatch.email,
+                interestedProductId: matchedProduct?.id || existingMatch.interestedProductId,
+                interestedProductName:
+                  matchedProduct?.name || rawProductName || existingMatch.interestedProductName,
+                estimatedValue:
+                  Number(row.estimatedValue || 0) > 0
+                    ? Math.round(Number(row.estimatedValue))
+                    : existingMatch.estimatedValue,
+                followUpDate:
+                  (typeof row.followUpDate === 'string' && row.followUpDate.trim()) ||
+                  existingMatch.followUpDate,
+                notes:
+                  [existingMatch.notes, typeof row.notes === 'string' ? row.notes.trim() : '']
+                    .filter(Boolean)
+                    .join(' | ') || undefined,
+                updatedAt: nowIso,
+              });
+              phoneMap.set(digits, updated);
+              updatedCount++;
+              continue;
+            }
+            if (skipDuplicates) {
+              skippedDuplicatesCount++;
+              continue;
+            }
+          }
+
+          const created = await upsertCrmLead(txDb, {
+            id: `lead_${Date.now()}_${i}_${Math.random().toString(36).slice(2, 6)}`,
+            leadName,
+            phone,
+            whatsapp: typeof row.whatsapp === 'string' ? row.whatsapp.trim() || undefined : undefined,
+            email: typeof row.email === 'string' ? row.email.trim() || undefined : undefined,
+            city: typeof row.city === 'string' ? row.city.trim() || undefined : undefined,
+            source,
+            interestedProductId: matchedProduct?.id || row.interestedProductId,
+            interestedProductName: matchedProduct?.name || rawProductName || undefined,
+            estimatedValue: Math.max(0, Math.round(Number(row.estimatedValue || 0))),
+            assignedSalespersonId: row.assignedSalespersonId || actor.id,
+            assignedSalespersonName: row.assignedSalespersonName || actor.name || 'Sales',
+            notes: typeof row.notes === 'string' ? row.notes.trim() || undefined : undefined,
+            followUpDate:
+              typeof row.followUpDate === 'string' ? row.followUpDate.trim() || undefined : undefined,
+            stage,
+            createdAt: nowIso,
+            updatedAt: nowIso,
+          });
+          phoneMap.set(digits, created);
+          importedCount++;
+        }
+
+        await insertAdminAuditLog(txDb, {
+          action: 'crm_leads_bulk_import',
+          entityType: 'crm_lead',
+          entityId: 'bulk_import',
+          actorId: actor.id,
+          actorName: actor.name,
+          actorRole: actor.role,
+          details: {
+            importedCount,
+            updatedCount,
+            skippedDuplicatesCount,
+            invalidCount,
+          },
+        });
+
+        return {
+          importedCount,
+          updatedCount,
+          skippedDuplicatesCount,
+          invalidCount,
+          leads: await getAllCrmLeads(txDb),
+        };
+      });
+
+      broadcastSyncEvent('crm_leads', req.header('x-client-id'));
+      res.json({ ok: true, ...result });
+    })
+  );
+
   app.put(
     '/api/crm/leads/:id',
     asyncRoute(async (req, res) => {
@@ -3715,13 +3999,42 @@ async function startServer() {
     })
   );
 
-  // Support & Complaint Tickets (with auto SLA dueAt)
+  // Support & Complaint Tickets (Open to signed-in customers for their own tickets + CRM staff)
+  const actorCanManageAllTickets = (actor: ResolvedActor): boolean =>
+    actor.role === 'super_admin' ||
+    actor.role === 'admin' ||
+    Boolean(actor.crmPermissions?.canManageTickets);
+
+  const doesTicketBelongToActor = (ticket: CRMSupportTicket, actor: ResolvedActor): boolean => {
+    if (!actor.id) return false;
+    if (
+      ticket.customerId &&
+      (ticket.customerId === actor.customerId || ticket.customerId === actor.id)
+    ) {
+      return true;
+    }
+    const actorPhone = normalizePhoneDigits(actor.phone || '');
+    const ticketPhone = normalizePhoneDigits(ticket.customerPhone || '');
+    return Boolean(actorPhone && ticketPhone && actorPhone === ticketPhone);
+  };
+
   app.get(
     '/api/crm/tickets',
     asyncRoute(async (req, res) => {
-      const actor = await requireCrmActor(req, res, 'canManageTickets');
-      if (!actor) return;
-      res.json({ ok: true, tickets: await getAllCrmTickets() });
+      const actor = await resolveActor(req);
+      if (!actor.id) {
+        res.status(401).json({ error: 'Please sign in to view support tickets.' });
+        return;
+      }
+      const allTickets = await getAllCrmTickets();
+      if (actorCanManageAllTickets(actor)) {
+        res.json({ ok: true, tickets: allTickets });
+        return;
+      }
+      res.json({
+        ok: true,
+        tickets: allTickets.filter((t) => doesTicketBelongToActor(t, actor)),
+      });
     })
   );
 
@@ -3730,7 +4043,7 @@ async function startServer() {
     asyncRoute(async (req, res) => {
       const actor = await resolveActor(req);
       if (!actor.id) {
-        res.status(401).json({ error: 'Authentication required.' });
+        res.status(401).json({ error: 'Please sign in first to create a support ticket.' });
         return;
       }
       const body = req.body as Partial<CRMSupportTicket>;
@@ -3738,51 +4051,115 @@ async function startServer() {
         res.status(400).json({ error: 'Ticket subject is required.' });
         return;
       }
+      const isStaffTicketManager = actorCanManageAllTickets(actor);
       const priority = body.priority || 'Medium';
       const slaHours = priority === 'Urgent' ? 4 : priority === 'High' ? 12 : priority === 'Low' ? 48 : 24;
       const nowMs = Date.now();
       const db = await getDb();
       const ticket = await upsertCrmTicket(db, {
-        id: body.id || `tkt_${nowMs}_${Math.random().toString(36).slice(2, 5)}`,
-        ticketNumber: body.ticketNumber || `TKT-100D-${String(nowMs).slice(-5)}`,
-        customerId: body.customerId || actor.customerId,
-        customerName: body.customerName || actor.name || 'Customer',
-        customerPhone: body.customerPhone || actor.phone,
+        id: `tkt_${nowMs}_${Math.random().toString(36).slice(2, 5)}`,
+        ticketNumber: `TKT-100D-${String(nowMs).slice(-5)}`,
+        customerId: isStaffTicketManager ? body.customerId || actor.customerId : actor.customerId || actor.id,
+        customerName: isStaffTicketManager
+          ? body.customerName || actor.name || 'Customer'
+          : actor.name || body.customerName?.trim() || 'Customer',
+        customerPhone: isStaffTicketManager
+          ? body.customerPhone || actor.phone
+          : actor.phone || body.customerPhone?.trim(),
         orderId: body.orderId,
-        orderNumber: body.orderNumber,
+        orderNumber: body.orderNumber?.trim() || undefined,
         category: body.category || 'Product Inquiry',
         priority,
-        status: body.status || 'Open',
-        assignedEmployeeId: body.assignedEmployeeId,
-        assignedEmployeeName: body.assignedEmployeeName,
+        status: isStaffTicketManager ? body.status || 'Open' : 'Open',
+        assignedEmployeeId: isStaffTicketManager ? body.assignedEmployeeId : undefined,
+        assignedEmployeeName: isStaffTicketManager ? body.assignedEmployeeName : undefined,
         subject: body.subject.trim(),
         description: body.description?.trim(),
-        resolutionNotes: body.resolutionNotes?.trim(),
-        dueAt: body.dueAt || new Date(nowMs + slaHours * 3600000).toISOString(),
-        createdAt: body.createdAt || new Date(nowMs).toISOString(),
+        resolutionNotes: isStaffTicketManager ? body.resolutionNotes?.trim() : undefined,
+        dueAt: new Date(nowMs + slaHours * 3600000).toISOString(),
+        createdAt: new Date(nowMs).toISOString(),
         updatedAt: new Date(nowMs).toISOString(),
       });
-      res.json({ ok: true, ticket, tickets: await getAllCrmTickets(db) });
+      const allTickets = await getAllCrmTickets(db);
+      broadcastSyncEvent('crm_tickets', req.header('x-client-id'));
+      res.json({
+        ok: true,
+        ticket,
+        tickets: isStaffTicketManager ? allTickets : allTickets.filter((t) => doesTicketBelongToActor(t, actor)),
+      });
     })
   );
 
   app.put(
     '/api/crm/tickets/:id',
     asyncRoute(async (req, res) => {
-      const actor = await requireCrmActor(req, res, 'canManageTickets');
-      if (!actor) return;
+      const actor = await resolveActor(req);
+      if (!actor.id) {
+        res.status(401).json({ error: 'Please sign in to update a support ticket.' });
+        return;
+      }
       const db = await getDb();
       const existing = (await getAllCrmTickets(db)).find((t) => t.id === req.params.id);
       if (!existing) {
         res.status(404).json({ error: 'Support ticket not found.' });
         return;
       }
-      const updated = await upsertCrmTicket(db, {
-        ...existing,
-        ...(req.body as Partial<CRMSupportTicket>),
-        id: existing.id,
+
+      const isStaffTicketManager = actorCanManageAllTickets(actor);
+      if (!isStaffTicketManager && !doesTicketBelongToActor(existing, actor)) {
+        res.status(403).json({ error: 'You can only view or update your own support tickets.' });
+        return;
+      }
+
+      const incoming = req.body as Partial<CRMSupportTicket> & { customerFollowUpNote?: string };
+      let updated: CRMSupportTicket;
+
+      if (isStaffTicketManager) {
+        updated = await upsertCrmTicket(db, {
+          ...existing,
+          ...incoming,
+          id: existing.id,
+        });
+      } else {
+        // Signed-in customer can keep/reopen their ticket as Open (or mark Closed) and append follow-up context
+        const allowedCustomerStatus =
+          incoming.status === 'Open' || incoming.status === 'Closed' ? incoming.status : existing.status;
+        const followUpText =
+          typeof incoming.customerFollowUpNote === 'string' ? incoming.customerFollowUpNote.trim() : '';
+        const mergedDescription = followUpText
+          ? [
+              existing.description || '',
+              `[Customer Update ${new Date().toISOString().slice(0, 16).replace('T', ' ')}]: ${followUpText}`,
+            ]
+              .filter(Boolean)
+              .join('\n')
+          : typeof incoming.description === 'string' && incoming.description.trim()
+          ? incoming.description.trim()
+          : existing.description;
+
+        const nowMs = Date.now();
+        const refreshedDueAt =
+          allowedCustomerStatus === 'Open' && new Date(existing.dueAt).getTime() < nowMs
+            ? new Date(nowMs + 24 * 3600000).toISOString()
+            : existing.dueAt;
+
+        updated = await upsertCrmTicket(db, {
+          ...existing,
+          status: allowedCustomerStatus,
+          description: mergedDescription,
+          dueAt: refreshedDueAt,
+          resolvedAt: allowedCustomerStatus === 'Open' ? undefined : existing.resolvedAt,
+          id: existing.id,
+        });
+      }
+
+      const allTickets = await getAllCrmTickets(db);
+      broadcastSyncEvent('crm_tickets', req.header('x-client-id'));
+      res.json({
+        ok: true,
+        ticket: updated,
+        tickets: isStaffTicketManager ? allTickets : allTickets.filter((t) => doesTicketBelongToActor(t, actor)),
       });
-      res.json({ ok: true, ticket: updated, tickets: await getAllCrmTickets(db) });
     })
   );
 

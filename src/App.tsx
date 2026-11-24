@@ -221,6 +221,12 @@ export default function App() {
 
     // Strict Guest Restriction: When nobody is logged in, allow ONLY public catalog & read-only lucky draw showcase
     if (!currentUser?.isAuthenticated) {
+      if (tab === 'customer_tickets') {
+        pushToast('Please sign in first to create or view support tickets.', 'info');
+        setCurrentTab('store');
+        setIsRoleModalOpen(true);
+        return;
+      }
       if (tab !== 'store' && tab !== 'lucky_draw') {
         setCurrentTab('store');
         setIsRoleModalOpen(true);
@@ -231,7 +237,7 @@ export default function App() {
     }
 
     if (activeRole === 'customer') {
-      const allowed = ['store', 'customer_portal', 'history', 'reports', 'monthly_statement', 'lucky_draw'];
+      const allowed = ['store', 'customer_portal', 'customer_tickets', 'history', 'reports', 'monthly_statement', 'lucky_draw'];
       if (!allowed.includes(tab)) {
         setCurrentTab('store');
         return;
@@ -1174,6 +1180,9 @@ export default function App() {
         id: userDetails.id || currentUser.id,
         name: userDetails.name || currentUser.name,
         phone: userDetails.phone ?? currentUser.phone ?? '',
+        whatsapp: userDetails.whatsapp ?? currentUser.whatsapp,
+        whatsappSameAsPhone: userDetails.whatsappSameAsPhone ?? currentUser.whatsappSameAsPhone,
+        email: userDetails.email ?? currentUser.email,
         role: newRole,
         isAuthenticated: userDetails.isAuthenticated ?? true,
       };
@@ -1238,14 +1247,17 @@ export default function App() {
             name: userDetails.name || `Customer ${cleanPhone.slice(-4)}`,
             urduName: userDetails.urduName || 'آن لائن کسٹمر',
             phone: userDetails.phone,
-            city: 'Lahore',
+            whatsapp: userDetails.whatsapp || userDetails.phone,
+            whatsappSameAsPhone: userDetails.whatsappSameAsPhone ?? true,
+            whatsappConsent: true,
+            email: userDetails.email,
+            city: 'Muzaffarabad',
             customerType: 'individual',
             balance: 0,
             totalPurchases: 0,
             creditLimit: 5000,
             paymentTermsDays: 7,
             status: 'active',
-            pin: userDetails.hasDefaultPin === false ? undefined : getDefaultPinForPhone(userDetails.phone),
             createdAt: new Date().toISOString(),
           };
           const updatedCusts = [newCustRecord, ...latestCustomers];
@@ -1784,9 +1796,9 @@ export default function App() {
             <span className="flex items-center gap-1.5">
               <Lock className="w-4 h-4 shrink-0" />
               <span>
-                سیکیورٹی یاددہانی: آپ کا پاس ورڈ ڈیفالٹ ہے۔ اپنے کھاتے اور آرڈرز کو محفوظ رکھنے کے لیے نیا پاس ورڈ تبدیل کریں۔
+                سیکیورٹی یاددہانی: آپ عارضی پاس ورڈ استعمال کر رہے ہیں۔ اپنے کھاتے اور آرڈرز کو محفوظ رکھنے کے لیے نیا پرائیویٹ پاس ورڈ سیٹ کریں۔
                 <span className="hidden sm:inline font-normal text-slate-900 ml-1">
-                  (Please change your default PIN to secure your account)
+                  (Please replace your temporary password with a private password to secure your account)
                 </span>
               </span>
             </span>
@@ -1795,7 +1807,7 @@ export default function App() {
               onClick={openRoleModal}
               className="px-2.5 py-1 bg-slate-950 text-white hover:bg-slate-900 rounded-md text-[11px] font-extrabold whitespace-nowrap cursor-pointer shrink-0 transition-colors"
             >
-              پاس ورڈ تبدیل کریں (Change PIN)
+              پاس ورڈ تبدیل کریں (Change Password)
             </button>
           </div>
         </div>
@@ -1869,7 +1881,7 @@ export default function App() {
         )}
 
         {/* CUSTOMER SELF-SERVICE PORTAL */}
-        {currentTab === 'customer_portal' && (
+        {(currentTab === 'customer_portal' || currentTab === 'customer_tickets') && (
           <CustomerPortalView
             currentUser={currentUser}
             customer={customers.find(
@@ -1878,7 +1890,9 @@ export default function App() {
                 (currentUser.phone && c.phone.replace(/\D/g, '') === currentUser.phone.replace(/\D/g, ''))
             )}
             transactions={transactions}
+            codOrders={codOrders}
             profile={profile}
+            initialTab={currentTab === 'customer_tickets' ? 'tickets' : 'dashboard'}
             onLogout={handleLogout}
             onOpenCart={() => setIsCheckoutOpen(true)}
             onNavigateTab={handleTabChange}
