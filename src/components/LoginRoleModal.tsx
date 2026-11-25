@@ -20,7 +20,7 @@ import {
   UserPlus,
   MapPin,
 } from 'lucide-react';
-import { AppUser, Customer, LoginFormConfig, Reseller, UserAccount, UserRole } from '../types/index.ts';
+import type { AppUser, Customer, LoginFormConfig, Reseller, UserAccount, UserRole } from '../types/index.ts';
 import {
   defaultGuestUser,
   getLoginFormConfig,

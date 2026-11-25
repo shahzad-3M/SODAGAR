@@ -1,6 +1,6 @@
 import React, { useMemo, useState } from 'react';
 import { Ruler, FileText, SlidersHorizontal, Layers, Check } from 'lucide-react';
-import { ProductItem, ProductSizeChart, ProductVariation } from '../types/index.ts';
+import type { ProductItem, ProductSizeChart, ProductVariation } from '../types/index.ts';
 import { normalizeTextKey } from '../utils/locationCategoryHelpers.ts';
 
 interface ProductSpecSizingShowcaseProps {

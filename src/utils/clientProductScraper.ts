@@ -1,11 +1,11 @@
-import {
+import type {
   CategoryRecord,
   ProductItem,
   ProductSizeChart,
   ProductSizeChartRow,
   ProductVariation,
-} from '../types';
-import { normalizeTextKey, UPCOMING_CATEGORY_ID } from './locationCategoryHelpers';
+} from '../types/index.ts';
+import { normalizeTextKey, UPCOMING_CATEGORY_ID } from './locationCategoryHelpers.ts';
 
 export interface ClientScrapeDiagnostics {
   strategiesUsed: string[];

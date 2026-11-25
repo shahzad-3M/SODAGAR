@@ -20,7 +20,7 @@ import {
   Pencil,
   Trash2,
 } from 'lucide-react';
-import {
+import type {
   AttendanceRecord,
   AttendanceStatus,
   BusinessProfile,

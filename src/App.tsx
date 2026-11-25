@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { Lock, ShieldAlert } from 'lucide-react';
-import {
+import type {
   AgeGroupType,
   AppUser,
   AttendanceRecord,

@@ -214,6 +214,25 @@ export function setSessionToken(token: string | null): void {
   }
 }
 
+function getConfiguredApiBaseUrl(): string {
+  try {
+    const raw = (import.meta as { env?: Record<string, string | undefined> })?.env?.VITE_API_BASE_URL;
+    return typeof raw === 'string' ? raw.trim().replace(/\/+$/, '') : '';
+  } catch {
+    return '';
+  }
+}
+
+export function resolveApiUrl(path: string): string {
+  if (!path.startsWith('/')) return path;
+  const base = getConfiguredApiBaseUrl();
+  return base ? `${base}${path}` : path;
+}
+
+function apiFetch(path: string, init?: RequestInit): Promise<Response> {
+  return fetch(resolveApiUrl(path), init);
+}
+
 function getAuthHeaders(): Record<string, string> {
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
@@ -240,7 +259,11 @@ async function safeParseJsonResponse<T = Record<string, unknown>>(
       ok: res.ok,
       status: res.status,
       data: null,
-      error: res.ok ? undefined : `Server returned an empty response (HTTP ${res.status}).`,
+      error: res.ok
+        ? undefined
+        : res.status === 404
+        ? 'API endpoint not found on this host (HTTP 404). Make sure the Node.js server is running or /api requests are routed to your backend.'
+        : `Server returned an empty response (HTTP ${res.status}).`,
     };
   }
 
@@ -255,7 +278,10 @@ async function safeParseJsonResponse<T = Record<string, unknown>>(
       ok: false,
       status: res.status,
       data: null,
-      error: `Server returned an unexpected HTML page (HTTP ${res.status}). Please refresh or try again; if importing an external site, use the "Paste HTML Source" option below.`,
+      error:
+        res.status === 404
+          ? 'API endpoint not found on this host (HTTP 404). Please verify the Node.js server is running and /api routing is active.'
+          : `Server returned an unexpected HTML page (HTTP ${res.status}). Please refresh or try again; if importing an external site, use the "Paste HTML Source" option below.`,
     };
   }
 
@@ -267,7 +293,10 @@ async function safeParseJsonResponse<T = Record<string, unknown>>(
       ok: false,
       status: res.status,
       data: null,
-      error: `Invalid response format from server (HTTP ${res.status}).`,
+      error:
+        res.status === 404
+          ? 'API endpoint not reachable on this host (HTTP 404). Make sure the Node.js backend (app.madinamarket.pk) is running and /api requests are routed properly.'
+          : `Invalid response format from server (HTTP ${res.status}).`,
     };
   }
 }
@@ -304,7 +333,7 @@ function queueServerCollectionWrite(collectionKey: string, value: unknown) {
   const prev = pendingWriteQueues.get(collectionKey) || Promise.resolve();
   const next = prev
     .then(async () => {
-      const res = await fetch(`/api/collections/${encodeURIComponent(collectionKey)}`, {
+      const res = await apiFetch(`/api/collections/${encodeURIComponent(collectionKey)}`, {
         method: 'PUT',
         headers: getAuthHeaders(),
         cache: 'no-store',
@@ -330,7 +359,7 @@ function queueServerEndpointDelete(
   let result: { ok: boolean; error?: string } = { ok: true };
   const next = prev
     .then(async () => {
-      const res = await fetch(url, {
+      const res = await apiFetch(url, {
         method: 'DELETE',
         headers: getAuthHeaders(),
         cache: 'no-store',
@@ -433,7 +462,7 @@ function applyServerStateSnapshot(state: Record<string, unknown>) {
 export async function refreshSyncState(): Promise<boolean> {
   if (typeof window === 'undefined') return false;
   try {
-    const res = await fetch('/api/sync/state', {
+    const res = await apiFetch('/api/sync/state', {
       method: 'GET',
       headers: getAuthHeaders(),
       cache: 'no-store',
@@ -468,7 +497,7 @@ async function migrateLocalStorageIfNeeded(): Promise<void> {
     }
 
     if (hasAnyLocalData) {
-      await fetch('/api/sync/migrate-local', {
+      await apiFetch('/api/sync/migrate-local', {
         method: 'POST',
         headers: getAuthHeaders(),
         cache: 'no-store',
@@ -495,7 +524,7 @@ export function subscribeToServerSync(listener: () => void): () => void {
 
   if (typeof window !== 'undefined' && !sseSource) {
     try {
-      sseSource = new EventSource('/api/events');
+      sseSource = new EventSource(resolveApiUrl('/api/events'));
       sseSource.addEventListener('sync', (ev) => {
         try {
           const payload = JSON.parse((ev as MessageEvent).data) as {
@@ -558,7 +587,7 @@ export async function apiAuthenticateLogin(
   pin: string
 ): Promise<{ ok: boolean; user?: Partial<AppUser>; sessionToken?: string; error?: string }> {
   try {
-    const res = await fetch('/api/auth/login', {
+    const res = await apiFetch('/api/auth/login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-client-id': CLIENT_ID },
       cache: 'no-store',
@@ -607,7 +636,7 @@ export async function apiActivateProductArrival(
   }
 ): Promise<{ ok: boolean; product?: ProductItem; error?: string }> {
   try {
-    const res = await fetch(`/api/products/${encodeURIComponent(productId)}/activate-arrival`, {
+    const res = await apiFetch(`/api/products/${encodeURIComponent(productId)}/activate-arrival`, {
       method: 'POST',
       headers: getAuthHeaders(),
       cache: 'no-store',
@@ -644,7 +673,7 @@ export async function apiScrapeProductUrl(
   error?: string;
 }> {
   const attemptServerScrape = async (): Promise<Response> => {
-    return fetch('/api/products/scrape-url', {
+    return apiFetch('/api/products/scrape-url', {
       method: 'POST',
       headers: getAuthHeaders(),
       cache: 'no-store',
@@ -799,7 +828,7 @@ export async function apiSaveProduct(
 ): Promise<{ ok: boolean; product?: ProductItem; error?: string }> {
   try {
     const endpoint = isUpdate ? `/api/products/${encodeURIComponent(product.id)}` : '/api/products';
-    const res = await fetch(endpoint, {
+    const res = await apiFetch(endpoint, {
       method: isUpdate ? 'PUT' : 'POST',
       headers: getAuthHeaders(),
       cache: 'no-store',
@@ -825,7 +854,7 @@ export async function apiCacheExternalImage(
   const trimmed = (url || '').trim();
   if (!trimmed) return { ok: false, localUrl: '', downloaded: false, error: 'Image URL is required.' };
   try {
-    const res = await fetch('/api/media/cache', {
+    const res = await apiFetch('/api/media/cache', {
       method: 'POST',
       headers: getAuthHeaders(),
       cache: 'no-store',
@@ -869,7 +898,7 @@ export async function apiSaveCategoryRecord(
     const url = existingId
       ? `/api/categories/${encodeURIComponent(existingId)}`
       : '/api/categories';
-    const res = await fetch(url, {
+    const res = await apiFetch(url, {
       method: existingId ? 'PUT' : 'POST',
       headers: getAuthHeaders(),
       cache: 'no-store',
@@ -893,7 +922,7 @@ export async function apiDeleteCategoryRecord(
   id: string
 ): Promise<{ ok: boolean; error?: string }> {
   try {
-    const res = await fetch(`/api/categories/${encodeURIComponent(id)}`, {
+    const res = await apiFetch(`/api/categories/${encodeURIComponent(id)}`, {
       method: 'DELETE',
       headers: getAuthHeaders(),
       cache: 'no-store',
@@ -914,7 +943,7 @@ export async function apiAddCity(
   province?: string
 ): Promise<{ ok: boolean; cities?: DeliveryCityConfig[]; error?: string }> {
   try {
-    const res = await fetch('/api/cities', {
+    const res = await apiFetch('/api/cities', {
       method: 'POST',
       headers: getAuthHeaders(),
       cache: 'no-store',
@@ -934,7 +963,7 @@ export async function apiUpdateCity(
   updates: { name?: string; province?: string; allowed?: boolean; deliveryCharge?: number | null }
 ): Promise<{ ok: boolean; cities?: DeliveryCityConfig[]; error?: string }> {
   try {
-    const res = await fetch(`/api/cities/${encodeURIComponent(idOrName)}`, {
+    const res = await apiFetch(`/api/cities/${encodeURIComponent(idOrName)}`, {
       method: 'PUT',
       headers: getAuthHeaders(),
       cache: 'no-store',
@@ -953,7 +982,7 @@ export async function apiDeleteCity(
   idOrName: string
 ): Promise<{ ok: boolean; cities?: DeliveryCityConfig[]; error?: string }> {
   try {
-    const res = await fetch(`/api/cities/${encodeURIComponent(idOrName)}`, {
+    const res = await apiFetch(`/api/cities/${encodeURIComponent(idOrName)}`, {
       method: 'DELETE',
       headers: getAuthHeaders(),
       cache: 'no-store',
@@ -971,7 +1000,7 @@ export async function apiToggleOtherCities(
   allowOtherCities: boolean
 ): Promise<{ ok: boolean; cities?: DeliveryCityConfig[]; error?: string }> {
   try {
-    const res = await fetch('/api/cities/toggle-other-cities', {
+    const res = await apiFetch('/api/cities/toggle-other-cities', {
       method: 'PUT',
       headers: getAuthHeaders(),
       cache: 'no-store',
@@ -993,7 +1022,7 @@ export async function apiAddCityArea(
   deliveryCharge?: number | null
 ): Promise<{ ok: boolean; cities?: DeliveryCityConfig[]; error?: string }> {
   try {
-    const res = await fetch(`/api/cities/${encodeURIComponent(cityIdOrName)}/areas`, {
+    const res = await apiFetch(`/api/cities/${encodeURIComponent(cityIdOrName)}/areas`, {
       method: 'POST',
       headers: getAuthHeaders(),
       cache: 'no-store',
@@ -1013,7 +1042,7 @@ export async function apiUpdateCityArea(
   updates: { name?: string; allowed?: boolean; deliveryCharge?: number | null }
 ): Promise<{ ok: boolean; cities?: DeliveryCityConfig[]; error?: string }> {
   try {
-    const res = await fetch(`/api/areas/${encodeURIComponent(areaId)}`, {
+    const res = await apiFetch(`/api/areas/${encodeURIComponent(areaId)}`, {
       method: 'PUT',
       headers: getAuthHeaders(),
       cache: 'no-store',
@@ -1032,7 +1061,7 @@ export async function apiDeleteCityArea(
   areaId: string
 ): Promise<{ ok: boolean; cities?: DeliveryCityConfig[]; error?: string }> {
   try {
-    const res = await fetch(`/api/areas/${encodeURIComponent(areaId)}`, {
+    const res = await apiFetch(`/api/areas/${encodeURIComponent(areaId)}`, {
       method: 'DELETE',
       headers: getAuthHeaders(),
       cache: 'no-store',
@@ -1054,7 +1083,7 @@ export async function apiSubmitCheckoutOrder(payload: {
   resellerId?: string;
 }): Promise<{ ok: boolean; error?: string }> {
   try {
-    const res = await fetch('/api/orders/checkout', {
+    const res = await apiFetch('/api/orders/checkout', {
       method: 'POST',
       headers: getAuthHeaders(),
       cache: 'no-store',
@@ -1075,7 +1104,7 @@ export async function apiUpdateCODOrderStatus(
   details?: { courierPartner?: CODOrder['courierPartner']; trackingNumber?: string }
 ): Promise<{ ok: boolean; order?: CODOrder; error?: string }> {
   try {
-    const res = await fetch(`/api/orders/${encodeURIComponent(orderId)}/status`, {
+    const res = await apiFetch(`/api/orders/${encodeURIComponent(orderId)}/status`, {
       method: 'POST',
       headers: getAuthHeaders(),
       cache: 'no-store',
@@ -1106,7 +1135,7 @@ export async function apiAuditAndRepairOrders(): Promise<{
   error?: string;
 }> {
   try {
-    const res = await fetch('/api/orders/audit-repair', {
+    const res = await apiFetch('/api/orders/audit-repair', {
       method: 'POST',
       headers: getAuthHeaders(),
       cache: 'no-store',
@@ -1140,7 +1169,7 @@ export async function apiAuditAndRepairOrders(): Promise<{
 
 export async function apiCreateServerBackup(reason = 'manual'): Promise<{ ok: boolean; error?: string }> {
   try {
-    const res = await fetch('/api/admin/backup', {
+    const res = await apiFetch('/api/admin/backup', {
       method: 'POST',
       headers: getAuthHeaders(),
       cache: 'no-store',
@@ -1635,7 +1664,7 @@ export async function apiRegisterCustomer(payload: {
   error?: string;
 }> {
   try {
-    const res = await fetch('/api/auth/register-customer', {
+    const res = await apiFetch('/api/auth/register-customer', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-client-id': CLIENT_ID },
       cache: 'no-store',
@@ -1680,7 +1709,7 @@ export async function apiChangeOwnPassword(
   newPin: string
 ): Promise<{ ok: boolean; error?: string }> {
   try {
-    const res = await fetch('/api/auth/change-password', {
+    const res = await apiFetch('/api/auth/change-password', {
       method: 'POST',
       headers: getAuthHeaders(),
       cache: 'no-store',
@@ -1702,7 +1731,7 @@ export async function apiChangeMasterPin(
   newPin: string
 ): Promise<{ ok: boolean; error?: string }> {
   try {
-    const res = await fetch('/api/auth/change-master-pin', {
+    const res = await apiFetch('/api/auth/change-master-pin', {
       method: 'POST',
       headers: getAuthHeaders(),
       cache: 'no-store',
@@ -1724,7 +1753,7 @@ export async function apiAdminResetPassword(
   tempPin?: string
 ): Promise<{ ok: boolean; tempPin?: string; error?: string }> {
   try {
-    const res = await fetch(`/api/admin/users/${encodeURIComponent(userId)}/reset-password`, {
+    const res = await apiFetch(`/api/admin/users/${encodeURIComponent(userId)}/reset-password`, {
       method: 'POST',
       headers: getAuthHeaders(),
       cache: 'no-store',
@@ -1773,7 +1802,7 @@ export interface CRMStateBundle {
 
 export async function apiFetchCrmState(): Promise<{ ok: boolean; data?: CRMStateBundle; error?: string }> {
   try {
-    const res = await fetch('/api/crm/state', { headers: getAuthHeaders(), cache: 'no-store' });
+    const res = await apiFetch('/api/crm/state', { headers: getAuthHeaders(), cache: 'no-store' });
     const parsed = await safeParseJsonResponse<{ ok?: boolean; error?: string } & Partial<CRMStateBundle>>(res);
     if (!parsed.ok || !parsed.data?.ok) {
       return { ok: false, error: parsed.data?.error || parsed.error || 'Failed to load CRM state.' };
@@ -1796,7 +1825,7 @@ export async function apiFetchCrmDashboard(filters: {
     Object.entries(filters).forEach(([k, v]) => {
       if (v && v !== 'ALL') qs.set(k, v);
     });
-    const res = await fetch(`/api/crm/dashboard?${qs.toString()}`, { headers: getAuthHeaders(), cache: 'no-store' });
+    const res = await apiFetch(`/api/crm/dashboard?${qs.toString()}`, { headers: getAuthHeaders(), cache: 'no-store' });
     const parsed = await safeParseJsonResponse<{ ok?: boolean; kpis?: CRMDashboardKPIs; error?: string }>(res);
     if (!parsed.ok || !parsed.data?.ok) {
       return { ok: false, error: parsed.data?.error || parsed.error || 'Dashboard fetch failed.' };
@@ -1830,7 +1859,7 @@ export async function apiFetchCrmCustomers(params: {
     if (params.segment && params.segment !== 'ALL') qs.set('segment', params.segment);
     if (params.city && params.city !== 'ALL') qs.set('city', params.city);
     if (params.customerType && params.customerType !== 'ALL') qs.set('customerType', params.customerType);
-    const res = await fetch(`/api/crm/customers?${qs.toString()}`, { headers: getAuthHeaders(), cache: 'no-store' });
+    const res = await apiFetch(`/api/crm/customers?${qs.toString()}`, { headers: getAuthHeaders(), cache: 'no-store' });
     const parsed = await safeParseJsonResponse<{
       ok?: boolean;
       items?: Customer360Profile[];
@@ -1858,7 +1887,7 @@ export async function apiFetchCustomer360(
   customerId: string
 ): Promise<{ ok: boolean; profile360?: Customer360Profile; error?: string }> {
   try {
-    const res = await fetch(`/api/crm/customers/${encodeURIComponent(customerId)}/360`, {
+    const res = await apiFetch(`/api/crm/customers/${encodeURIComponent(customerId)}/360`, {
       headers: getAuthHeaders(),
       cache: 'no-store',
     });
@@ -1877,7 +1906,7 @@ export async function apiUpdateCrmCustomer(
   updates: Partial<Customer>
 ): Promise<{ ok: boolean; customer?: Customer; error?: string }> {
   try {
-    const res = await fetch(`/api/crm/customers/${encodeURIComponent(customerId)}`, {
+    const res = await apiFetch(`/api/crm/customers/${encodeURIComponent(customerId)}`, {
       method: 'PUT',
       headers: getAuthHeaders(),
       cache: 'no-store',
@@ -1898,7 +1927,7 @@ export async function apiSaveCrmCustomSegment(
   rule: Partial<CRMCustomSegmentRule> & { name: string }
 ): Promise<{ ok: boolean; rule?: CRMCustomSegmentRule; error?: string }> {
   try {
-    const res = await fetch('/api/crm/segments', {
+    const res = await apiFetch('/api/crm/segments', {
       method: 'POST',
       headers: getAuthHeaders(),
       cache: 'no-store',
@@ -1916,7 +1945,7 @@ export async function apiSaveCrmCustomSegment(
 
 export async function apiDeleteCrmCustomSegment(id: string): Promise<{ ok: boolean; error?: string }> {
   try {
-    const res = await fetch(`/api/crm/segments/${encodeURIComponent(id)}`, {
+    const res = await apiFetch(`/api/crm/segments/${encodeURIComponent(id)}`, {
       method: 'DELETE',
       headers: getAuthHeaders(),
       cache: 'no-store',
@@ -1936,7 +1965,7 @@ export async function apiSaveCrmTask(
 ): Promise<{ ok: boolean; task?: CRMFollowUpTask; error?: string }> {
   try {
     const isUpdate = Boolean(task.id);
-    const res = await fetch(isUpdate ? `/api/crm/tasks/${encodeURIComponent(task.id!)}` : '/api/crm/tasks', {
+    const res = await apiFetch(isUpdate ? `/api/crm/tasks/${encodeURIComponent(task.id!)}` : '/api/crm/tasks', {
       method: isUpdate ? 'PUT' : 'POST',
       headers: getAuthHeaders(),
       cache: 'no-store',
@@ -1954,7 +1983,7 @@ export async function apiSaveCrmTask(
 
 export async function apiDeleteCrmTask(id: string): Promise<{ ok: boolean; error?: string }> {
   try {
-    const res = await fetch(`/api/crm/tasks/${encodeURIComponent(id)}`, {
+    const res = await apiFetch(`/api/crm/tasks/${encodeURIComponent(id)}`, {
       method: 'DELETE',
       headers: getAuthHeaders(),
       cache: 'no-store',
@@ -1974,7 +2003,7 @@ export async function apiSaveCrmLead(
 ): Promise<{ ok: boolean; lead?: CRMLead; error?: string }> {
   try {
     const isUpdate = Boolean(lead.id);
-    const res = await fetch(isUpdate ? `/api/crm/leads/${encodeURIComponent(lead.id!)}` : '/api/crm/leads', {
+    const res = await apiFetch(isUpdate ? `/api/crm/leads/${encodeURIComponent(lead.id!)}` : '/api/crm/leads', {
       method: isUpdate ? 'PUT' : 'POST',
       headers: getAuthHeaders(),
       cache: 'no-store',
@@ -2006,7 +2035,7 @@ export async function apiBulkImportCrmLeads(payload: {
   error?: string;
 }> {
   try {
-    const res = await fetch('/api/crm/leads/bulk-import', {
+    const res = await apiFetch('/api/crm/leads/bulk-import', {
       method: 'POST',
       headers: getAuthHeaders(),
       cache: 'no-store',
@@ -2041,7 +2070,7 @@ export async function apiConvertCrmLead(
   leadId: string
 ): Promise<{ ok: boolean; customer?: Customer; reusedExisting?: boolean; lead?: CRMLead; error?: string }> {
   try {
-    const res = await fetch(`/api/crm/leads/${encodeURIComponent(leadId)}/convert`, {
+    const res = await apiFetch(`/api/crm/leads/${encodeURIComponent(leadId)}/convert`, {
       method: 'POST',
       headers: getAuthHeaders(),
       cache: 'no-store',
@@ -2074,7 +2103,7 @@ export async function apiSaveCrmCampaign(
 ): Promise<{ ok: boolean; campaign?: CRMCampaign; error?: string }> {
   try {
     const isUpdate = Boolean(campaign.id);
-    const res = await fetch(isUpdate ? `/api/crm/campaigns/${encodeURIComponent(campaign.id!)}` : '/api/crm/campaigns', {
+    const res = await apiFetch(isUpdate ? `/api/crm/campaigns/${encodeURIComponent(campaign.id!)}` : '/api/crm/campaigns', {
       method: isUpdate ? 'PUT' : 'POST',
       headers: getAuthHeaders(),
       cache: 'no-store',
@@ -2094,7 +2123,7 @@ export async function apiSaveCrmLoyaltyConfig(
   config: CRMLoyaltyConfig
 ): Promise<{ ok: boolean; config?: CRMLoyaltyConfig; error?: string }> {
   try {
-    const res = await fetch('/api/crm/loyalty', {
+    const res = await apiFetch('/api/crm/loyalty', {
       method: 'PUT',
       headers: getAuthHeaders(),
       cache: 'no-store',
@@ -2116,7 +2145,7 @@ export async function apiRedeemLoyaltyPoints(payload: {
   notes?: string;
 }): Promise<{ ok: boolean; coupon?: CRMLoyaltyCoupon; account?: CRMLoyaltyAccount; error?: string }> {
   try {
-    const res = await fetch('/api/crm/loyalty/redeem', {
+    const res = await apiFetch('/api/crm/loyalty/redeem', {
       method: 'POST',
       headers: getAuthHeaders(),
       cache: 'no-store',
@@ -2141,7 +2170,7 @@ export async function apiSaveCrmCoupon(
   coupon: Partial<CRMLoyaltyCoupon>
 ): Promise<{ ok: boolean; coupon?: CRMLoyaltyCoupon; error?: string }> {
   try {
-    const res = await fetch('/api/crm/coupons', {
+    const res = await apiFetch('/api/crm/coupons', {
       method: 'POST',
       headers: getAuthHeaders(),
       cache: 'no-store',
@@ -2163,7 +2192,7 @@ export async function apiFetchCrmTickets(): Promise<{
   error?: string;
 }> {
   try {
-    const res = await fetch('/api/crm/tickets', {
+    const res = await apiFetch('/api/crm/tickets', {
       method: 'GET',
       headers: getAuthHeaders(),
       cache: 'no-store',
@@ -2187,7 +2216,7 @@ export async function apiSaveCrmTicket(
 ): Promise<{ ok: boolean; ticket?: CRMSupportTicket; tickets?: CRMSupportTicket[]; error?: string }> {
   try {
     const isUpdate = Boolean(ticket.id);
-    const res = await fetch(isUpdate ? `/api/crm/tickets/${encodeURIComponent(ticket.id!)}` : '/api/crm/tickets', {
+    const res = await apiFetch(isUpdate ? `/api/crm/tickets/${encodeURIComponent(ticket.id!)}` : '/api/crm/tickets', {
       method: isUpdate ? 'PUT' : 'POST',
       headers: getAuthHeaders(),
       cache: 'no-store',
@@ -2212,7 +2241,7 @@ export async function apiSaveCrmAutomationRule(
   rule: Partial<CRMAutomationRule> & { id: string }
 ): Promise<{ ok: boolean; rule?: CRMAutomationRule; error?: string }> {
   try {
-    const res = await fetch(`/api/crm/automation/rules/${encodeURIComponent(rule.id)}`, {
+    const res = await apiFetch(`/api/crm/automation/rules/${encodeURIComponent(rule.id)}`, {
       method: 'PUT',
       headers: getAuthHeaders(),
       cache: 'no-store',
@@ -2252,7 +2281,7 @@ export async function apiRunCrmAutomation(
   error?: string;
 }> {
   try {
-    const res = await fetch('/api/crm/automation/run', {
+    const res = await apiFetch('/api/crm/automation/run', {
       method: 'POST',
       headers: getAuthHeaders(),
       cache: 'no-store',
@@ -2301,7 +2330,7 @@ export async function apiLogCrmActivity(event: {
   amount?: number;
 }): Promise<void> {
   try {
-    await fetch('/api/crm/activity', {
+    await apiFetch('/api/crm/activity', {
       method: 'POST',
       headers: getAuthHeaders(),
       cache: 'no-store',
@@ -2330,7 +2359,7 @@ export async function apiFetchCrmReport(
     const qs = new URLSearchParams();
     if (params.dateFrom) qs.set('dateFrom', params.dateFrom);
     if (params.dateTo) qs.set('dateTo', params.dateTo);
-    const res = await fetch(`/api/crm/reports/${encodeURIComponent(reportKey)}?${qs.toString()}`, {
+    const res = await apiFetch(`/api/crm/reports/${encodeURIComponent(reportKey)}?${qs.toString()}`, {
       headers: getAuthHeaders(),
       cache: 'no-store',
     });
@@ -2369,7 +2398,7 @@ export async function downloadCrmReportFile(
     const qs = new URLSearchParams({ format });
     if (params.dateFrom) qs.set('dateFrom', params.dateFrom);
     if (params.dateTo) qs.set('dateTo', params.dateTo);
-    const res = await fetch(`/api/crm/reports/${encodeURIComponent(reportKey)}?${qs.toString()}`, {
+    const res = await apiFetch(`/api/crm/reports/${encodeURIComponent(reportKey)}?${qs.toString()}`, {
       headers: getAuthHeaders(),
       cache: 'no-store',
     });
@@ -2823,7 +2852,7 @@ export async function apiFetchInvestorOfferings(): Promise<{
   error?: string;
 }> {
   try {
-    const res = await fetch('/api/investor-offerings', { headers: getAuthHeaders(), cache: 'no-store' });
+    const res = await apiFetch('/api/investor-offerings', { headers: getAuthHeaders(), cache: 'no-store' });
     const parsed = await safeParseJsonResponse<{
       ok?: boolean;
       offerings?: InvestorProductOffering[];
@@ -2854,7 +2883,7 @@ export async function apiSaveInvestorOffering(
     const endpoint = existingId
       ? `/api/investor-offerings/${encodeURIComponent(existingId)}`
       : '/api/investor-offerings';
-    const res = await fetch(endpoint, {
+    const res = await apiFetch(endpoint, {
       method: existingId ? 'PUT' : 'POST',
       headers: getAuthHeaders(),
       cache: 'no-store',
@@ -2878,7 +2907,7 @@ export async function apiSaveInvestorOffering(
 
 export async function apiDeleteInvestorOffering(id: string): Promise<{ ok: boolean; error?: string }> {
   try {
-    const res = await fetch(`/api/investor-offerings/${encodeURIComponent(id)}`, {
+    const res = await apiFetch(`/api/investor-offerings/${encodeURIComponent(id)}`, {
       method: 'DELETE',
       headers: getAuthHeaders(),
       cache: 'no-store',
@@ -2901,7 +2930,7 @@ export async function apiCreateInvestorRequest(payload: {
   investorId?: string;
 }): Promise<{ ok: boolean; request?: InvestorProductRequest; error?: string }> {
   try {
-    const res = await fetch('/api/investor-requests', {
+    const res = await apiFetch('/api/investor-requests', {
       method: 'POST',
       headers: getAuthHeaders(),
       cache: 'no-store',
@@ -2928,7 +2957,7 @@ export async function apiReviewInvestorRequest(
   rejectionReason?: string
 ): Promise<{ ok: boolean; request?: InvestorProductRequest; error?: string }> {
   try {
-    const res = await fetch(`/api/investor-requests/${encodeURIComponent(requestId)}/review`, {
+    const res = await apiFetch(`/api/investor-requests/${encodeURIComponent(requestId)}/review`, {
       method: 'POST',
       headers: getAuthHeaders(),
       cache: 'no-store',

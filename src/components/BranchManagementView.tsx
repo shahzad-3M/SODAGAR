@@ -26,7 +26,7 @@ import {
   Briefcase,
   Store,
 } from 'lucide-react';
-import {
+import type {
   Branch,
   UserAccount,
   SalespersonReferral,

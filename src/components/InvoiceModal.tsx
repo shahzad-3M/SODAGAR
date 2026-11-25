@@ -1,6 +1,6 @@
 import React from 'react';
 import { X, Printer, Share2 } from 'lucide-react';
-import { BusinessProfile, Customer, Transaction } from '../types/index.ts';
+import type { BusinessProfile, Customer, Transaction } from '../types/index.ts';
 import { generateWhatsAppLink, formatPaymentChannelsText } from '../utils/whatsapp.ts';
 
 interface InvoiceModalProps {

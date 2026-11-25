@@ -28,7 +28,7 @@ import {
   Check,
   Ruler,
 } from 'lucide-react';
-import { ProductItem, ProductVariation, ProductImportLog, CategoryRecord, ProductSizeChart } from '../types/index.ts';
+import type { ProductItem, ProductVariation, ProductImportLog, CategoryRecord, ProductSizeChart } from '../types/index.ts';
 import {
   getCategories,
   addCategory,

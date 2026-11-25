@@ -29,7 +29,7 @@ import {
   Truck,
   Lock,
 } from 'lucide-react';
-import { AppUser, BusinessProfile, CartItem, CategoryRecord, Customer, DeliverySpeedCategory, Investor, ProductItem } from '../types/index.ts';
+import type { AppUser, BusinessProfile, CartItem, CategoryRecord, Customer, DeliverySpeedCategory, Investor, ProductItem } from '../types/index.ts';
 import { ProductDetailsModal } from './ProductDetailsModal.tsx';
 import {
   buildDirectProductWhatsAppMessage,

@@ -1,4 +1,4 @@
-import { CategoryRecord, DeliveryAreaConfig, DeliveryCityConfig, ProductItem } from '../types';
+import type { CategoryRecord, DeliveryAreaConfig, DeliveryCityConfig, ProductItem } from '../types/index.ts';
 
 export const UPCOMING_CATEGORY_ID = 'cat_upcoming';
 export const UPCOMING_CATEGORY_NAME = 'Upcoming Viral Products | Coming Soon';

@@ -21,7 +21,7 @@ import {
   Users,
   Download,
 } from 'lucide-react';
-import {
+import type {
   AgeGroupType,
   BroadcastContact,
   BusinessProfile,

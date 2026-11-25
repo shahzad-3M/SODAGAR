@@ -24,7 +24,7 @@ import {
   Wallet,
   X,
 } from 'lucide-react';
-import {
+import type {
   BusinessProfile,
   CODOrder,
   CODOrderStatus,

@@ -17,7 +17,7 @@ import {
   Check,
   Search,
 } from 'lucide-react';
-import { CategoryRecord, ProductItem } from '../types/index.ts';
+import type { CategoryRecord, ProductItem } from '../types/index.ts';
 import {
   apiDeleteCategoryRecord,
   apiSaveCategoryRecord,

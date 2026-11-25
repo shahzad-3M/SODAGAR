@@ -18,7 +18,7 @@ import {
   ChevronLeft,
   ChevronRight,
 } from 'lucide-react';
-import { BusinessProfile, Customer, Transaction } from '../types/index.ts';
+import type { BusinessProfile, Customer, Transaction } from '../types/index.ts';
 import { defaultDeliveryCities } from '../utils/defaultData.ts';
 import { AddressFieldsGroup } from './AddressFieldsGroup.tsx';
 import { openWhatsAppDirect, formatPaymentChannelsText } from '../utils/whatsapp.ts';

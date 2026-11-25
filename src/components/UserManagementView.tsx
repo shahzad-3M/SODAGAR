@@ -24,7 +24,7 @@ import {
   Sparkles,
   Edit3,
 } from 'lucide-react';
-import { CRMPermissions, CRMRoleSpecialization, LoginFormConfig, LoginAuditRecord, UserAccount, UserRole } from '../types/index.ts';
+import type { CRMPermissions, CRMRoleSpecialization, LoginFormConfig, LoginAuditRecord, UserAccount, UserRole } from '../types/index.ts';
 import {
   createUserAccount,
   getLoginAudits,

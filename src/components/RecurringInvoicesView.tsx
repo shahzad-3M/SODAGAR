@@ -11,7 +11,7 @@ import {
   Pause,
   FileText,
 } from 'lucide-react';
-import { BusinessProfile, Customer, RecurringInvoice, Transaction } from '../types/index.ts';
+import type { BusinessProfile, Customer, RecurringInvoice, Transaction } from '../types/index.ts';
 
 interface RecurringInvoicesViewProps {
   recurringInvoices: RecurringInvoice[];

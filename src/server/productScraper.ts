@@ -2,8 +2,8 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
-import { CategoryRecord, ProductItem, ProductSizeChart, ProductSizeChartRow, ProductVariation } from '../types';
-import { normalizeTextKey, UPCOMING_CATEGORY_ID } from '../utils/locationCategoryHelpers';
+import type { CategoryRecord, ProductItem, ProductSizeChart, ProductSizeChartRow, ProductVariation } from '../types/index.ts';
+import { normalizeTextKey, UPCOMING_CATEGORY_ID } from '../utils/locationCategoryHelpers.ts';
 
 export const IMPORTED_MEDIA_DIR = path.resolve(process.cwd(), 'data', 'imported-media');
 fs.mkdirSync(IMPORTED_MEDIA_DIR, { recursive: true });

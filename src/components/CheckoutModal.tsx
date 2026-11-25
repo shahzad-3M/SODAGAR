@@ -20,7 +20,7 @@ import {
   Trash2,
   Minus,
 } from 'lucide-react';
-import { AppUser, BusinessProfile, CartItem, Customer, DeliveryCityConfig, PaymentMode, SalePaymentType } from '../types/index.ts';
+import type { AppUser, BusinessProfile, CartItem, Customer, DeliveryCityConfig, PaymentMode, SalePaymentType } from '../types/index.ts';
 import { defaultDeliveryCities } from '../utils/defaultData.ts';
 import {
   DEFAULT_CITY_CENTER_DELIVERY_CHARGE,

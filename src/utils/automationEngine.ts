@@ -1,4 +1,4 @@
-import {
+import type {
   BroadcastContact,
   BusinessProfile,
   Customer,
@@ -11,8 +11,8 @@ import {
   TopBuyer,
   Transaction,
   WhatsAppNotification,
-} from '../types';
-import { formatPaymentChannelsText, formatTemplateMessage } from './whatsapp';
+} from '../types/index.ts';
+import { formatPaymentChannelsText, formatTemplateMessage } from './whatsapp.ts';
 
 export interface AutomationResult {
   generatedInvoicesCount: number;

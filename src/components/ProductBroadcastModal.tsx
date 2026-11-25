@@ -12,7 +12,7 @@ import {
   MapPin,
   BookmarkPlus,
 } from 'lucide-react';
-import {
+import type {
   BroadcastContact,
   BusinessProfile,
   Customer,

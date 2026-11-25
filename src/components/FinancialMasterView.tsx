@@ -24,7 +24,7 @@ import {
   Save,
   Layers,
 } from 'lucide-react';
-import {
+import type {
   AppUser,
   AttendanceRecord,
   BusinessProfile,

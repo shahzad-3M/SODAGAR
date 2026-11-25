@@ -23,7 +23,7 @@ import {
   ArrowRight,
   ShieldAlert,
 } from 'lucide-react';
-import {
+import type {
   ProductItem,
   ProductVariation,
   WalkInSale,

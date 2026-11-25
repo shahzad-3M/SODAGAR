@@ -28,7 +28,7 @@ import {
   Image as ImageIcon,
   Upload,
 } from 'lucide-react';
-import { AppUser, BusinessProfile, CategoryRecord, DeliverySpeedCategory, Investor, ProductDeliveryFeeType, ProductItem, ProductVariation } from '../types/index.ts';
+import type { AppUser, BusinessProfile, CategoryRecord, DeliverySpeedCategory, Investor, ProductDeliveryFeeType, ProductItem, ProductVariation } from '../types/index.ts';
 import {
   getCategories,
   addCategory,

@@ -34,7 +34,7 @@ import {
   HeartHandshake,
   LifeBuoy,
 } from 'lucide-react';
-import { AppUser, BusinessProfile, CategoryRecord, ProductItem, UserRole } from '../types/index.ts';
+import type { AppUser, BusinessProfile, CategoryRecord, ProductItem, UserRole } from '../types/index.ts';
 import { openWhatsAppDirect } from '../utils/whatsapp.ts';
 import {
   doesProductMatchCategoryFilter,

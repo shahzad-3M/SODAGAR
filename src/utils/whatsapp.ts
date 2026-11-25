@@ -1,4 +1,4 @@
-import {
+import type {
   BusinessProfile,
   Customer,
   Investor,
@@ -9,7 +9,7 @@ import {
   ProductItem,
   ReminderTemplate,
   Transaction,
-} from '../types';
+} from '../types/index.ts';
 
 export function cleanPhoneNumber(rawPhone: string): string {
   // Strip non-digits

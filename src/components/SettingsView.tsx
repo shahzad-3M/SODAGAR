@@ -34,7 +34,7 @@ import {
   ChevronRight,
   Database,
 } from 'lucide-react';
-import { BusinessProfile, Customer, DeliveryCityConfig, LoginAuditRecord, Reseller } from '../types/index.ts';
+import type { BusinessProfile, Customer, DeliveryCityConfig, LoginAuditRecord, Reseller } from '../types/index.ts';
 import { defaultDeliveryCities } from '../utils/defaultData.ts';
 import {
   exportAllDataJSON,

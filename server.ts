@@ -157,7 +157,10 @@ const envPort =
   process.env.PORT && process.env.PORT !== process.env.NGINX_PORT
     ? process.env.PORT
     : undefined;
-const PORT = Number(cliPort || envPort || process.env.DEFAULT_APP_PORT || 3000);
+const rawPort = (cliPort || envPort || process.env.DEFAULT_APP_PORT || '3000').trim();
+const numericPort = Number(rawPort);
+const isNamedSocket = !Number.isFinite(numericPort) || numericPort <= 0;
+const PORT: number | string = isNamedSocket ? rawPort : numericPort;
 const HOST = readCliArg('--host') || process.env.npm_config_host || process.env.HOST || '0.0.0.0';
 function getSessionSecret(): string {
   return process.env.SESSION_SECRET?.trim() || getCachedServerSessionSecret();
@@ -462,8 +465,50 @@ async function startServer() {
   // Serve downloaded & verified imported product images cleanly from local server storage
   app.use('/api/media/imported', express.static(IMPORTED_MEDIA_DIR, { maxAge: '30d' }));
 
-  // Disable caching on all JSON API routes so all devices always see fresh state
+  // Allow safe cross-origin API requests from primary domain, subdomain, and Vercel previews
+  const extraCorsOrigins = new Set(
+    (process.env.CORS_ALLOWED_ORIGINS || '')
+      .split(',')
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean)
+  );
+  const isAllowedCorsOrigin = (originHeader?: string): boolean => {
+    if (!originHeader) return false;
+    try {
+      const parsed = new URL(originHeader);
+      const hostname = parsed.hostname.toLowerCase();
+      if (
+        hostname === 'madinamarket.pk' ||
+        hostname === 'www.madinamarket.pk' ||
+        hostname === 'app.madinamarket.pk' ||
+        hostname.endsWith('.madinamarket.pk') ||
+        hostname.endsWith('.vercel.app') ||
+        hostname === 'localhost' ||
+        hostname === '127.0.0.1'
+      ) {
+        return true;
+      }
+      return extraCorsOrigins.has(originHeader.toLowerCase());
+    } catch {
+      return false;
+    }
+  };
+
   app.use('/api', (req, res, next) => {
+    const reqOrigin = req.header('origin');
+    if (reqOrigin && isAllowedCorsOrigin(reqOrigin)) {
+      res.setHeader('Access-Control-Allow-Origin', reqOrigin);
+      res.setHeader('Vary', 'Origin');
+      res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+      res.setHeader(
+        'Access-Control-Allow-Headers',
+        'Content-Type, Authorization, Accept, x-session-token, x-client-id'
+      );
+      if (req.method === 'OPTIONS') {
+        res.status(204).end();
+        return;
+      }
+    }
     if (req.path.startsWith('/media/imported')) {
       next();
       return;
@@ -5296,13 +5341,27 @@ async function startServer() {
     path.resolve(process.cwd(), 'dist'),
     path.resolve(serverDir, 'dist'),
   ];
-  const distDir =
+  let distDir =
     distDirCandidates.find((dir) => fs.existsSync(path.join(dir, 'index.html'))) || distDirCandidates[0];
-  const hasBuiltDist = fs.existsSync(path.join(distDir, 'index.html'));
+  let hasBuiltDist = fs.existsSync(path.join(distDir, 'index.html'));
   const isProduction =
     process.env.NODE_ENV === 'production' ||
     Boolean(process.env.K_SERVICE) ||
     (process.env.NODE_ENV !== 'development' && hasBuiltDist);
+
+  // If deployed in production via Git without pre-built dist/, build Vite dist automatically once before serving
+  if (isProduction && !hasBuiltDist) {
+    try {
+      console.log('[Build] dist/index.html not found in production; building Vite bundle automatically...');
+      const { build: viteBuild } = await import('vite');
+      await viteBuild();
+      distDir =
+        distDirCandidates.find((dir) => fs.existsSync(path.join(dir, 'index.html'))) || distDirCandidates[0];
+      hasBuiltDist = fs.existsSync(path.join(distDir, 'index.html'));
+    } catch (buildErr) {
+      console.error('[Build] Automatic production Vite build failed:', buildErr);
+    }
+  }
 
   // Frontend middleware / static dist serving
   if (!isProduction || !hasBuiltDist) {
@@ -5334,17 +5393,36 @@ async function startServer() {
         },
       })
     );
+    // Never return index.html for missing JS/CSS/media assets (prevents browser MIME-type crashes)
+    app.use((req, res, next) => {
+      if (
+        req.path.startsWith('/assets/') ||
+        /\.(?:js|mjs|css|map|png|jpe?g|webp|gif|svg|ico|woff2?|ttf|eot|json)$/i.test(req.path)
+      ) {
+        res.status(404).type('text/plain').send('Asset not found.');
+        return;
+      }
+      next();
+    });
     app.get('*', (_req, res) => {
       res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
       res.sendFile(path.join(distDir, 'index.html'));
     });
   }
 
-  httpServer.listen(PORT, HOST, () => {
-    console.log(
-      `100DAGAR Full-Stack Server running on http://${HOST}:${PORT} (${isProduction && hasBuiltDist ? 'production-dist' : 'vite-dev'})`
-    );
-  });
+  if (typeof PORT === 'string') {
+    httpServer.listen(PORT, () => {
+      console.log(
+        `100DAGAR Full-Stack Server running on socket ${PORT} (${isProduction && hasBuiltDist ? 'production-dist' : 'vite-dev'})`
+      );
+    });
+  } else {
+    httpServer.listen(PORT, HOST, () => {
+      console.log(
+        `100DAGAR Full-Stack Server running on http://${HOST}:${PORT} (${isProduction && hasBuiltDist ? 'production-dist' : 'vite-dev'})`
+      );
+    });
+  }
 
   const shutdown = () => {
     for (const client of sseClients) {

@@ -21,7 +21,7 @@ import {
   Check,
   ExternalLink,
 } from 'lucide-react';
-import {
+import type {
   BusinessProfile,
   Customer,
   LuckyDrawEvent,

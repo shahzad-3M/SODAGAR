@@ -24,7 +24,7 @@ import {
   PlusCircle,
   Ruler,
 } from 'lucide-react';
-import { AppUser, BusinessProfile, Customer, Investor, ProductItem } from '../types/index.ts';
+import type { AppUser, BusinessProfile, Customer, Investor, ProductItem } from '../types/index.ts';
 import { ProductSpecSizingShowcase } from './ProductSpecSizingShowcase.tsx';
 import {
   buildAddMyProductInvestorMessage,

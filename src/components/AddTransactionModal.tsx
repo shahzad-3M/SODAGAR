@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { X, Plus, Trash2, ArrowUpRight, ArrowDownLeft, Send } from 'lucide-react';
-import { BusinessProfile, Customer, PaymentMode, Transaction, TransactionType } from '../types/index.ts';
+import type { BusinessProfile, Customer, PaymentMode, Transaction, TransactionType } from '../types/index.ts';
 
 interface AddTransactionModalProps {
   isOpen: boolean;

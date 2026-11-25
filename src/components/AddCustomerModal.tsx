@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { X, UserPlus, Phone } from 'lucide-react';
-import { BusinessProfile, Customer, CustomerType } from '../types/index.ts';
+import type { BusinessProfile, Customer, CustomerType } from '../types/index.ts';
 import { defaultDeliveryCities } from '../utils/defaultData.ts';
 import { AddressFieldsGroup } from './AddressFieldsGroup.tsx';
 

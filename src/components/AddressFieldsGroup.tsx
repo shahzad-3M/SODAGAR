@@ -1,6 +1,6 @@
 import React, { useMemo, useState } from 'react';
 import { MapPin, Navigation, Home, Building2, Lock, Zap, CheckCircle2, Globe2 } from 'lucide-react';
-import { DeliveryCityConfig } from '../types/index.ts';
+import type { DeliveryCityConfig } from '../types/index.ts';
 import {
   getOrderedProvincesFromCities,
   inferProvinceForCity,

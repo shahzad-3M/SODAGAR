@@ -19,7 +19,7 @@ import {
   X,
   PackagePlus,
 } from 'lucide-react';
-import {
+import type {
   AppUser,
   BusinessProfile,
   Customer,

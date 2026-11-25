@@ -1,4 +1,4 @@
-import {
+import type {
   AttendanceRecord,
   Branch,
   BroadcastContact,
@@ -30,7 +30,7 @@ import {
   WalkInSale,
   WasalSettlement,
   WhatsAppNotification,
-} from '../types';
+} from '../types/index.ts';
 
 export const defaultDeliveryCities: DeliveryCityConfig[] = [
   // ==========================================

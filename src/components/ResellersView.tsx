@@ -15,7 +15,7 @@ import {
   Search,
   Pencil,
 } from 'lucide-react';
-import { BusinessProfile, Reseller } from '../types/index.ts';
+import type { BusinessProfile, Reseller } from '../types/index.ts';
 import { buildCurrentOriginUrl, openWhatsAppDirect } from '../utils/whatsapp.ts';
 import {
   ToastBanner,

@@ -484,7 +484,7 @@ async function ensureMysqlSchemaAndMigrations(db: MysqlDbAdapter): Promise<void>
       created_at VARCHAR(40) NOT NULL,
       updated_at VARCHAR(40) NOT NULL,
       data_json LONGTEXT NOT NULL,
-      INDEX idx_products_category (category),
+      INDEX idx_products_category (category(191)),
       INDEX idx_products_parent_cat (parent_category_id),
       INDEX idx_products_sku (sku)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
@@ -586,7 +586,7 @@ async function ensureMysqlSchemaAndMigrations(db: MysqlDbAdapter): Promise<void>
       coupon_code VARCHAR(128),
       notes TEXT,
       created_at VARCHAR(40) NOT NULL,
-      INDEX idx_crm_loyalty_ledger_cust (customer_id, created_at)
+      INDEX idx_crm_loyalty_ledger_cust (customer_id(128), created_at)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
     `CREATE TABLE IF NOT EXISTS crm_coupons (
       id VARCHAR(191) PRIMARY KEY,
@@ -636,7 +636,7 @@ async function ensureMysqlSchemaAndMigrations(db: MysqlDbAdapter): Promise<void>
       order_number VARCHAR(128),
       created_at VARCHAR(40) NOT NULL,
       data_json LONGTEXT NOT NULL,
-      INDEX idx_crm_activity_cust (customer_id, created_at)
+      INDEX idx_crm_activity_cust (customer_id(128), created_at)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
   ];
 
