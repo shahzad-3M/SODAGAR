@@ -34,7 +34,7 @@ import {
   WasalSettlement,
 } from '../types/index.ts';
 import { openWhatsAppDirect } from '../utils/whatsapp.ts';
-import { getWasalSettlements, saveWasalSettlements } from '../utils/storage.ts';
+import { apiDeleteCollectionItem, getWasalSettlements, saveWasalSettlements } from '../utils/storage.ts';
 import { defaultDeliveryCities } from '../utils/defaultData.ts';
 import {
   DEFAULT_CITY_CENTER_DELIVERY_CHARGE,
@@ -244,6 +244,7 @@ export const CODOrdersView: React.FC<CODOrdersViewProps> = ({
     const updated = wasalSettlements.filter((s) => s.id !== id);
     setWasalSettlements(updated);
     saveWasalSettlements(updated);
+    void apiDeleteCollectionItem('wasal_settlements', id);
     setFeedbackNotice('WASAL settlement entry removed.');
   };
 

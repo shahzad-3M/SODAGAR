@@ -12,6 +12,7 @@ export interface ParsedLeadDraft {
   interestedProductName?: string;
   estimatedValue: number;
   followUpDate?: string;
+  createdAt?: string;
   notes?: string;
   email?: string;
   whatsapp?: string;
@@ -106,19 +107,73 @@ function parseNumberCell(raw: unknown): number {
   return Number.isFinite(n) && n > 0 ? Math.round(n) : 0;
 }
 
-function parseDateCell(raw: unknown): string | undefined {
-  if (raw === null || raw === undefined || raw === '') return undefined;
-  if (raw instanceof Date && !Number.isNaN(raw.getTime())) {
-    return raw.toISOString().split('T')[0];
+function isValidCalendarDateParts(year: number, month: number, day: number): boolean {
+  if (!Number.isInteger(year) || !Number.isInteger(month) || !Number.isInteger(day)) return false;
+  if (year < 1970 || year > 2100 || month < 1 || month > 12 || day < 1 || day > 31) return false;
+  const d = new Date(Date.UTC(year, month - 1, day));
+  return d.getUTCFullYear() === year && d.getUTCMonth() === month - 1 && d.getUTCDate() === day;
+}
+
+function parseDateCellStrict(
+  raw: unknown,
+  mode: 'dateOnly' | 'datetime' = 'dateOnly'
+): { value?: string; invalidRaw?: string } {
+  if (raw === null || raw === undefined || raw === '') return {};
+  if (raw instanceof Date) {
+    if (Number.isNaN(raw.getTime())) {
+      return { invalidRaw: 'Invalid Date' };
+    }
+    const iso = raw.toISOString();
+    return { value: mode === 'dateOnly' ? iso.slice(0, 10) : iso };
   }
   const str = String(raw).trim();
-  if (!str) return undefined;
-  if (/^\d{4}-\d{2}-\d{2}/.test(str)) return str.slice(0, 10);
-  const parsed = new Date(str);
-  if (!Number.isNaN(parsed.getTime())) {
-    return parsed.toISOString().split('T')[0];
+  if (!str) return {};
+
+  // Strict ISO YYYY-MM-DD
+  const ymdOnly = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(str);
+  if (ymdOnly) {
+    const year = Number(ymdOnly[1]);
+    const month = Number(ymdOnly[2]);
+    const day = Number(ymdOnly[3]);
+    if (!isValidCalendarDateParts(year, month, day)) {
+      return { invalidRaw: str };
+    }
+    const mm = String(month).padStart(2, '0');
+    const dd = String(day).padStart(2, '0');
+    return { value: `${year}-${mm}-${dd}` };
   }
-  return undefined;
+
+  // Strict DD/MM/YYYY or DD-MM-YYYY
+  const dmy = /^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$/.exec(str);
+  if (dmy) {
+    const day = Number(dmy[1]);
+    const month = Number(dmy[2]);
+    const year = Number(dmy[3]);
+    if (!isValidCalendarDateParts(year, month, day)) {
+      return { invalidRaw: str };
+    }
+    const mm = String(month).padStart(2, '0');
+    const dd = String(day).padStart(2, '0');
+    return { value: `${year}-${mm}-${dd}` };
+  }
+
+  // Full ISO datetime / timestamp with calendar verification
+  const isoPrefix = /^(\d{4})-(\d{2})-(\d{2})(?:[T\s].*)?$/.exec(str);
+  if (isoPrefix) {
+    const year = Number(isoPrefix[1]);
+    const month = Number(isoPrefix[2]);
+    const day = Number(isoPrefix[3]);
+    if (!isValidCalendarDateParts(year, month, day)) {
+      return { invalidRaw: str };
+    }
+  }
+
+  const parsed = new Date(str);
+  if (Number.isNaN(parsed.getTime())) {
+    return { invalidRaw: str };
+  }
+  const iso = parsed.toISOString();
+  return { value: mode === 'dateOnly' ? iso.slice(0, 10) : iso };
 }
 
 function looksLikePhone(val: string): boolean {
@@ -142,6 +197,7 @@ type CanonicalLeadField =
   | 'interestedProductName'
   | 'estimatedValue'
   | 'followUpDate'
+  | 'createdAt'
   | 'notes'
   | 'stage';
 
@@ -155,6 +211,7 @@ const HEADER_ALIASES: Record<CanonicalLeadField, string[]> = {
   interestedProductName: ['product', 'interestedproduct', 'interestedproductname', 'item', 'productname', 'interest', 'category'],
   estimatedValue: ['estimatedvalue', 'estvalue', 'value', 'amount', 'price', 'budget', 'pkr', 'total'],
   followUpDate: ['followupdate', 'followup', 'nextfollowup', 'callbackdate', 'date'],
+  createdAt: ['createdat', 'createddate', 'leadcreatedat', 'entrydate', 'dateadded'],
   notes: ['notes', 'note', 'remarks', 'remark', 'comment', 'comments', 'details', 'description', 'message'],
   stage: ['stage', 'status', 'leadstage', 'pipeline'],
 };
@@ -411,7 +468,10 @@ export function matrixToLeadDrafts(
       ? String(mapped.interestedProductName).trim()
       : undefined;
     const estimatedValue = parseNumberCell(mapped.estimatedValue);
-    const followUpDate = parseDateCell(mapped.followUpDate);
+    const followUpParsed = parseDateCellStrict(mapped.followUpDate, 'dateOnly');
+    const createdAtParsed = parseDateCellStrict(mapped.createdAt, 'datetime');
+    const followUpDate = followUpParsed.value;
+    const createdAt = createdAtParsed.value;
     const notes = mapped.notes ? String(mapped.notes).trim() : undefined;
 
     let isValid = true;
@@ -422,6 +482,12 @@ export function matrixToLeadDrafts(
     } else if (normalizedPhone.length < 7) {
       isValid = false;
       errorReason = 'Missing or invalid phone number';
+    } else if (followUpParsed.invalidRaw) {
+      isValid = false;
+      errorReason = `Invalid follow-up date: "${followUpParsed.invalidRaw}"`;
+    } else if (createdAtParsed.invalidRaw) {
+      isValid = false;
+      errorReason = `Invalid created date: "${createdAtParsed.invalidRaw}"`;
     }
 
     const isDuplicateInFile = Boolean(normalizedPhone.length >= 7 && seenFilePhones.has(normalizedPhone));
@@ -444,6 +510,7 @@ export function matrixToLeadDrafts(
       interestedProductName,
       estimatedValue,
       followUpDate,
+      createdAt,
       notes,
       email,
       whatsapp,

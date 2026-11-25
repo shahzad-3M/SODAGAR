@@ -3,6 +3,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import express, { NextFunction, Request, Response } from 'express';
 import type {
   BusinessProfile,
@@ -88,8 +89,10 @@ import {
   insertCrmActivityEvent,
   insertCrmAutomationLog,
   listBackups,
+  mergeCollectionArrayNonDestructively,
   mergeLocalSnapshotNonDestructively,
   replaceCitiesAndAreasFromList,
+  sanitizeAndValidateCollectionItemDates,
   saveCollectionValue,
   saveCrmLoyaltyConfig,
   syncDeliveryCitiesIntoBusinessProfile,
@@ -107,6 +110,15 @@ import {
   verifyServerSecret,
   withDbTransaction,
 } from './src/server/db.ts';
+import {
+  hasRecordContentChanges,
+  isDateValidationError,
+  mergePreservingOmittedFields,
+  resolvePreservedCreatedAt,
+  resolveUpdatedAt,
+  validateAndNormalizeDateOnly,
+  validateAndNormalizeDateTime,
+} from './src/server/dateUtils.ts';
 import {
   ALL_AUTO_SEGMENTS,
   buildCsvContent,
@@ -355,6 +367,21 @@ async function resolveActor(req: Request): Promise<ResolvedActor> {
     };
   }
 
+  if (
+    claims.role === 'super_admin' &&
+    claims.userId === 'usr_superadmin' &&
+    !accounts.some((u) => u.role === 'super_admin')
+  ) {
+    return {
+      id: 'usr_superadmin',
+      role: 'super_admin',
+      name: claims.name || 'Shahzad Malik',
+      phone: '03125256266',
+      crmRole: 'administrator',
+      crmPermissions: getDefaultCrmPermissionsForRole('super_admin', 'administrator'),
+    };
+  }
+
   if (claims.role === 'customer') {
     const cust = (await getAllCustomersFromDb(db)).find((c) => c.id === claims.userId);
     if (!cust || cust.status === 'archived') return { role: undefined };
@@ -409,9 +436,20 @@ const asyncRoute =
     Promise.resolve(fn(req, res, next)).catch(next);
   };
 
+function sendRouteError(res: Response, err: unknown, fallbackMessage: string) {
+  if (isDateValidationError(err) || (err as { statusCode?: number })?.statusCode === 400) {
+    res.status(400).json({ error: err instanceof Error ? err.message : fallbackMessage });
+    return;
+  }
+  res.status(500).json({ error: err instanceof Error ? err.message : fallbackMessage });
+}
+
 async function startServer() {
-  // Initialize active database driver (SQLite or MySQL), verify schema, and warm session secret
-  await initDb();
+  // Initialize active database driver (MySQL in production, fail-fast without SQLite fallback), verify schema, and warm session secret
+  const activeDb = await initDb();
+  console.log(
+    `[DB] Initialized driver=${activeDb.driver} env=${process.env.NODE_ENV || 'development'}`
+  );
 
   const app = express();
   app.set('trust proxy', 1);
@@ -602,6 +640,26 @@ async function startServer() {
                 : u
             );
             await saveCollectionValue(db, 'user_accounts', nextAccounts);
+          } else if (!superAdminAcc && matchesEnvMaster) {
+            const hashed = hashServerSecret(cleanPin);
+            const nowIso = new Date().toISOString();
+            const bootstrappedAdmin: UserAccount = {
+              id: 'usr_superadmin',
+              username: 'admin',
+              fullName: 'Shahzad Malik',
+              urduName: 'شہزاد ملک (سپر ایڈمن)',
+              phone: '03125256266',
+              email: 'admin@madinamarket.pk',
+              role: 'super_admin',
+              crmRole: 'administrator',
+              passwordHash: hashed.hash,
+              passwordSalt: hashed.salt,
+              status: 'active',
+              canAuthorizeCreditSale: true,
+              createdAt: nowIso,
+              lastLoginAt: nowIso,
+            };
+            await saveCollectionValue(db, 'user_accounts', [bootstrappedAdmin, ...accounts]);
           }
           const perms = getDefaultCrmPermissionsForRole('super_admin', 'administrator');
           const userObj = {
@@ -1356,6 +1414,10 @@ async function startServer() {
 
       const categoryBreadcrumb = getCategoryBreadcrumb(allCats, parentCategoryId, subcategoryId, childSubcategoryId);
       const now = new Date().toISOString();
+      const incomingActivatedAt = validateAndNormalizeDateTime(
+        (req.body as { activatedAt?: unknown })?.activatedAt,
+        'activatedAt'
+      );
 
       const resolvedFeeType = deliveryFeeType || existing.deliveryFeeType || 'default';
       const activatedProduct: ProductItem = {
@@ -1390,7 +1452,8 @@ async function startServer() {
         isUpcoming: false,
         upcomingStatus: 'available',
         status: 'published',
-        activatedAt: now,
+        createdAt: existing.createdAt,
+        activatedAt: incomingActivatedAt || now,
         activatedBy: actor.name || actor.role || 'Admin',
         updatedAt: now,
       };
@@ -1515,25 +1578,52 @@ async function startServer() {
       const db = await getDb();
       const list = await getCollectionValue<MonthlyExpense[]>(db, 'monthly_expenses', []);
       const now = new Date().toISOString();
-      const dateStr = incoming.date || now.split('T')[0];
-      const expense: MonthlyExpense = {
-        id: incoming.id || `exp_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-        title: incoming.title.trim(),
-        urduTitle: incoming.urduTitle?.trim() || undefined,
-        category: incoming.category || 'other',
-        amount: Math.max(0, Math.round(Number(incoming.amount))),
-        month: incoming.month || dateStr.slice(0, 7),
+      const expenseId = incoming.id || `exp_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+      const existing = list.find((e) => e.id === expenseId);
+      const merged = mergePreservingOmittedFields(
+        existing as Record<string, unknown> | undefined,
+        incoming as Record<string, unknown>
+      ) as unknown as Partial<MonthlyExpense>;
+      const dateStr = validateAndNormalizeDateOnly(merged.date, 'date') || now.split('T')[0];
+      const preservedCreatedAt = resolvePreservedCreatedAt({
+        existingCreatedAt: existing?.createdAt,
+        incomingCreatedAt: incoming.createdAt,
+        fallbackIso: now,
+        fieldName: 'createdAt',
+      });
+      const candidateExpense: MonthlyExpense = {
+        id: expenseId,
+        title: String(merged.title || incoming.title).trim(),
+        urduTitle: merged.urduTitle?.trim() || undefined,
+        category: merged.category || 'other',
+        amount: Math.max(0, Math.round(Number(merged.amount ?? incoming.amount))),
+        month: merged.month || dateStr.slice(0, 7),
         date: dateStr,
-        paymentStatus: incoming.paymentStatus || 'paid',
-        paymentMode: incoming.paymentMode || 'cash',
-        isRecurringMonthly: Boolean(incoming.isRecurringMonthly),
-        notes: incoming.notes?.trim() || undefined,
-        recordedBy: incoming.recordedBy || actor.name || 'Admin',
-        createdAt: incoming.createdAt || now,
-        updatedAt: now,
+        paymentStatus: merged.paymentStatus || 'paid',
+        paymentMode: merged.paymentMode || 'cash',
+        isRecurringMonthly: Boolean(merged.isRecurringMonthly),
+        notes: merged.notes?.trim() || undefined,
+        recordedBy: merged.recordedBy || actor.name || 'Admin',
+        createdAt: preservedCreatedAt,
       };
-      const exists = list.some((e) => e.id === expense.id);
-      const nextList = exists ? list.map((e) => (e.id === expense.id ? expense : e)) : [expense, ...list];
+      const hasChanges = hasRecordContentChanges(
+        existing as Record<string, unknown> | undefined,
+        candidateExpense as unknown as Record<string, unknown>
+      );
+      const resolvedUpdatedAt = resolveUpdatedAt({
+        isNew: !existing,
+        hasChanges,
+        existingUpdatedAt: existing?.updatedAt,
+        incomingUpdatedAt: incoming.updatedAt,
+        createdAtValue: preservedCreatedAt,
+        nowIso: now,
+      });
+      const expense: MonthlyExpense = {
+        ...candidateExpense,
+        createdAt: preservedCreatedAt,
+        updatedAt: resolvedUpdatedAt,
+      };
+      const nextList = existing ? list.map((e) => (e.id === expense.id ? expense : e)) : [expense, ...list];
       await saveCollectionValue(db, 'monthly_expenses', nextList);
       broadcastSyncEvent('monthly_expenses', req.header('x-client-id'));
       res.json({ ok: true, expense, expenses: nextList, syncVersion: getSyncVersion() });
@@ -2240,9 +2330,38 @@ async function startServer() {
         res.status(403).json({ error: 'Unauthorized to modify customer records.' });
         return;
       }
-      const saved = await upsertCustomerRow(db, { ...existing, ...incoming, id: existing.id });
+      const saved = await upsertCustomerRow(db, { ...existing, ...incoming, id: existing.id, createdAt: existing.createdAt });
       broadcastSyncEvent('customers', req.header('x-client-id'));
       res.json({ ok: true, customer: saved, syncVersion: getSyncVersion() });
+    })
+  );
+
+  app.delete(
+    '/api/customers/:id',
+    asyncRoute(async (req, res) => {
+      const actor = await resolveActor(req);
+      if (actor.role !== 'super_admin' && actor.role !== 'admin') {
+        res.status(403).json({ error: 'Only administrators can delete customer records.' });
+        return;
+      }
+      const db = await getDb();
+      const existing = (await getAllCustomersFromDb(db)).find((c) => c.id === req.params.id);
+      if (!existing) {
+        res.status(404).json({ error: 'Customer not found.' });
+        return;
+      }
+      await db.run('DELETE FROM customers WHERE id = ?', [req.params.id]);
+      await insertAdminAuditLog(db, {
+        action: 'delete_customer',
+        entityType: 'customer',
+        entityId: req.params.id,
+        actorId: actor.id,
+        actorName: actor.name,
+        actorRole: actor.role,
+        details: { customerName: existing.name, phone: existing.phone },
+      });
+      broadcastSyncEvent('customers', req.header('x-client-id'));
+      res.json({ ok: true, syncVersion: getSyncVersion() });
     })
   );
 
@@ -2398,23 +2517,41 @@ async function startServer() {
             authoritativeSubtotal + safeDeliveryFee - couponDiscount
           );
 
+          const nowCheckoutIso = new Date().toISOString();
+
           if (transaction) {
+            const currentTxs = await getCollectionValue<Transaction[]>(txDb, 'transactions', []);
+            const existingTx = currentTxs.find((t) => t.id === transaction.id);
             const finalTxAmount =
               !isPrivilegedSeller && computedCatalogSubtotal > 0
                 ? authoritativeTotal
                 : Math.max(0, Number(transaction.amount || 0));
+            const txCreatedAt = resolvePreservedCreatedAt({
+              existingCreatedAt: existingTx?.createdAt,
+              incomingCreatedAt: transaction.createdAt,
+              fallbackIso: nowCheckoutIso,
+              fieldName: 'transaction.createdAt',
+            });
+            const txDate =
+              validateAndNormalizeDateOnly(transaction.date, 'transaction.date') ||
+              existingTx?.date ||
+              txCreatedAt.slice(0, 10);
+            const txDueDate =
+              validateAndNormalizeDateOnly(transaction.dueDate, 'transaction.dueDate') || existingTx?.dueDate;
             const cleanTx: Transaction = {
               ...transaction,
               customerId: transaction.customerId || savedCustomer?.id || '',
               amount: finalTxAmount,
               paidAmount: Math.min(finalTxAmount, Math.max(0, Number(transaction.paidAmount || 0))),
               dueBalance: Math.max(0, Number(transaction.dueBalance ?? 0)),
+              date: txDate,
+              dueDate: txDueDate,
+              createdAt: txCreatedAt,
               notes: appliedCoupon
                 ? `${transaction.notes || ''} [Coupon ${appliedCoupon.code}: -Rs.${couponDiscount}]`.trim()
                 : transaction.notes,
               auditTrail: Array.isArray(transaction.auditTrail) ? transaction.auditTrail : [],
             };
-            const currentTxs = await getCollectionValue<Transaction[]>(txDb, 'transactions', []);
             await saveCollectionValue(txDb, 'transactions', [
               cleanTx,
               ...currentTxs.filter((t) => t.id !== cleanTx.id),
@@ -2423,6 +2560,17 @@ async function startServer() {
 
           let persistedOrderNumber = transaction?.invoiceNumber;
           if (codOrder) {
+            const currentOrders = await getCollectionValue<CODOrder[]>(txDb, 'cod_orders', []);
+            const existingCod = currentOrders.find((o) => o.id === codOrder.id);
+            const orderCreatedAt = resolvePreservedCreatedAt({
+              existingCreatedAt: existingCod?.createdAt,
+              incomingCreatedAt: codOrder.createdAt,
+              fallbackIso: nowCheckoutIso,
+              fieldName: 'codOrder.createdAt',
+            });
+            const dispatchedAt = validateAndNormalizeDateTime(codOrder.dispatchedAt, 'codOrder.dispatchedAt');
+            const deliveredAt = validateAndNormalizeDateTime(codOrder.deliveredAt, 'codOrder.deliveredAt');
+            const returnedAt = validateAndNormalizeDateTime(codOrder.returnedAt, 'codOrder.returnedAt');
             const safeItems = Array.isArray(codOrder.items) ? codOrder.items : [];
             const cleanOrder: CODOrder = {
               ...codOrder,
@@ -2434,10 +2582,12 @@ async function startServer() {
                 isPrivilegedSeller && codOrder.totalAmount > 0 && !appliedCoupon
                   ? Math.max(0, Number(codOrder.totalAmount))
                   : authoritativeTotal,
-              createdAt: codOrder.createdAt || new Date().toISOString(),
+              dispatchedAt: dispatchedAt ?? existingCod?.dispatchedAt,
+              deliveredAt: deliveredAt ?? existingCod?.deliveredAt,
+              returnedAt: returnedAt ?? existingCod?.returnedAt,
+              createdAt: orderCreatedAt,
             };
             persistedOrderNumber = cleanOrder.orderNumber;
-            const currentOrders = await getCollectionValue<CODOrder[]>(txDb, 'cod_orders', []);
             await saveCollectionValue(txDb, 'cod_orders', [
               cleanOrder,
               ...currentOrders.filter((o) => o.id !== cleanOrder.id),
@@ -2510,7 +2660,7 @@ async function startServer() {
           }
         });
       } catch (err) {
-        res.status(500).json({ error: err instanceof Error ? err.message : 'Checkout persistence failed.' });
+        sendRouteError(res, err, 'Checkout persistence failed.');
         return;
       }
 
@@ -2853,23 +3003,24 @@ async function startServer() {
         return;
       }
 
+      // Guardrail: never allow an empty array sync/import payload to wipe out any existing collection.
+      if (Array.isArray(data) && data.length === 0) {
+        res.json({ ok: true, skippedEmptyOverwrite: true, syncVersion: getSyncVersion() });
+        return;
+      }
+
       try {
         await withDbTransaction(async (txDb) => {
           if (key === 'products' && Array.isArray(data)) {
+            // Non-destructive upsert only: never delete existing products omitted from sync/import payload
             const incomingList = data as ProductItem[];
-            const incomingIds = new Set(incomingList.map((p) => p.id));
-            const existing = await getAllProductsFromDb(txDb);
-            for (const ex of existing) {
-              if (!incomingIds.has(ex.id)) {
-                await txDb.run('DELETE FROM products WHERE id = ?', [ex.id]);
-              }
-            }
             for (const item of incomingList) {
               if (item?.id) {
                 await upsertProductRow(txDb, item);
               }
             }
           } else if (key === 'categories' && Array.isArray(data)) {
+            // Non-destructive upsert only: never delete existing categories omitted from sync/import payload
             const incoming = (data as CategoryRecord[]).map(normalizeUpcomingCategoryRecord);
             const hasUpcoming = incoming.some((c) => c.id === UPCOMING_CATEGORY_ID || c.isUpcoming);
             if (!hasUpcoming) {
@@ -2878,26 +3029,16 @@ async function startServer() {
               );
               if (existingUp) incoming.push(existingUp);
             }
-            const incomingIds = new Set(incoming.map((c) => c.id));
-            const existing = await getAllCategoriesFromDb(txDb);
-            for (const ex of existing) {
-              if (!incomingIds.has(ex.id) && ex.id !== UPCOMING_CATEGORY_ID && !ex.isUpcoming) {
-                await txDb.run('DELETE FROM categories WHERE id = ?', [ex.id]);
-              }
-            }
             for (const cat of incoming) {
-              await upsertCategoryRow(txDb, cat);
+              if (cat?.id && cat?.name) {
+                await upsertCategoryRow(txDb, cat);
+              }
             }
           } else if (key === 'customers' && Array.isArray(data)) {
+            // Non-destructive upsert only: preserve existing PINs, createdAt, and omitted fields; never delete missing customers
             const incoming = data as Customer[];
-            const incomingIds = new Set(incoming.map((c) => c.id));
             const existing = await getAllCustomersFromDb(txDb);
             const existingById = new Map(existing.map((c) => [c.id, c]));
-            for (const ex of existing) {
-              if (!incomingIds.has(ex.id)) {
-                await txDb.run('DELETE FROM customers WHERE id = ?', [ex.id]);
-              }
-            }
             for (const c of incoming) {
               if (c?.id) {
                 const prev = existingById.get(c.id);
@@ -2913,13 +3054,15 @@ async function startServer() {
           } else if (key === 'business_profile' && typeof data === 'object' && data !== null) {
             const incomingBp = data as BusinessProfile;
             const currentBp = await getCollectionValue<BusinessProfile>(txDb, 'business_profile', defaultBusinessProfile);
-            const mergedBp: BusinessProfile = {
-              ...incomingBp,
-              shippingPartner: {
-                ...incomingBp.shippingPartner,
-                apiKey: incomingBp.shippingPartner?.apiKey || currentBp.shippingPartner?.apiKey || '',
-              },
-            };
+            const mergedBp = mergePreservingOmittedFields(
+              currentBp as unknown as Record<string, unknown>,
+              incomingBp as unknown as Partial<Record<string, unknown>>
+            ) as unknown as BusinessProfile;
+            mergedBp.shippingPartner = {
+              ...(currentBp.shippingPartner || {}),
+              ...(incomingBp.shippingPartner || {}),
+              apiKey: incomingBp.shippingPartner?.apiKey || currentBp.shippingPartner?.apiKey || '',
+            } as BusinessProfile['shippingPartner'];
             delete mergedBp.adminPin;
             if (Array.isArray(mergedBp.deliveryCities)) {
               await replaceCitiesAndAreasFromList(txDb, mergedBp.deliveryCities);
@@ -2931,9 +3074,18 @@ async function startServer() {
           } else if (key === 'user_accounts' && Array.isArray(data)) {
             const existingAccounts = await getCollectionValue<UserAccount[]>(txDb, 'user_accounts', []);
             const byId = new Map(existingAccounts.map((u) => [u.id, u]));
-            const mergedAccounts = (data as UserAccount[]).map((u) => {
+            const working = [...existingAccounts];
+            const workingIndex = new Map(working.map((u, idx) => [u.id, idx]));
+            const nowIso = new Date().toISOString();
+
+            for (const u of data as UserAccount[]) {
+              if (!u?.id) continue;
               const prev = byId.get(u.id);
-              const clean = { ...u };
+              const clean = sanitizeAndValidateCollectionItemDates(
+                u as unknown as Record<string, unknown>,
+                prev as unknown as Record<string, unknown> | undefined,
+                nowIso
+              ) as unknown as UserAccount;
               delete clean.suggestedDefaultPin;
               delete clean.resetToken;
               delete clean.resetTokenExpiresAt;
@@ -2943,40 +3095,108 @@ async function startServer() {
                   clean.passwordHash = h.hash;
                   clean.passwordSalt = h.salt;
                 }
-                return clean;
+                working.push(clean);
+                workingIndex.set(clean.id, working.length - 1);
+              } else {
+                const idx = workingIndex.get(clean.id)!;
+                working[idx] = {
+                  ...clean,
+                  passwordHash: clean.passwordHash || prev.passwordHash,
+                  passwordSalt: clean.passwordSalt || prev.passwordSalt,
+                };
               }
-              return {
-                ...clean,
-                passwordHash: clean.passwordHash || prev.passwordHash,
-                passwordSalt: clean.passwordSalt || prev.passwordSalt,
-              };
-            });
-            await saveCollectionValue(txDb, 'user_accounts', mergedAccounts);
+            }
+            await saveCollectionValue(txDb, 'user_accounts', working);
           } else if (key === 'review_rewards' && Array.isArray(data) && !isAdmin && !isManager && !isStaff) {
-            // Non-admin customers may only add/update their own pending review submissions
+            // Non-admin customers may only add their own pending review submissions non-destructively
             const currentReviews = await getCollectionValue<ReviewRewardSubmission[]>(txDb, 'review_rewards', []);
             const currentMap = new Map(currentReviews.map((r) => [r.id, r]));
+            const nowIso = new Date().toISOString();
             for (const rawRev of data as ReviewRewardSubmission[]) {
               if (
                 rawRev?.id &&
                 !currentMap.has(rawRev.id) &&
                 (rawRev.customerId === actor.customerId || !actor.customerId)
               ) {
-                currentReviews.unshift({ ...rawRev, status: 'pending', voucherCode: undefined });
+                const sanitized = sanitizeAndValidateCollectionItemDates(
+                  { ...rawRev, status: 'pending', voucherCode: undefined },
+                  undefined,
+                  nowIso
+                ) as unknown as ReviewRewardSubmission;
+                currentReviews.unshift(sanitized);
               }
             }
             await saveCollectionValue(txDb, 'review_rewards', currentReviews);
+          } else if (Array.isArray(data)) {
+            await mergeCollectionArrayNonDestructively(txDb, key, data as Array<Record<string, unknown>>);
           } else {
             await saveCollectionValue(txDb, key, data);
           }
         });
       } catch (err) {
-        res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to persist collection.' });
+        sendRouteError(res, err, 'Failed to persist collection.');
         return;
       }
 
       broadcastSyncEvent(key, req.header('x-client-id'));
       res.json({ ok: true, syncVersion: getSyncVersion() });
+    })
+  );
+
+  // Explicit single-item DELETE endpoint for collection items (e.g., expenses, employees, attendance, notifications, recurring, etc.)
+  app.delete(
+    '/api/collections/:collectionKey/items/:itemId',
+    asyncRoute(async (req, res) => {
+      const actor = await resolveActor(req);
+      if (!actor.id) {
+        res.status(401).json({ error: 'Authentication required to delete records.' });
+        return;
+      }
+      const key = req.params.collectionKey;
+      const itemId = req.params.itemId;
+      const isAdmin = actor.role === 'super_admin' || actor.role === 'admin';
+      const isManager = actor.role === 'manager';
+      const isStaff = actor.role === 'staff';
+
+      if (ADMIN_ONLY_COLLECTIONS.has(key) && !isAdmin) {
+        res.status(403).json({ error: `Only administrators can delete from "${key}".` });
+        return;
+      }
+      if (!isAdmin && !isManager) {
+        if (!isStaff || !STAFF_WRITABLE_COLLECTIONS.has(key)) {
+          res.status(403).json({ error: `Insufficient permissions to delete from "${key}".` });
+          return;
+        }
+      }
+
+      if (key === 'products' || key === 'categories' || key === 'customers') {
+        res.status(400).json({ error: `Use /api/${key}/:id DELETE endpoint to delete ${key} records.` });
+        return;
+      }
+
+      let removed = false;
+      await withDbTransaction(async (txDb) => {
+        const current = await getCollectionValue<Array<Record<string, unknown>>>(txDb, key, []);
+        if (!Array.isArray(current)) return;
+        const filtered = current.filter((item) => String(item?.id || '') !== itemId);
+        if (filtered.length !== current.length) {
+          removed = true;
+          await saveCollectionValue(txDb, key, filtered);
+          await insertAdminAuditLog(txDb, {
+            action: `delete_collection_item_${key}`,
+            entityType: key,
+            entityId: itemId,
+            actorId: actor.id,
+            actorName: actor.name,
+            actorRole: actor.role,
+          });
+        }
+      });
+
+      if (removed) {
+        broadcastSyncEvent(key, req.header('x-client-id'));
+      }
+      res.json({ ok: true, removed, syncVersion: getSyncVersion() });
     })
   );
 
@@ -3513,6 +3733,20 @@ async function startServer() {
             continue;
           }
 
+          // Strictly validate all incoming dates on every row (throws HTTP 400 DateValidationError cleanly; never silently replaces with today's date)
+          const validIncomingCreatedAt = validateAndNormalizeDateTime(
+            row.createdAt,
+            `leads[${i}].createdAt`
+          );
+          const validIncomingUpdatedAt = validateAndNormalizeDateTime(
+            row.updatedAt,
+            `leads[${i}].updatedAt`
+          );
+          const validFollowUpDate = validateAndNormalizeDateOnly(
+            row.followUpDate,
+            `leads[${i}].followUpDate`
+          );
+
           const source: CRMSourceChannel = ALLOWED_SOURCES.has(row.source as CRMSourceChannel)
             ? (row.source as CRMSourceChannel)
             : defaultSource;
@@ -3544,14 +3778,13 @@ async function startServer() {
                   Number(row.estimatedValue || 0) > 0
                     ? Math.round(Number(row.estimatedValue))
                     : existingMatch.estimatedValue,
-                followUpDate:
-                  (typeof row.followUpDate === 'string' && row.followUpDate.trim()) ||
-                  existingMatch.followUpDate,
+                followUpDate: validFollowUpDate || existingMatch.followUpDate,
                 notes:
                   [existingMatch.notes, typeof row.notes === 'string' ? row.notes.trim() : '']
                     .filter(Boolean)
                     .join(' | ') || undefined,
-                updatedAt: nowIso,
+                createdAt: existingMatch.createdAt,
+                updatedAt: validIncomingUpdatedAt,
               });
               phoneMap.set(digits, updated);
               updatedCount++;
@@ -3563,6 +3796,7 @@ async function startServer() {
             }
           }
 
+          const createdAtValue = validIncomingCreatedAt || nowIso;
           const created = await upsertCrmLead(txDb, {
             id: `lead_${Date.now()}_${i}_${Math.random().toString(36).slice(2, 6)}`,
             leadName,
@@ -3577,11 +3811,10 @@ async function startServer() {
             assignedSalespersonId: row.assignedSalespersonId || actor.id,
             assignedSalespersonName: row.assignedSalespersonName || actor.name || 'Sales',
             notes: typeof row.notes === 'string' ? row.notes.trim() || undefined : undefined,
-            followUpDate:
-              typeof row.followUpDate === 'string' ? row.followUpDate.trim() || undefined : undefined,
+            followUpDate: validFollowUpDate,
             stage,
-            createdAt: nowIso,
-            updatedAt: nowIso,
+            createdAt: createdAtValue,
+            updatedAt: validIncomingUpdatedAt || createdAtValue,
           });
           phoneMap.set(digits, created);
           importedCount++;
@@ -4055,6 +4288,10 @@ async function startServer() {
       const priority = body.priority || 'Medium';
       const slaHours = priority === 'Urgent' ? 4 : priority === 'High' ? 12 : priority === 'Low' ? 48 : 24;
       const nowMs = Date.now();
+      const incomingCreatedAt = validateAndNormalizeDateTime(body.createdAt, 'createdAt');
+      const incomingDueAt = validateAndNormalizeDateTime(body.dueAt, 'dueAt');
+      const nowIso = new Date(nowMs).toISOString();
+      const ticketCreatedAt = incomingCreatedAt || nowIso;
       const db = await getDb();
       const ticket = await upsertCrmTicket(db, {
         id: `tkt_${nowMs}_${Math.random().toString(36).slice(2, 5)}`,
@@ -4076,9 +4313,9 @@ async function startServer() {
         subject: body.subject.trim(),
         description: body.description?.trim(),
         resolutionNotes: isStaffTicketManager ? body.resolutionNotes?.trim() : undefined,
-        dueAt: new Date(nowMs + slaHours * 3600000).toISOString(),
-        createdAt: new Date(nowMs).toISOString(),
-        updatedAt: new Date(nowMs).toISOString(),
+        dueAt: incomingDueAt || new Date(nowMs + slaHours * 3600000).toISOString(),
+        createdAt: ticketCreatedAt,
+        updatedAt: validateAndNormalizeDateTime(body.updatedAt, 'updatedAt') || ticketCreatedAt,
       });
       const allTickets = await getAllCrmTickets(db);
       broadcastSyncEvent('crm_tickets', req.header('x-client-id'));
@@ -4471,10 +4708,14 @@ async function startServer() {
     res.status(404).json({ error: 'API endpoint not found.' });
   });
 
-  // /api JSON error handler BEFORE Vite/static middleware so malformed JSON or payload errors always return JSON
+  // /api JSON error handler BEFORE Vite/static middleware so malformed JSON or date validation errors always return JSON
   app.use('/api', (err: unknown, _req: Request, res: Response, next: NextFunction) => {
     if (res.headersSent) {
       next(err);
+      return;
+    }
+    if (isDateValidationError(err)) {
+      res.status(400).json({ error: err.message });
       return;
     }
     const errObj = err as { status?: number; statusCode?: number; type?: string; message?: string };
@@ -4486,7 +4727,7 @@ async function startServer() {
       error:
         status === 413
           ? 'Submitted payload is too large. Please paste only the product HTML body.'
-          : status === 400
+          : errObj?.type === 'entity.parse.failed'
           ? 'Malformed JSON request body.'
           : errObj?.message || 'Unexpected server error.',
     });
@@ -4495,9 +4736,10 @@ async function startServer() {
   const httpServer = http.createServer(app);
   let viteInstance: { close: () => Promise<void>; middlewares: express.RequestHandler } | null = null;
 
+  const serverDir = path.dirname(fileURLToPath(import.meta.url));
   const distDirCandidates = [
     path.resolve(process.cwd(), 'dist'),
-    path.resolve(__dirname, 'dist'),
+    path.resolve(serverDir, 'dist'),
   ];
   const distDir =
     distDirCandidates.find((dir) => fs.existsSync(path.join(dir, 'index.html'))) || distDirCandidates[0];

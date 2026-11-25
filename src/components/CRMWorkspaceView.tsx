@@ -783,6 +783,7 @@ export const CRMWorkspaceView: React.FC<CRMWorkspaceViewProps> = ({
         interestedProductName: r.interestedProductName,
         estimatedValue: r.estimatedValue,
         followUpDate: r.followUpDate,
+        createdAt: r.createdAt,
         notes: r.notes,
         stage: r.stage,
       })),

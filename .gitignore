@@ -6,3 +6,12 @@ coverage/
 *.log
 .env*
 !.env.example
+data/madinamarket.db
+data/madinamarket.db-wal
+data/madinamarket.db-shm
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/*.db-journal
+data/backups/
+data/imported-media/
