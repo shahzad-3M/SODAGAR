@@ -16,7 +16,7 @@ import {
   Pencil,
 } from 'lucide-react';
 import { BusinessProfile, Reseller } from '../types/index.ts';
-import { openWhatsAppDirect } from '../utils/whatsapp.ts';
+import { buildCurrentOriginUrl, openWhatsAppDirect } from '../utils/whatsapp.ts';
 import {
   ToastBanner,
   ToastMessage,
@@ -76,7 +76,7 @@ export const ResellersView: React.FC<ResellersViewProps> = ({
   const totalPaidSalesVol = displayResellers.reduce((sum, r) => sum + r.totalPaidSales, 0);
 
   const handleCopyLink = (referralCode: string) => {
-    const link = `https://madinamarket.pk/?ref=${referralCode}`;
+    const link = buildCurrentOriginUrl(`/?ref=${referralCode}`);
     navigator.clipboard.writeText(link);
     setCopiedCode(referralCode);
     setTimeout(() => setCopiedCode(null), 2500);
@@ -84,7 +84,8 @@ export const ResellersView: React.FC<ResellersViewProps> = ({
 
   const handleShareWhatsApp = (r: Reseller) => {
     const cleanPhone = r.phone.replace(/\D/g, '');
-    const msg = `🤝 *100DAGAR ری سیلر کمیشن اکاؤنٹ / Reseller Affiliate Portal*\n*${profile.name} · مدینہ مارکیٹ*\n\nمحترم *${r.name}* صاحب،\nآپ کا ری سیلر ریفرل کوڈ: *${r.referralCode}*\n\n*کمیشن فارمولا:* ہر 1,000 روپے کی ادائیگی پر نقد *30 روپے کمیشن* (صرف موصولہ / ادا شدہ رقم پر قابل ادائیگی)۔\n\n*آپ کا ریفرل لنک:* https://madinamarket.pk/?ref=${r.referralCode}\n\n*آپ کے کمیشن کی تفصیلات:*\n• ادا شدہ سیلز والیم: ${profile.currencySymbol}${r.totalPaidSales.toLocaleString('en-PK')}\n• کمایا گیا کل کمیشن: ${profile.currencySymbol}${r.earnedCommission.toLocaleString('en-PK')}\n• وصول شدہ کمیشن: ${profile.currencySymbol}${r.paidCommission.toLocaleString('en-PK')}\n• بقایا واجب الادا کمیشن: *${profile.currencySymbol}${(r.earnedCommission - r.paidCommission).toLocaleString('en-PK')}*\n• سپُر بیسٹ کریڈٹ لمٹ: *${profile.currencySymbol}${(r.creditLimit || 25000).toLocaleString('en-PK')}*\n\nادائیگی بذریعہ نقد کیش (دکان پر)، EasyPaisa، JazzCash، یا SadaPay (03125256266) کی جاتی ہے۔ شکریہ!`;
+    const refUrl = buildCurrentOriginUrl(`/?ref=${r.referralCode}`);
+    const msg = `🤝 *100DAGAR ری سیلر کمیشن اکاؤنٹ / Reseller Affiliate Portal*\n*${profile.name} · مدینہ مارکیٹ*\n\nمحترم *${r.name}* صاحب،\nآپ کا ری سیلر ریفرل کوڈ: *${r.referralCode}*\n\n*کمیشن فارمولا:* ہر 1,000 روپے کی ادائیگی پر نقد *30 روپے کمیشن* (صرف موصولہ / ادا شدہ رقم پر قابل ادائیگی)۔\n\n*آپ کا ریفرل لنک:* ${refUrl}\n\n*آپ کے کمیشن کی تفصیلات:*\n• ادا شدہ سیلز والیم: ${profile.currencySymbol}${r.totalPaidSales.toLocaleString('en-PK')}\n• کمایا گیا کل کمیشن: ${profile.currencySymbol}${r.earnedCommission.toLocaleString('en-PK')}\n• وصول شدہ کمیشن: ${profile.currencySymbol}${r.paidCommission.toLocaleString('en-PK')}\n• بقایا واجب الادا کمیشن: *${profile.currencySymbol}${(r.earnedCommission - r.paidCommission).toLocaleString('en-PK')}*\n• سپُر بیسٹ کریڈٹ لمٹ: *${profile.currencySymbol}${(r.creditLimit || 25000).toLocaleString('en-PK')}*\n\nادائیگی بذریعہ نقد کیش (دکان پر)، EasyPaisa، JazzCash، یا SadaPay (03125256266) کی جاتی ہے۔ شکریہ!`;
 
     openWhatsAppDirect(cleanPhone, msg);
   };

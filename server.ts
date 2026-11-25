@@ -23,6 +23,10 @@ import type {
   CRMSupportTicket,
   Customer,
   DeliveryCityConfig,
+  Investor,
+  InvestorProductOffering,
+  InvestorProductRequest,
+  InvestorTransaction,
   MonthlyExpense,
   ProductItem,
   Reseller,
@@ -1644,6 +1648,557 @@ async function startServer() {
       await saveCollectionValue(db, 'monthly_expenses', nextList);
       broadcastSyncEvent('monthly_expenses', req.header('x-client-id'));
       res.json({ ok: true, expenses: nextList, syncVersion: getSyncVersion() });
+    })
+  );
+
+  // 5D. INVESTOR PRODUCT OFFERINGS & PENDING INVESTMENT REQUESTS (ADMIN + REGISTERED INVESTORS ONLY)
+  app.get(
+    '/api/investor-offerings',
+    asyncRoute(async (req, res) => {
+      const actor = await resolveActor(req);
+      if (!actor.id) {
+        res.status(401).json({ error: 'Authentication required to view investor product offerings.' });
+        return;
+      }
+      const isAllowed =
+        actor.role === 'super_admin' ||
+        actor.role === 'admin' ||
+        actor.role === 'manager' ||
+        actor.role === 'investor';
+      if (!isAllowed) {
+        res.status(403).json({
+          error: 'Only registered investors and administrators can access Investor Product Offerings.',
+        });
+        return;
+      }
+
+      const db = await getDb();
+      const offerings = await getCollectionValue<InvestorProductOffering[]>(db, 'investor_offerings', []);
+      const allRequests = await getCollectionValue<InvestorProductRequest[]>(db, 'investor_requests', []);
+
+      let visibleRequests = allRequests;
+      if (actor.role === 'investor') {
+        const allInvestors = await getCollectionValue<Investor[]>(db, 'investors', []);
+        const normPhone = (v?: string) => (v || '').replace(/\D/g, '');
+        const actorDigits = normPhone(actor.phone);
+        const ownedIds = new Set(
+          allInvestors
+            .filter(
+              (inv) =>
+                (actor.investorId && inv.id === actor.investorId) ||
+                (actorDigits && normPhone(inv.phone) === actorDigits)
+            )
+            .map((inv) => inv.id)
+        );
+        if (actor.investorId) ownedIds.add(actor.investorId);
+        visibleRequests = allRequests.filter(
+          (r) =>
+            (r.investorId && ownedIds.has(r.investorId)) ||
+            (actor.id && r.userId === actor.id)
+        );
+      }
+
+      res.json({
+        ok: true,
+        offerings,
+        requests: visibleRequests,
+        syncVersion: getSyncVersion(),
+      });
+    })
+  );
+
+  app.post(
+    '/api/investor-offerings',
+    asyncRoute(async (req, res) => {
+      const actor = await resolveActor(req);
+      if (actor.role !== 'super_admin' && actor.role !== 'admin') {
+        res.status(403).json({ error: 'Only Super Admin or Admin can create investor product offerings.' });
+        return;
+      }
+
+      const incoming = (req.body || {}) as Partial<InvestorProductOffering>;
+      const title = (incoming.title || '').trim();
+      const unitPrice = Number(incoming.unitPrice || 0);
+      const minInvestQty = Math.max(1, Math.round(Number(incoming.minInvestQty || 1)));
+      const maxAvailableQty = Math.max(minInvestQty, Math.round(Number(incoming.maxAvailableQty || minInvestQty)));
+      const otherExpenses = Math.max(0, Math.round(Number(incoming.otherExpenses || 0)));
+
+      if (!title || !Number.isFinite(unitPrice) || unitPrice <= 0) {
+        res.status(400).json({ error: 'Offering title and valid unit price (> 0) are required.' });
+        return;
+      }
+
+      const now = new Date().toISOString();
+      let savedOffering!: InvestorProductOffering;
+      let nextOfferings: InvestorProductOffering[] = [];
+
+      await withDbTransaction(async (txDb) => {
+        const list = await getCollectionValue<InvestorProductOffering[]>(txDb, 'investor_offerings', []);
+        const existing = incoming.id ? list.find((o) => o.id === incoming.id) : undefined;
+        const preservedCreatedAt = resolvePreservedCreatedAt({
+          existingCreatedAt: existing?.createdAt,
+          incomingCreatedAt: incoming.createdAt,
+          fallbackIso: now,
+        });
+
+        const reservedQty = Math.max(0, Math.min(maxAvailableQty, Number(existing?.reservedQty ?? incoming.reservedQty ?? 0)));
+        const candidate: InvestorProductOffering = {
+          id: existing?.id || incoming.id || `inv_off_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          productId: incoming.productId?.trim() || existing?.productId || undefined,
+          title,
+          urduTitle: incoming.urduTitle?.trim() || existing?.urduTitle || undefined,
+          category: (incoming.category || existing?.category || 'General Wholesale').trim(),
+          imageUrl: incoming.imageUrl?.trim() || existing?.imageUrl || undefined,
+          description: incoming.description?.trim() || existing?.description || undefined,
+          unitPrice: Math.round(unitPrice),
+          minInvestQty,
+          maxAvailableQty,
+          reservedQty,
+          otherExpenses,
+          otherExpensesNote: incoming.otherExpensesNote?.trim() || existing?.otherExpensesNote || undefined,
+          expectedProfitSharePercent:
+            incoming.expectedProfitSharePercent !== undefined
+              ? Number(incoming.expectedProfitSharePercent)
+              : existing?.expectedProfitSharePercent,
+          estimatedMonthlyReturnText:
+            incoming.estimatedMonthlyReturnText?.trim() || existing?.estimatedMonthlyReturnText || undefined,
+          status:
+            incoming.status ||
+            (reservedQty >= maxAvailableQty ? 'funded' : existing?.status || 'active'),
+          createdById: existing?.createdById || actor.id,
+          createdAt: preservedCreatedAt,
+        };
+
+        const hasChanges = hasRecordContentChanges(
+          existing as unknown as Record<string, unknown> | undefined,
+          candidate as unknown as Record<string, unknown>
+        );
+        const resolvedUpdatedAt = resolveUpdatedAt({
+          isNew: !existing,
+          hasChanges,
+          existingUpdatedAt: existing?.updatedAt,
+          incomingUpdatedAt: incoming.updatedAt,
+          createdAtValue: preservedCreatedAt,
+          nowIso: now,
+        });
+
+        savedOffering = {
+          ...candidate,
+          createdAt: preservedCreatedAt,
+          updatedAt: resolvedUpdatedAt,
+        };
+
+        nextOfferings = existing
+          ? list.map((o) => (o.id === savedOffering.id ? savedOffering : o))
+          : [savedOffering, ...list];
+
+        await saveCollectionValue(txDb, 'investor_offerings', nextOfferings);
+        await insertAdminAuditLog(txDb, {
+          action: existing ? 'update_investor_offering' : 'create_investor_offering',
+          entityType: 'investor_offerings',
+          entityId: savedOffering.id,
+          actorId: actor.id,
+          actorName: actor.name,
+          actorRole: actor.role,
+          details: { title: savedOffering.title, unitPrice: savedOffering.unitPrice, minInvestQty: savedOffering.minInvestQty },
+        });
+      });
+
+      broadcastSyncEvent('investor_offerings', req.header('x-client-id'));
+      res.json({ ok: true, offering: savedOffering, offerings: nextOfferings, syncVersion: getSyncVersion() });
+    })
+  );
+
+  app.put(
+    '/api/investor-offerings/:id',
+    asyncRoute(async (req, res) => {
+      const actor = await resolveActor(req);
+      if (actor.role !== 'super_admin' && actor.role !== 'admin') {
+        res.status(403).json({ error: 'Only Super Admin or Admin can update investor product offerings.' });
+        return;
+      }
+
+      const offeringId = req.params.id;
+      const incoming = (req.body || {}) as Partial<InvestorProductOffering>;
+      const now = new Date().toISOString();
+      let updatedOffering!: InvestorProductOffering;
+      let nextOfferings: InvestorProductOffering[] = [];
+
+      await withDbTransaction(async (txDb) => {
+        const list = await getCollectionValue<InvestorProductOffering[]>(txDb, 'investor_offerings', []);
+        const existing = list.find((o) => o.id === offeringId);
+        if (!existing) {
+          throw Object.assign(new Error('Investor offering not found.'), { statusCode: 404 });
+        }
+
+        const merged = mergePreservingOmittedFields(
+          existing as unknown as Record<string, unknown>,
+          incoming as unknown as Partial<Record<string, unknown>>
+        ) as unknown as InvestorProductOffering;
+
+        const preservedCreatedAt = resolvePreservedCreatedAt({
+          existingCreatedAt: existing.createdAt,
+          incomingCreatedAt: incoming.createdAt,
+          fallbackIso: now,
+        });
+
+        const unitPrice = Math.max(1, Math.round(Number(merged.unitPrice || existing.unitPrice)));
+        const minInvestQty = Math.max(1, Math.round(Number(merged.minInvestQty || existing.minInvestQty)));
+        const maxAvailableQty = Math.max(minInvestQty, Math.round(Number(merged.maxAvailableQty || existing.maxAvailableQty)));
+        const reservedQty = Math.max(0, Math.min(maxAvailableQty, Number(merged.reservedQty ?? existing.reservedQty ?? 0)));
+
+        const candidate: InvestorProductOffering = {
+          ...merged,
+          id: existing.id,
+          unitPrice,
+          minInvestQty,
+          maxAvailableQty,
+          reservedQty,
+          otherExpenses: Math.max(0, Math.round(Number(merged.otherExpenses || 0))),
+          createdAt: preservedCreatedAt,
+        };
+
+        const hasChanges = hasRecordContentChanges(
+          existing as unknown as Record<string, unknown>,
+          candidate as unknown as Record<string, unknown>
+        );
+        const resolvedUpdatedAt = resolveUpdatedAt({
+          isNew: false,
+          hasChanges,
+          existingUpdatedAt: existing.updatedAt,
+          incomingUpdatedAt: incoming.updatedAt,
+          createdAtValue: preservedCreatedAt,
+          nowIso: now,
+        });
+
+        updatedOffering = {
+          ...candidate,
+          createdAt: preservedCreatedAt,
+          updatedAt: resolvedUpdatedAt,
+        };
+        nextOfferings = list.map((o) => (o.id === offeringId ? updatedOffering : o));
+        await saveCollectionValue(txDb, 'investor_offerings', nextOfferings);
+      });
+
+      broadcastSyncEvent('investor_offerings', req.header('x-client-id'));
+      res.json({ ok: true, offering: updatedOffering, offerings: nextOfferings, syncVersion: getSyncVersion() });
+    })
+  );
+
+  app.delete(
+    '/api/investor-offerings/:id',
+    asyncRoute(async (req, res) => {
+      const actor = await resolveActor(req);
+      if (actor.role !== 'super_admin' && actor.role !== 'admin') {
+        res.status(403).json({ error: 'Only Super Admin or Admin can delete investor offerings.' });
+        return;
+      }
+
+      let nextOfferings: InvestorProductOffering[] = [];
+      await withDbTransaction(async (txDb) => {
+        const list = await getCollectionValue<InvestorProductOffering[]>(txDb, 'investor_offerings', []);
+        nextOfferings = list.filter((o) => o.id !== req.params.id);
+        if (nextOfferings.length !== list.length) {
+          await saveCollectionValue(txDb, 'investor_offerings', nextOfferings);
+          await insertAdminAuditLog(txDb, {
+            action: 'delete_investor_offering',
+            entityType: 'investor_offerings',
+            entityId: req.params.id,
+            actorId: actor.id,
+            actorName: actor.name,
+            actorRole: actor.role,
+          });
+        }
+      });
+
+      broadcastSyncEvent('investor_offerings', req.header('x-client-id'));
+      res.json({ ok: true, offerings: nextOfferings, syncVersion: getSyncVersion() });
+    })
+  );
+
+  app.post(
+    '/api/investor-requests',
+    asyncRoute(async (req, res) => {
+      const actor = await resolveActor(req);
+      if (!actor.id) {
+        res.status(401).json({ error: 'Please sign in as a registered investor to submit an investment request.' });
+        return;
+      }
+      if (actor.role !== 'investor' && actor.role !== 'admin' && actor.role !== 'super_admin') {
+        res.status(403).json({
+          error: 'Only registered investors can invest in investor product offerings.',
+        });
+        return;
+      }
+
+      const { offeringId, requestedQty: rawQty, notes, investorId: overrideInvestorId } = (req.body || {}) as {
+        offeringId?: string;
+        requestedQty?: number;
+        notes?: string;
+        investorId?: string;
+      };
+
+      if (!offeringId) {
+        res.status(400).json({ error: 'Offering ID is required.' });
+        return;
+      }
+
+      const requestedQty = Math.round(Number(rawQty || 0));
+      if (!Number.isFinite(requestedQty) || requestedQty <= 0) {
+        res.status(400).json({ error: 'Please select a valid quantity to invest.' });
+        return;
+      }
+
+      const now = new Date().toISOString();
+      let createdRequest!: InvestorProductRequest;
+
+      await withDbTransaction(async (txDb) => {
+        const offerings = await getCollectionValue<InvestorProductOffering[]>(txDb, 'investor_offerings', []);
+        const offering = offerings.find((o) => o.id === offeringId);
+        if (!offering) {
+          throw Object.assign(new Error('Selected investor product offering was not found.'), { statusCode: 404 });
+        }
+        if (offering.status !== 'active') {
+          throw Object.assign(new Error('This offering is no longer open for new investment requests.'), { statusCode: 400 });
+        }
+
+        const remainingQty = Math.max(0, offering.maxAvailableQty - (offering.reservedQty || 0));
+        if (requestedQty < offering.minInvestQty) {
+          throw Object.assign(
+            new Error(`Minimum quantity required for "${offering.title}" is ${offering.minInvestQty} units.`),
+            { statusCode: 400 }
+          );
+        }
+        if (requestedQty > remainingQty) {
+          throw Object.assign(
+            new Error(`Only ${remainingQty} units remain available in this offering.`),
+            { statusCode: 400 }
+          );
+        }
+
+        const allInvestors = await getCollectionValue<Investor[]>(txDb, 'investors', []);
+        const normPhone = (v?: string) => (v || '').replace(/\D/g, '');
+        const actorDigits = normPhone(actor.phone);
+        const targetInvestorId =
+          actor.role === 'investor' ? actor.investorId : overrideInvestorId || actor.investorId;
+        const matchedInv = allInvestors.find(
+          (inv) =>
+            (targetInvestorId && inv.id === targetInvestorId) ||
+            (actorDigits && normPhone(inv.phone) === actorDigits)
+        );
+
+        const subtotalAmount = Math.round(requestedQty * offering.unitPrice);
+        const otherExpensesShare =
+          offering.otherExpenses > 0 && offering.maxAvailableQty > 0
+            ? Math.round((offering.otherExpenses * requestedQty) / offering.maxAvailableQty)
+            : 0;
+        const totalInvestment = subtotalAmount + otherExpensesShare;
+
+        createdRequest = {
+          id: `inv_req_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          offeringId: offering.id,
+          offeringTitle: offering.title,
+          productId: offering.productId,
+          investorId: matchedInv?.id || targetInvestorId,
+          userId: actor.id,
+          investorName: matchedInv?.name || actor.name || 'Registered Investor',
+          investorPhone: matchedInv?.phone || actor.phone || '',
+          requestedQty,
+          unitPrice: offering.unitPrice,
+          subtotalAmount,
+          otherExpensesShare,
+          totalInvestment,
+          notes: notes?.trim() || undefined,
+          status: 'pending',
+          createdAt: now,
+          updatedAt: now,
+        };
+
+        const requests = await getCollectionValue<InvestorProductRequest[]>(txDb, 'investor_requests', []);
+        await saveCollectionValue(txDb, 'investor_requests', [createdRequest, ...requests]);
+        await insertAdminAuditLog(txDb, {
+          action: 'create_investor_request',
+          entityType: 'investor_requests',
+          entityId: createdRequest.id,
+          actorId: actor.id,
+          actorName: actor.name,
+          actorRole: actor.role,
+          details: {
+            offeringId: offering.id,
+            offeringTitle: offering.title,
+            requestedQty,
+            totalInvestment,
+          },
+        });
+      });
+
+      broadcastSyncEvent('investor_requests', req.header('x-client-id'));
+      res.json({ ok: true, request: createdRequest, syncVersion: getSyncVersion() });
+    })
+  );
+
+  app.post(
+    '/api/investor-requests/:id/review',
+    asyncRoute(async (req, res) => {
+      const actor = await resolveActor(req);
+      if (actor.role !== 'super_admin' && actor.role !== 'admin') {
+        res.status(403).json({ error: 'Only Super Admin or Admin can approve or reject investment requests.' });
+        return;
+      }
+
+      const requestId = req.params.id;
+      const { decision, rejectionReason } = (req.body || {}) as {
+        decision?: 'approved' | 'rejected';
+        rejectionReason?: string;
+      };
+      if (decision !== 'approved' && decision !== 'rejected') {
+        res.status(400).json({ error: 'Decision must be "approved" or "rejected".' });
+        return;
+      }
+
+      const now = new Date().toISOString();
+      const todayStr = now.split('T')[0];
+      let updatedRequest!: InvestorProductRequest;
+
+      await withDbTransaction(async (txDb) => {
+        const requests = await getCollectionValue<InvestorProductRequest[]>(txDb, 'investor_requests', []);
+        const reqItem = requests.find((r) => r.id === requestId);
+        if (!reqItem) {
+          throw Object.assign(new Error('Investment request not found.'), { statusCode: 404 });
+        }
+        if (reqItem.status !== 'pending') {
+          throw Object.assign(new Error(`Request has already been ${reqItem.status}.`), { statusCode: 400 });
+        }
+
+        const offerings = await getCollectionValue<InvestorProductOffering[]>(txDb, 'investor_offerings', []);
+        const offeringIdx = offerings.findIndex((o) => o.id === reqItem.offeringId);
+
+        if (decision === 'approved') {
+          if (offeringIdx === -1) {
+            throw Object.assign(new Error('Linked offering no longer exists.'), { statusCode: 404 });
+          }
+          const offering = offerings[offeringIdx];
+          const remainingQty = Math.max(0, offering.maxAvailableQty - (offering.reservedQty || 0));
+          if (reqItem.requestedQty > remainingQty) {
+            throw Object.assign(
+              new Error(`Insufficient remaining units (${remainingQty}) to approve ${reqItem.requestedQty} units.`),
+              { statusCode: 400 }
+            );
+          }
+
+          const nextReserved = (offering.reservedQty || 0) + reqItem.requestedQty;
+          const nextOffering: InvestorProductOffering = {
+            ...offering,
+            reservedQty: nextReserved,
+            status: nextReserved >= offering.maxAvailableQty ? 'funded' : offering.status,
+            updatedAt: now,
+          };
+          const nextOfferings = [...offerings];
+          nextOfferings[offeringIdx] = nextOffering;
+          await saveCollectionValue(txDb, 'investor_offerings', nextOfferings);
+
+          // Credit investor capital & product allocation + ledger transaction
+          const investors = await getCollectionValue<Investor[]>(txDb, 'investors', []);
+          const normPhone = (v?: string) => (v || '').replace(/\D/g, '');
+          const reqPhoneDigits = normPhone(reqItem.investorPhone);
+          const invIdx = investors.findIndex(
+            (inv) =>
+              (reqItem.investorId && inv.id === reqItem.investorId) ||
+              (reqPhoneDigits && normPhone(inv.phone) === reqPhoneDigits)
+          );
+
+          let finalInvestorId = reqItem.investorId;
+          if (invIdx !== -1) {
+            const inv = investors[invIdx];
+            finalInvestorId = inv.id;
+            const prevAssigned = Array.isArray(inv.assignedProductIds) ? inv.assignedProductIds : [];
+            const nextAssigned =
+              reqItem.productId && !prevAssigned.includes(reqItem.productId)
+                ? [...prevAssigned, reqItem.productId]
+                : prevAssigned;
+
+            const allocProductKey = reqItem.productId || reqItem.offeringId;
+            const prevAllocs = Array.isArray(inv.productAllocations) ? inv.productAllocations : [];
+            const existingAllocIdx = prevAllocs.findIndex((a) => a.productId === allocProductKey);
+            const nextAllocs = [...prevAllocs];
+            if (existingAllocIdx !== -1) {
+              nextAllocs[existingAllocIdx] = {
+                ...nextAllocs[existingAllocIdx],
+                unitsOwned: (nextAllocs[existingAllocIdx].unitsOwned || 0) + reqItem.requestedQty,
+                investedAmount: (nextAllocs[existingAllocIdx].investedAmount || 0) + reqItem.totalInvestment,
+              };
+            } else {
+              nextAllocs.push({
+                productId: allocProductKey,
+                unitsOwned: reqItem.requestedQty,
+                investedAmount: reqItem.totalInvestment,
+                notes: `${reqItem.offeringTitle} (Approved Request)`,
+              });
+            }
+
+            const nextInvestors = [...investors];
+            nextInvestors[invIdx] = {
+              ...inv,
+              totalInvestment: (inv.totalInvestment || 0) + reqItem.totalInvestment,
+              assignedProductIds: nextAssigned,
+              productAllocations: nextAllocs,
+            };
+            await saveCollectionValue(txDb, 'investors', nextInvestors);
+          }
+
+          if (finalInvestorId) {
+            const invTxs = await getCollectionValue<InvestorTransaction[]>(txDb, 'investor_transactions', []);
+            const newTx: InvestorTransaction = {
+              id: `inv_tx_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`,
+              investorId: finalInvestorId,
+              date: todayStr,
+              type: 'investment_deposit',
+              amount: reqItem.totalInvestment,
+              productId: reqItem.productId,
+              productName: reqItem.offeringTitle,
+              notes: `Approved lot investment: ${reqItem.requestedQty} units @ Rs.${reqItem.unitPrice} + Rs.${reqItem.otherExpensesShare} expenses share`,
+              reference: reqItem.id,
+              createdAt: now,
+            };
+            await saveCollectionValue(txDb, 'investor_transactions', [newTx, ...invTxs]);
+          }
+        }
+
+        updatedRequest = {
+          ...reqItem,
+          status: decision,
+          reviewedById: actor.id,
+          reviewedByName: actor.name || 'Admin',
+          reviewedAt: now,
+          rejectionReason: decision === 'rejected' ? rejectionReason?.trim() || 'Declined by Admin' : undefined,
+          updatedAt: now,
+        };
+
+        const nextRequests = requests.map((r) => (r.id === requestId ? updatedRequest : r));
+        await saveCollectionValue(txDb, 'investor_requests', nextRequests);
+
+        await insertAdminAuditLog(txDb, {
+          action: decision === 'approved' ? 'approve_investor_request' : 'reject_investor_request',
+          entityType: 'investor_requests',
+          entityId: requestId,
+          actorId: actor.id,
+          actorName: actor.name,
+          actorRole: actor.role,
+          details: {
+            offeringTitle: reqItem.offeringTitle,
+            requestedQty: reqItem.requestedQty,
+            totalInvestment: reqItem.totalInvestment,
+            decision,
+          },
+        });
+      });
+
+      broadcastSyncEvent('investor_offerings', req.header('x-client-id'));
+      broadcastSyncEvent('investor_requests', req.header('x-client-id'));
+      broadcastSyncEvent('investors', req.header('x-client-id'));
+      broadcastSyncEvent('investor_transactions', req.header('x-client-id'));
+
+      res.json({ ok: true, request: updatedRequest, syncVersion: getSyncVersion() });
     })
   );
 
@@ -4769,8 +5324,18 @@ async function startServer() {
         .catch(next);
     });
   } else {
-    app.use(express.static(distDir, { index: 'index.html' }));
+    app.use(
+      express.static(distDir, {
+        index: false,
+        setHeaders: (res, filePath) => {
+          if (filePath.endsWith('index.html')) {
+            res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+          }
+        },
+      })
+    );
     app.get('*', (_req, res) => {
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
       res.sendFile(path.join(distDir, 'index.html'));
     });
   }

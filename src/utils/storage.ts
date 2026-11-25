@@ -14,6 +14,8 @@ import type {
   DeliveryCityConfig,
   Employee,
   Investor,
+  InvestorProductOffering,
+  InvestorProductRequest,
   InvestorTransaction,
   LoginAuditRecord,
   LoginFormConfig,
@@ -131,6 +133,8 @@ const STORAGE_KEYS = {
   IMPORT_LOGS: '100dagar_import_logs_v5',
   WASAL_SETTLEMENTS: '100dagar_wasal_settlements_v5',
   MONTHLY_EXPENSES: '100dagar_monthly_expenses_v5',
+  INVESTOR_OFFERINGS: '100dagar_investor_offerings_v5',
+  INVESTOR_REQUESTS: '100dagar_investor_requests_v5',
   CART: '100dagar_cart_v5',
 };
 
@@ -171,6 +175,8 @@ const STORAGE_TO_COLLECTION: Record<string, string> = {
   [STORAGE_KEYS.IMPORT_LOGS]: 'import_logs',
   [STORAGE_KEYS.WASAL_SETTLEMENTS]: 'wasal_settlements',
   [STORAGE_KEYS.MONTHLY_EXPENSES]: 'monthly_expenses',
+  [STORAGE_KEYS.INVESTOR_OFFERINGS]: 'investor_offerings',
+  [STORAGE_KEYS.INVESTOR_REQUESTS]: 'investor_requests',
 };
 
 const COLLECTION_TO_STORAGE: Record<string, string> = Object.fromEntries(
@@ -648,7 +654,7 @@ export async function apiScrapeProductUrl(
 
   try {
     let res = await attemptServerScrape();
-    if (res.status === 502 || res.status === 503 || res.status === 504) {
+    if (res.status === 502 || res.status === 503 || res.status === 504 || res.status === 505) {
       await new Promise((r) => setTimeout(r, 700));
       res = await attemptServerScrape();
     }
@@ -668,14 +674,6 @@ export async function apiScrapeProductUrl(
         ok: false,
         error:
           'Your session expired or needs a fresh sign-in after the security upgrade. Please sign in again as Super Admin, Admin, or Manager.',
-      };
-    }
-
-    if (res.status === 403) {
-      return {
-        ok: false,
-        error:
-          'Permission denied (HTTP 403). Please ensure you are signed in as Super Admin, Admin, or Manager before importing products.',
       };
     }
 
@@ -701,20 +699,47 @@ export async function apiScrapeProductUrl(
       return { ok: true, product: data.product, diagnostics: data.diagnostics };
     }
 
-    const isMissingBackendRoute =
-      res.status === 404 ||
-      res.status === 405 ||
-      (parsed.error?.includes('unexpected HTML page') ?? false);
+    if (res.status === 403 && data?.error?.toLowerCase().includes('only administrators')) {
+      return {
+        ok: false,
+        error:
+          'Permission denied (HTTP 403). Please ensure you are signed in as Super Admin, Admin, or Manager before importing products.',
+      };
+    }
 
-    if (isMissingBackendRoute) {
-      if (htmlOverride && htmlOverride.trim()) {
+    // For pasted HTML source, never let proxy/WAF/403-HTML/413/500/502/503/504/505 block parsing — parse locally in browser!
+    if (htmlOverride && htmlOverride.trim()) {
+      try {
         const localParsed = parseProductFromHtmlInBrowser(url, htmlOverride, getCategoryRecords());
         return {
           ok: true,
           product: localParsed.product,
           diagnostics: localParsed.diagnostics,
         };
+      } catch (parseErr) {
+        return {
+          ok: false,
+          error:
+            (parseErr instanceof Error ? parseErr.message : '') ||
+            data?.error ||
+            parsed.error ||
+            'Could not extract product data from the pasted HTML source.',
+        };
       }
+    }
+
+    const isBackendOrProxyFailure =
+      res.status === 404 ||
+      res.status === 405 ||
+      res.status === 500 ||
+      res.status === 502 ||
+      res.status === 503 ||
+      res.status === 504 ||
+      res.status === 505 ||
+      res.status === 422 ||
+      (parsed.error?.includes('unexpected HTML page') ?? false);
+
+    if (isBackendOrProxyFailure) {
       const fallbackRes = await tryFetchProductInBrowserFallback(url, getCategoryRecords());
       if (fallbackRes.ok && fallbackRes.product) {
         return {
@@ -726,9 +751,10 @@ export async function apiScrapeProductUrl(
       return {
         ok: false,
         error:
+          data?.error ||
           fallbackRes.error ||
           parsed.error ||
-          'Backend scraper endpoint returned HTTP 404. Use "Paste HTML Source" below to import offline directly in your browser.',
+          `Server returned HTTP ${res.status}. Open the page in your browser, copy Page Source (Ctrl+U -> Ctrl+A -> Ctrl+C), and use "Paste HTML Source" below.`,
       };
     }
 
@@ -738,12 +764,19 @@ export async function apiScrapeProductUrl(
     };
   } catch (err) {
     if (htmlOverride && htmlOverride.trim()) {
-      const localParsed = parseProductFromHtmlInBrowser(url, htmlOverride, getCategoryRecords());
-      return {
-        ok: true,
-        product: localParsed.product,
-        diagnostics: localParsed.diagnostics,
-      };
+      try {
+        const localParsed = parseProductFromHtmlInBrowser(url, htmlOverride, getCategoryRecords());
+        return {
+          ok: true,
+          product: localParsed.product,
+          diagnostics: localParsed.diagnostics,
+        };
+      } catch (parseErr) {
+        return {
+          ok: false,
+          error: parseErr instanceof Error ? parseErr.message : 'Failed to parse pasted HTML.',
+        };
+      }
     }
     const fallbackRes = await tryFetchProductInBrowserFallback(url, getCategoryRecords());
     if (fallbackRes.ok && fallbackRes.product) {
@@ -2754,9 +2787,185 @@ export function importAllDataJSON(jsonStr: string): boolean {
     if (parsed.importLogs) saveProductImportLogs(parsed.importLogs);
     if (parsed.wasalSettlements) saveWasalSettlements(parsed.wasalSettlements);
     if (parsed.monthlyExpenses) saveMonthlyExpenses(parsed.monthlyExpenses);
+    if (parsed.investorOfferings) saveInvestorOfferings(parsed.investorOfferings);
+    if (parsed.investorRequests) saveInvestorRequests(parsed.investorRequests);
     return true;
   } catch (e) {
     console.error('Failed to import JSON data', e);
     return false;
   }
 }
+
+// ==========================================
+// INVESTOR PRODUCT OFFERINGS & PENDING REQUESTS
+// ==========================================
+
+export function getInvestorOfferings(): InvestorProductOffering[] {
+  return loadFromStorage<InvestorProductOffering[]>(STORAGE_KEYS.INVESTOR_OFFERINGS, []);
+}
+
+export function saveInvestorOfferings(list: InvestorProductOffering[]): void {
+  saveToStorage(STORAGE_KEYS.INVESTOR_OFFERINGS, list);
+}
+
+export function getInvestorRequests(): InvestorProductRequest[] {
+  return loadFromStorage<InvestorProductRequest[]>(STORAGE_KEYS.INVESTOR_REQUESTS, []);
+}
+
+export function saveInvestorRequests(list: InvestorProductRequest[]): void {
+  saveToStorage(STORAGE_KEYS.INVESTOR_REQUESTS, list);
+}
+
+export async function apiFetchInvestorOfferings(): Promise<{
+  ok: boolean;
+  offerings?: InvestorProductOffering[];
+  requests?: InvestorProductRequest[];
+  error?: string;
+}> {
+  try {
+    const res = await fetch('/api/investor-offerings', { headers: getAuthHeaders(), cache: 'no-store' });
+    const parsed = await safeParseJsonResponse<{
+      ok?: boolean;
+      offerings?: InvestorProductOffering[];
+      requests?: InvestorProductRequest[];
+      error?: string;
+    }>(res);
+    if (!parsed.ok || !parsed.data?.ok) {
+      return { ok: false, error: parsed.data?.error || parsed.error || 'Failed to fetch investor offerings.' };
+    }
+    if (Array.isArray(parsed.data.offerings)) {
+      memoryStore.set(STORAGE_KEYS.INVESTOR_OFFERINGS, parsed.data.offerings);
+    }
+    if (Array.isArray(parsed.data.requests)) {
+      memoryStore.set(STORAGE_KEYS.INVESTOR_REQUESTS, parsed.data.requests);
+    }
+    notifyListeners();
+    return { ok: true, offerings: parsed.data.offerings || [], requests: parsed.data.requests || [] };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
+export async function apiSaveInvestorOffering(
+  payload: Partial<InvestorProductOffering>,
+  existingId?: string
+): Promise<{ ok: boolean; offering?: InvestorProductOffering; offerings?: InvestorProductOffering[]; error?: string }> {
+  try {
+    const endpoint = existingId
+      ? `/api/investor-offerings/${encodeURIComponent(existingId)}`
+      : '/api/investor-offerings';
+    const res = await fetch(endpoint, {
+      method: existingId ? 'PUT' : 'POST',
+      headers: getAuthHeaders(),
+      cache: 'no-store',
+      body: JSON.stringify(payload),
+    });
+    const parsed = await safeParseJsonResponse<{
+      ok?: boolean;
+      offering?: InvestorProductOffering;
+      offerings?: InvestorProductOffering[];
+      error?: string;
+    }>(res);
+    if (!parsed.ok || !parsed.data?.ok) {
+      return { ok: false, error: parsed.data?.error || parsed.error || 'Failed to save investor product offering.' };
+    }
+    await refreshSyncState();
+    return { ok: true, offering: parsed.data.offering, offerings: parsed.data.offerings };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
+export async function apiDeleteInvestorOffering(id: string): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await fetch(`/api/investor-offerings/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+      headers: getAuthHeaders(),
+      cache: 'no-store',
+    });
+    const parsed = await safeParseJsonResponse<{ ok?: boolean; error?: string }>(res);
+    if (!parsed.ok || !parsed.data?.ok) {
+      return { ok: false, error: parsed.data?.error || parsed.error || 'Failed to delete offering.' };
+    }
+    await refreshSyncState();
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
+export async function apiCreateInvestorRequest(payload: {
+  offeringId: string;
+  requestedQty: number;
+  notes?: string;
+  investorId?: string;
+}): Promise<{ ok: boolean; request?: InvestorProductRequest; error?: string }> {
+  try {
+    const res = await fetch('/api/investor-requests', {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      cache: 'no-store',
+      body: JSON.stringify(payload),
+    });
+    const parsed = await safeParseJsonResponse<{
+      ok?: boolean;
+      request?: InvestorProductRequest;
+      error?: string;
+    }>(res);
+    if (!parsed.ok || !parsed.data?.ok) {
+      return { ok: false, error: parsed.data?.error || parsed.error || 'Failed to submit investment request.' };
+    }
+    await refreshSyncState();
+    return { ok: true, request: parsed.data.request };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
+export async function apiReviewInvestorRequest(
+  requestId: string,
+  decision: 'approved' | 'rejected',
+  rejectionReason?: string
+): Promise<{ ok: boolean; request?: InvestorProductRequest; error?: string }> {
+  try {
+    const res = await fetch(`/api/investor-requests/${encodeURIComponent(requestId)}/review`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      cache: 'no-store',
+      body: JSON.stringify({ decision, rejectionReason }),
+    });
+    const parsed = await safeParseJsonResponse<{
+      ok?: boolean;
+      request?: InvestorProductRequest;
+      error?: string;
+    }>(res);
+    if (!parsed.ok || !parsed.data?.ok) {
+      return { ok: false, error: parsed.data?.error || parsed.error || 'Failed to review investment request.' };
+    }
+    await refreshSyncState();
+    return { ok: true, request: parsed.data.request };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
+/**
+ * Clears ONLY browser localStorage/sessionStorage UI cache keys without modifying or deleting any server database records.
+ * Used for safe recovery on subdomain/live host HTTP 505 or stale cache errors.
+ */
+export function clearClientCacheSafely(): void {
+  try {
+    memoryStore.clear();
+    const keysToRemove: string[] = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith('100dagar_') && k !== SESSION_TOKEN_KEY) {
+        keysToRemove.push(k);
+      }
+    }
+    keysToRemove.forEach((k) => localStorage.removeItem(k));
+  } catch {
+    // ignore browser storage restrictions
+  }
+}
+

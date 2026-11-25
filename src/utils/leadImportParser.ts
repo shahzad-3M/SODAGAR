@@ -1,4 +1,4 @@
-import { readSheet } from 'read-excel-file/browser';
+import readXlsxFile, { readSheet } from 'read-excel-file/browser';
 import type { CRMLead, CRMLeadStage, CRMSourceChannel } from '../types/index.ts';
 import { normalizeDigits } from './crmEngine.ts';
 
@@ -126,11 +126,23 @@ function parseDateCellStrict(
     const iso = raw.toISOString();
     return { value: mode === 'dateOnly' ? iso.slice(0, 10) : iso };
   }
+  if (typeof raw === 'number' && Number.isFinite(raw)) {
+    // Support Excel numeric serial dates (days since 1899-12-30)
+    if (raw >= 25569 && raw <= 80000) {
+      const utcMs = Math.round((raw - 25569) * 86400 * 1000);
+      const d = new Date(utcMs);
+      if (!Number.isNaN(d.getTime())) {
+        const iso = d.toISOString();
+        return { value: mode === 'dateOnly' ? iso.slice(0, 10) : iso };
+      }
+    }
+    return { invalidRaw: String(raw) };
+  }
   const str = String(raw).trim();
   if (!str) return {};
 
-  // Strict ISO YYYY-MM-DD
-  const ymdOnly = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(str);
+  // Strict ISO YYYY-MM-DD or YYYY/MM/DD
+  const ymdOnly = /^(\d{4})[/-](\d{1,2})[/-](\d{1,2})$/.exec(str);
   if (ymdOnly) {
     const year = Number(ymdOnly[1]);
     const month = Number(ymdOnly[2]);
@@ -143,12 +155,19 @@ function parseDateCellStrict(
     return { value: `${year}-${mm}-${dd}` };
   }
 
-  // Strict DD/MM/YYYY or DD-MM-YYYY
+  // Strict DD/MM/YYYY, DD-MM-YYYY, or unambiguous MM/DD/YYYY from Excel exports
   const dmy = /^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$/.exec(str);
   if (dmy) {
-    const day = Number(dmy[1]);
-    const month = Number(dmy[2]);
+    const first = Number(dmy[1]);
+    const second = Number(dmy[2]);
     const year = Number(dmy[3]);
+    let day = first;
+    let month = second;
+    if (second > 12 && first >= 1 && first <= 12) {
+      // Unambiguous MM/DD/YYYY (e.g. 11/28/2026)
+      month = first;
+      day = second;
+    }
     if (!isValidCalendarDateParts(year, month, day)) {
       return { invalidRaw: str };
     }
@@ -456,9 +475,10 @@ export function matrixToLeadDrafts(
       }
     }
 
-    const leadName = String(mapped.leadName ?? '').trim();
+    const rawLeadName = String(mapped.leadName ?? '').trim();
     const phone = normalizePhoneCell(mapped.phone ?? mapped.whatsapp);
     const normalizedPhone = normalizeDigits(phone);
+    const leadName = rawLeadName || (normalizedPhone.length >= 7 ? `WhatsApp Contact (${normalizedPhone.slice(-4)})` : '');
     const whatsapp = mapped.whatsapp ? normalizePhoneCell(mapped.whatsapp) : undefined;
     const email = mapped.email ? String(mapped.email).trim() : undefined;
     const city = mapped.city ? String(mapped.city).trim() : undefined;
@@ -476,9 +496,9 @@ export function matrixToLeadDrafts(
 
     let isValid = true;
     let errorReason: string | undefined;
-    if (!leadName) {
+    if (!leadName && normalizedPhone.length < 7) {
       isValid = false;
-      errorReason = 'Missing lead name';
+      errorReason = 'Missing phone number';
     } else if (normalizedPhone.length < 7) {
       isValid = false;
       errorReason = 'Missing or invalid phone number';
@@ -539,7 +559,14 @@ export async function parseLeadUploadFile(
   const ext = fileName.split('.').pop()?.toLowerCase() || '';
 
   if (ext === 'xlsx') {
-    const sheetData = await readSheet(file);
+    let sheetData: unknown[][] = [];
+    try {
+      const sheets = await readXlsxFile(file);
+      const bestSheet = [...sheets].sort((a, b) => (b.data?.length || 0) - (a.data?.length || 0))[0];
+      sheetData = bestSheet?.data || [];
+    } catch {
+      sheetData = await readSheet(file);
+    }
     const parsed = matrixToLeadDrafts(sheetData, options);
     return {
       fileName,
@@ -558,7 +585,14 @@ export async function parseLeadUploadFile(
       headerBytes[3] === 0xe0;
 
     if (isZip) {
-      const sheetData = await readSheet(file);
+      let sheetData: unknown[][] = [];
+      try {
+        const sheets = await readXlsxFile(file);
+        const bestSheet = [...sheets].sort((a, b) => (b.data?.length || 0) - (a.data?.length || 0))[0];
+        sheetData = bestSheet?.data || [];
+      } catch {
+        sheetData = await readSheet(file);
+      }
       const parsed = matrixToLeadDrafts(sheetData, options);
       return {
         fileName,

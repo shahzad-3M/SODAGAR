@@ -37,11 +37,13 @@ import {
   UserPlus,
   Users,
   Video,
+  Zap,
 } from 'lucide-react';
 import type {
   AppUser,
   BusinessProfile,
   CRMAutoSegmentName,
+  CRMBuyerSignal,
   CRMCampaign,
   CRMCustomSegmentRule,
   CRMDashboardKPIs,
@@ -49,6 +51,7 @@ import type {
   CRMFollowUpStatus,
   CRMFollowUpTask,
   CRMFollowUpTaskType,
+  CRMGroupSignalSummary,
   CRMLead,
   CRMLeadStage,
   CRMLoyaltyConfig,
@@ -68,6 +71,7 @@ import {
   ALL_AUTO_SEGMENTS,
   CRM_REPORT_CATALOG,
   CRM_WHATSAPP_TEMPLATES,
+  computeCrmCampaignSignals,
   normalizeDigits,
   renderCrmWhatsAppTemplate,
 } from '../utils/crmEngine.ts';
@@ -103,7 +107,7 @@ import {
   apiUpdateCrmCustomer,
   downloadCrmReportFile,
 } from '../utils/storage.ts';
-import { openWhatsAppDirect } from '../utils/whatsapp.ts';
+import { buildCurrentOriginUrl, getCurrentOrigin, openWhatsAppDirect } from '../utils/whatsapp.ts';
 
 interface CRMWorkspaceViewProps {
   currentUser: AppUser;
@@ -268,10 +272,14 @@ export const CRMWorkspaceView: React.FC<CRMWorkspaceViewProps> = ({
   const [campMediaVideoUrl, setCampMediaVideoUrl] = useState('');
   const [campOfferText, setCampOfferText] = useState('');
   const [campCtaLabel, setCampCtaLabel] = useState('Shop Bundle Offer Now');
-  const [campCtaUrl, setCampCtaUrl] = useState('https://www.madinamarket.pk');
+  const [campCtaUrl, setCampCtaUrl] = useState(() => getCurrentOrigin() || buildCurrentOriginUrl('/'));
   const [campSelectedRecipientIds, setCampSelectedRecipientIds] = useState<string[]>([]);
   const [campRecipientSearch, setCampRecipientSearch] = useState('');
   const [campRecipientCityFilter, setCampRecipientCityFilter] = useState('ALL');
+  const [campRecipientSourceTab, setCampRecipientSourceTab] = useState<'all' | 'customers' | 'leads'>('all');
+  const [campUploadingLeads, setCampUploadingLeads] = useState(false);
+  const [expandedSignalGroupId, setExpandedSignalGroupId] = useState<string | null>(null);
+  const campLeadFileInputRef = useRef<HTMLInputElement | null>(null);
   const [campProductSearch, setCampProductSearch] = useState('');
   const [activeBundleLauncherId, setActiveBundleLauncherId] = useState<string | null>(null);
   const [sentRecipientIdsByCamp, setSentRecipientIdsByCamp] = useState<Record<string, string[]>>({});
@@ -772,38 +780,51 @@ export const CRMWorkspaceView: React.FC<CRMWorkspaceViewProps> = ({
     }
 
     setLeadImporting(true);
-    const res = await apiBulkImportCrmLeads({
-      leads: validRows.map((r) => ({
-        leadName: r.leadName,
-        phone: r.phone,
-        whatsapp: r.whatsapp,
-        email: r.email,
-        city: r.city,
-        source: r.source,
-        interestedProductName: r.interestedProductName,
-        estimatedValue: r.estimatedValue,
-        followUpDate: r.followUpDate,
-        createdAt: r.createdAt,
-        notes: r.notes,
-        stage: r.stage,
-      })),
-      defaultSource: leadUploadSource,
-      defaultStage: leadUploadStage,
-      skipDuplicates: leadUploadDuplicateMode === 'skip',
-      updateDuplicates: leadUploadDuplicateMode === 'update',
-    });
+    let totalImported = 0;
+    let totalUpdated = 0;
+    let totalSkipped = 0;
+    let totalInvalid = 0;
+    const BATCH_SIZE = 500;
+
+    for (let i = 0; i < validRows.length; i += BATCH_SIZE) {
+      const chunk = validRows.slice(i, i + BATCH_SIZE);
+      const res = await apiBulkImportCrmLeads({
+        leads: chunk.map((r) => ({
+          leadName: r.leadName,
+          phone: r.phone,
+          whatsapp: r.whatsapp,
+          email: r.email,
+          city: r.city,
+          source: r.source,
+          interestedProductName: r.interestedProductName,
+          estimatedValue: r.estimatedValue,
+          followUpDate: r.followUpDate,
+          createdAt: r.createdAt,
+          notes: r.notes,
+          stage: r.stage,
+        })),
+        defaultSource: leadUploadSource,
+        defaultStage: leadUploadStage,
+        skipDuplicates: leadUploadDuplicateMode === 'skip',
+        updateDuplicates: leadUploadDuplicateMode === 'update',
+      });
+      if (!res.ok) {
+        setLeadImporting(false);
+        showNotice(res.error || `Bulk lead import failed at batch ${Math.floor(i / BATCH_SIZE) + 1}.`, 'error');
+        return;
+      }
+      totalImported += res.importedCount ?? 0;
+      totalUpdated += res.updatedCount ?? 0;
+      totalSkipped += res.skippedDuplicatesCount ?? 0;
+      totalInvalid += res.invalidCount ?? 0;
+    }
     setLeadImporting(false);
 
-    if (!res.ok) {
-      showNotice(res.error || 'Bulk lead import failed.', 'error');
-      return;
-    }
-
     const parts = [
-      `Imported ${res.importedCount ?? 0} new lead(s)`,
-      res.updatedCount ? `updated ${res.updatedCount}` : '',
-      res.skippedDuplicatesCount ? `skipped ${res.skippedDuplicatesCount} duplicate(s)` : '',
-      res.invalidCount ? `${res.invalidCount} invalid row(s) ignored` : '',
+      `Imported ${totalImported} new lead(s)`,
+      totalUpdated ? `updated ${totalUpdated}` : '',
+      totalSkipped ? `skipped ${totalSkipped} duplicate(s)` : '',
+      totalInvalid ? `${totalInvalid} invalid row(s) ignored` : '',
     ].filter(Boolean);
 
     showNotice(`${parts.join(' · ')}.`, 'success');
@@ -811,6 +832,148 @@ export const CRMWorkspaceView: React.FC<CRMWorkspaceViewProps> = ({
     setLeadUploadPasteText('');
     setIsLeadUploadOpen(false);
     await loadCrmData();
+  };
+
+  const handleCampaignLeadFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    setCampUploadingLeads(true);
+    try {
+      const parsed = await parseLeadUploadFile(file, {
+        defaultSource: 'WhatsApp',
+        defaultStage: 'New',
+        existingLeads: crmState?.leads || [],
+        existingCustomerPhones: existingCustomerPhoneSet,
+      });
+      const validRows = parsed.rows.filter((r) => r.isValid);
+      if (validRows.length === 0) {
+        showNotice(parsed.warnings[0] || 'No valid WhatsApp phone rows found in the uploaded file.', 'error');
+        return;
+      }
+
+      const BATCH_SIZE = 500;
+      let totalImported = 0;
+      for (let i = 0; i < validRows.length; i += BATCH_SIZE) {
+        const chunk = validRows.slice(i, i + BATCH_SIZE);
+        const res = await apiBulkImportCrmLeads({
+          leads: chunk.map((r) => ({
+            leadName: r.leadName,
+            phone: r.phone,
+            whatsapp: r.whatsapp || r.phone,
+            email: r.email,
+            city: r.city,
+            source: r.source,
+            interestedProductName: r.interestedProductName,
+            estimatedValue: r.estimatedValue,
+            followUpDate: r.followUpDate,
+            createdAt: r.createdAt,
+            notes: r.notes,
+            stage: r.stage,
+          })),
+          defaultSource: 'WhatsApp',
+          defaultStage: 'New',
+          skipDuplicates: true,
+          updateDuplicates: false,
+        });
+        if (!res.ok) {
+          showNotice(res.error || 'Could not import WhatsApp leads into CRM.', 'error');
+          return;
+        }
+        totalImported += res.importedCount ?? 0;
+      }
+
+      const freshBundle = await apiFetchCrmState();
+      if (freshBundle.ok && freshBundle.data) {
+        setCrmState(freshBundle.data);
+        const uploadedPhones = new Set(validRows.map((r) => normalizeDigits(r.phone)));
+        const matchedLeadIds = freshBundle.data.leads
+          .filter((l) => uploadedPhones.has(normalizeDigits(l.phone)))
+          .map((l) => l.id);
+        setCampSelectedRecipientIds((prev) => Array.from(new Set([...prev, ...matchedLeadIds])));
+        setCampRecipientSourceTab('leads');
+        setCampMode('manual_bundle');
+      }
+      showNotice(
+        `Uploaded ${validRows.length} WhatsApp contacts from ${parsed.fileName} (${totalImported} new leads saved) and selected them for your campaign.`,
+        'success'
+      );
+    } catch (err) {
+      showNotice(err instanceof Error ? err.message : 'Failed to parse uploaded file.', 'error');
+    } finally {
+      setCampUploadingLeads(false);
+    }
+  };
+
+  // Smart Buyer & Group Signals across all customer tiers
+  const campaignSignals = useMemo<CRMGroupSignalSummary[]>(() => {
+    if (!crmState) return [];
+    return computeCrmCampaignSignals({
+      profiles: crmState.profiles,
+      products,
+    });
+  }, [crmState, products]);
+
+  const handleLoadSignalGroupIntoCampaign = (sig: CRMGroupSignalSummary) => {
+    setCampMode('manual_bundle');
+    setCampName(`${sig.groupLabel} — ${sig.actionType}: ${sig.recommendedProductName}`);
+    setCampBundleTitle(`${sig.recommendedProductName} (${sig.actionType})`);
+    if (sig.recommendedProductId) {
+      setCampBundleProductIds([sig.recommendedProductId]);
+      const prod = products.find((p) => p.id === sig.recommendedProductId);
+      if (prod) {
+        const img = prod.imageUrl || prod.pictures?.[0] || '';
+        if (img) setCampMediaImageUrl(img);
+        setCampCtaUrl(buildCurrentOriginUrl(`/?product=${encodeURIComponent(prod.id)}`));
+        if (prod.ourPrice > 0) setCampBundleOfferPrice(String(prod.ourPrice));
+      }
+    } else {
+      setCampCtaUrl(getCurrentOrigin() || buildCurrentOriginUrl('/'));
+    }
+
+    const eligibleIds = sig.buyers.map((b) => b.customerId);
+    setCampSelectedRecipientIds(eligibleIds);
+
+    const renderedBody = renderCrmWhatsAppTemplate(sig.templateType, {
+      customerName: 'Valued Customer',
+      productName: sig.recommendedProductName,
+      amount: sig.recommendedProductPrice || 0,
+      balance: sig.buyers[0]?.outstandingBalance || 0,
+      city: sig.buyers[0]?.city || 'Muzaffarabad',
+      couponCode: sig.groupKey === 'vip_customers' ? 'VIP-OFFER' : sig.groupKey === 'cold_customers' ? 'WELCOME-BACK' : 'SAVE-NOW',
+      storeName: profile.name || '100DAGAR · Madina Market',
+      websiteUrl: getCurrentOrigin() || buildCurrentOriginUrl('/'),
+    });
+    setCampOfferText(renderedBody);
+    setWaTemplateType(sig.templateType);
+    setWaProductName(sig.recommendedProductName);
+    showNotice(
+      `Loaded "${sig.groupLabel}" (${eligibleIds.length} buyers) & recommended product "${sig.recommendedProductName}" into the campaign builder.`,
+      'success'
+    );
+  };
+
+  const handleSendSignalBuyerWa = async (buyer: CRMBuyerSignal) => {
+    const rendered = renderCrmWhatsAppTemplate(buyer.templateType, {
+      customerName: buyer.customerName,
+      productName: buyer.recommendedProductName,
+      amount: buyer.recommendedProductPrice || 0,
+      balance: buyer.outstandingBalance || 0,
+      city: buyer.city || 'Muzaffarabad',
+      couponCode: buyer.groupKey === 'vip_customers' ? 'VIP-OFFER' : buyer.groupKey === 'cold_customers' ? 'WELCOME-BACK' : 'SAVE-NOW',
+      storeName: profile.name || '100DAGAR · Madina Market',
+      websiteUrl: buyer.recommendedProductId
+        ? buildCurrentOriginUrl(`/?product=${encodeURIComponent(buyer.recommendedProductId)}`)
+        : getCurrentOrigin() || buildCurrentOriginUrl('/'),
+    });
+    openWhatsAppDirect(buyer.phone, rendered);
+    await apiLogCrmActivity({
+      customerId: buyer.customerId,
+      phone: buyer.phone,
+      eventType: 'whatsapp_opened',
+      notes: `Signal ${buyer.groupLabel} (${buyer.actionType}) opened for ${buyer.recommendedProductName}`,
+    });
+    showNotice(`WhatsApp ${buyer.actionType} opened for ${buyer.customerName}.`, 'info');
   };
 
   // WhatsApp composer + Campaign handlers
@@ -831,7 +994,7 @@ export const CRMWorkspaceView: React.FC<CRMWorkspaceViewProps> = ({
         city: waTargetCustomer?.customer.city || 'Muzaffarabad',
         couponCode: waCouponCode || 'MADINA-VIP',
         storeName: profile.name || '100DAGAR · Madina Market',
-        websiteUrl: 'https://www.madinamarket.pk',
+        websiteUrl: getCurrentOrigin() || buildCurrentOriginUrl('/'),
       },
       waCustomBody || undefined
     );
@@ -871,8 +1034,9 @@ export const CRMWorkspaceView: React.FC<CRMWorkspaceViewProps> = ({
         if (!campMediaImageUrl && primaryImg) {
           setCampMediaImageUrl(primaryImg);
         }
-        if (campCtaUrl === 'https://www.madinamarket.pk' || !campCtaUrl.trim()) {
-          setCampCtaUrl(`https://www.madinamarket.pk/?product=${encodeURIComponent(prod.id)}`);
+        const currentOrigin = getCurrentOrigin();
+        if (!campCtaUrl.trim() || campCtaUrl === currentOrigin || campCtaUrl === `${currentOrigin}/`) {
+          setCampCtaUrl(buildCurrentOriginUrl(`/?product=${encodeURIComponent(prod.id)}`));
         }
         if (!campBundleTitle.trim()) {
           setCampBundleTitle(next.length === 1 ? `${prod.name} Special Offer` : `${next.length}-Product Bundle Deal`);
@@ -949,7 +1113,7 @@ export const CRMWorkspaceView: React.FC<CRMWorkspaceViewProps> = ({
         mediaImageUrl: campMediaImageUrl.trim() || undefined,
         mediaVideoUrl: campMediaVideoUrl.trim() || undefined,
         ctaLabel: campCtaLabel.trim() || 'Shop Bundle Offer Now',
-        ctaUrl: campCtaUrl.trim() || 'https://www.madinamarket.pk',
+        ctaUrl: campCtaUrl.trim() || getCurrentOrigin() || buildCurrentOriginUrl('/'),
         targetRecipientIds: campSelectedRecipientIds,
         recipientsCount: campSelectedRecipientIds.length,
         templateType: 'discount_offer',
@@ -1012,27 +1176,30 @@ export const CRMWorkspaceView: React.FC<CRMWorkspaceViewProps> = ({
     await loadCrmData();
   };
 
-  const handleSendBundleRecipientWa = async (cmp: CRMCampaign, profileItem: Customer360Profile) => {
-    if (profileItem.customer.whatsappOptOut) {
-      showNotice(`${profileItem.customer.name} has opted out of marketing messages.`, 'error');
+  const handleSendBundleRecipientWa = async (
+    cmp: CRMCampaign,
+    recipient: { id: string; name: string; phone: string; whatsapp?: string; whatsappOptOut?: boolean; isLead?: boolean }
+  ) => {
+    if (recipient.whatsappOptOut) {
+      showNotice(`${recipient.name} has opted out of marketing messages.`, 'error');
       return;
     }
-    const msg = buildBundleWhatsappText(cmp, profileItem.customer.name);
-    openWhatsAppDirect(profileItem.customer.whatsapp || profileItem.customer.phone, msg);
+    const msg = buildBundleWhatsappText(cmp, recipient.name);
+    openWhatsAppDirect(recipient.whatsapp || recipient.phone, msg);
     await apiLogCrmActivity({
-      customerId: profileItem.customer.id,
-      phone: profileItem.customer.phone,
+      customerId: recipient.isLead ? undefined : recipient.id,
+      phone: recipient.phone,
       eventType: 'whatsapp_opened',
-      notes: `Manual Bundle Campaign "${cmp.name}" opened via WhatsApp click-to-chat`,
+      notes: `Manual Bundle Campaign "${cmp.name}" opened via WhatsApp click-to-chat (${recipient.isLead ? 'CRM Lead' : 'Customer'})`,
     });
     const prevSent = sentRecipientIdsByCamp[cmp.id] || [];
-    if (!prevSent.includes(profileItem.customer.id)) {
-      const nextSent = [...prevSent, profileItem.customer.id];
+    if (!prevSent.includes(recipient.id)) {
+      const nextSent = [...prevSent, recipient.id];
       setSentRecipientIdsByCamp((prev) => ({ ...prev, [cmp.id]: nextSent }));
       await apiSaveCrmCampaign({ ...cmp, sentCount: Math.max(cmp.sentCount || 0, nextSent.length) });
       await loadCrmData();
     }
-    showNotice(`WhatsApp prepared for ${profileItem.customer.name}. Press Send inside WhatsApp to deliver.`, 'info');
+    showNotice(`WhatsApp prepared for ${recipient.name}. Press Send inside WhatsApp to deliver.`, 'info');
   };
 
   const handleUpdateCampaignStatus = async (cmp: CRMCampaign, nextStatus: 'Approved' | 'Launched') => {
@@ -2489,6 +2656,113 @@ export const CRMWorkspaceView: React.FC<CRMWorkspaceViewProps> = ({
       {/* 5. WHATSAPP CRM & CAMPAIGN MANAGEMENT */}
       {activeSubTab === 'whatsapp' && crmState && (
         <div className="space-y-4">
+          {/* SMART BUYER & GROUP SIGNALS PANEL (All Tiers: VIP, Recent, Repeat, Regular, Cold, Payment Due, Category) */}
+          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-4 space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <h3 className="text-sm font-bold text-slate-900 dark:text-white flex items-center gap-1.5">
+                  <Zap className="w-4 h-4 text-amber-500" />
+                  <span>Smart Buyer &amp; Group Signals (Product + Offer / Reminder Recommendations)</span>
+                </h3>
+                <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                  Live segmentation across VIP, Recent Buyers, Repeat, Regular, Cold/Inactive, Khata Due &amp; Categories — click "Load into Campaign" or expand any group to message individual buyers.
+                </p>
+              </div>
+              <span className="text-[11px] font-mono text-slate-500 tabular-nums">
+                {campaignSignals.length} Active Signal Groups
+              </span>
+            </div>
+
+            {campaignSignals.length === 0 ? (
+              <p className="text-xs text-slate-400 py-3">No customer signals computed yet. Record customer orders or leads to activate automated buyer targeting.</p>
+            ) : (
+              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+                {campaignSignals.map((sig) => {
+                  const isExpanded = expandedSignalGroupId === sig.id;
+                  return (
+                    <div
+                      key={sig.id}
+                      className="rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-850 p-3 flex flex-col justify-between gap-2.5 text-xs"
+                    >
+                      <div className="space-y-1">
+                        <div className="flex items-start justify-between gap-2">
+                          <div>
+                            <span className="text-[10px] font-bold uppercase tracking-wider text-amber-700 dark:text-amber-400">
+                              {sig.actionType}
+                            </span>
+                            <h4 className="font-bold text-slate-900 dark:text-white text-xs leading-snug">
+                              {sig.groupLabel}
+                            </h4>
+                          </div>
+                          <span className="font-mono font-bold text-xs text-slate-800 dark:text-slate-200 tabular-nums shrink-0">
+                            {sig.buyerCount} buyers
+                          </span>
+                        </div>
+                        <div className="text-[11px] text-slate-700 dark:text-slate-300">
+                          Recommended: <span className="font-bold">{sig.recommendedProductName}</span>
+                          {sig.recommendedProductPrice ? (
+                            <span className="font-mono text-emerald-700 dark:text-emerald-400 ml-1 tabular-nums">
+                              ({profile.currencySymbol}{sig.recommendedProductPrice.toLocaleString('en-PK')})
+                            </span>
+                          ) : null}
+                        </div>
+                        <p className="text-[11px] text-slate-500 dark:text-slate-400 line-clamp-2">{sig.reason}</p>
+                      </div>
+
+                      <div className="flex flex-wrap items-center justify-between gap-1.5 pt-2 border-t border-slate-200/80 dark:border-slate-700/80">
+                        <button
+                          type="button"
+                          onClick={() => setExpandedSignalGroupId(isExpanded ? null : sig.id)}
+                          className="px-2 py-1 rounded border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-200 font-semibold text-[11px] cursor-pointer hover:bg-slate-100 dark:hover:bg-slate-800"
+                        >
+                          {isExpanded ? 'Hide Buyers' : `View Buyers (${sig.buyerCount})`}
+                        </button>
+                        {can('canManageCampaigns') && (
+                          <button
+                            type="button"
+                            onClick={() => handleLoadSignalGroupIntoCampaign(sig)}
+                            className="px-2.5 py-1 rounded bg-slate-900 dark:bg-amber-500 text-white dark:text-slate-950 font-bold text-[11px] cursor-pointer hover:opacity-90"
+                          >
+                            Load into Campaign
+                          </button>
+                        )}
+                      </div>
+
+                      {isExpanded && (
+                        <div className="mt-1 pt-2 border-t border-slate-200 dark:border-slate-700 space-y-1.5 max-h-48 overflow-y-auto">
+                          {sig.buyers.slice(0, 25).map((buyer) => (
+                            <div
+                              key={`${sig.id}_${buyer.customerId}`}
+                              className="flex items-center justify-between gap-2 p-1.5 rounded bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800"
+                            >
+                              <div className="min-w-0">
+                                <div className="font-bold text-[11px] truncate text-slate-900 dark:text-white">
+                                  {buyer.customerName}
+                                </div>
+                                <div className="text-[10px] text-slate-500 truncate">
+                                  {buyer.recommendedProductName} · <span className="font-mono tabular-nums">{buyer.totalOrders} orders</span>
+                                  {buyer.daysSinceLastOrder !== undefined ? ` · ${buyer.daysSinceLastOrder}d ago` : ''}
+                                </div>
+                              </div>
+                              <button
+                                type="button"
+                                disabled={!can('canSendWhatsAppCrm')}
+                                onClick={() => void handleSendSignalBuyerWa(buyer)}
+                                className="px-2 py-1 rounded bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-[10px] cursor-pointer shrink-0 disabled:opacity-40"
+                              >
+                                Send
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
             <div className="lg:col-span-5 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-4 space-y-3 text-xs">
               <div className="flex items-center justify-between">
@@ -2678,21 +2952,52 @@ export const CRMWorkspaceView: React.FC<CRMWorkspaceViewProps> = ({
                     </div>
                   </div>
 
-                  {/* Step 2: Select Group of People (Consented Customers) */}
-                  <div className="p-2.5 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 space-y-1.5">
+                  {/* Step 2: Select Group of People (Consented Customers + Uploaded Excel/CSV Leads) */}
+                  <div className="p-2.5 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 space-y-2">
                     <div className="flex flex-wrap items-center justify-between gap-2">
                       <span className="font-bold text-[11px] flex items-center gap-1 text-slate-800 dark:text-slate-200">
                         <Users className="w-3.5 h-3.5 text-emerald-600" />
-                        2. Target Group of People ({campSelectedRecipientIds.length} selected)
+                        2. Target People &amp; Uploaded Leads ({campSelectedRecipientIds.length} selected)
                       </span>
                       <div className="flex flex-wrap items-center gap-1.5">
+                        <input
+                          ref={campLeadFileInputRef}
+                          type="file"
+                          accept=".xlsx,.xls,.csv,.tsv,.txt"
+                          onChange={(e) => void handleCampaignLeadFileUpload(e)}
+                          className="hidden"
+                        />
+                        <button
+                          type="button"
+                          disabled={campUploadingLeads}
+                          onClick={() => campLeadFileInputRef.current?.click()}
+                          className="px-2 py-1 rounded bg-slate-900 dark:bg-amber-500 text-white dark:text-slate-950 font-bold text-[10px] cursor-pointer inline-flex items-center gap-1 disabled:opacity-50"
+                          title="Upload Excel (.xlsx/.xls), CSV, or Notepad (.txt) WhatsApp contacts directly into this campaign"
+                        >
+                          <Upload className="w-3 h-3" />
+                          <span>{campUploadingLeads ? 'Importing...' : 'Upload Excel / CSV'}</span>
+                        </button>
+                        <select
+                          value={campRecipientSourceTab}
+                          onChange={(e) => setCampRecipientSourceTab(e.target.value as 'all' | 'customers' | 'leads')}
+                          className="px-2 py-1 text-[10px] rounded border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 font-semibold"
+                        >
+                          <option value="all">Customers + Leads</option>
+                          <option value="customers">Customers Only ({crmState.profiles.length})</option>
+                          <option value="leads">Uploaded Leads ({crmState.leads.filter((l) => Boolean(l.phone)).length})</option>
+                        </select>
                         <select
                           value={campRecipientCityFilter}
                           onChange={(e) => setCampRecipientCityFilter(e.target.value)}
                           className="px-2 py-1 text-[10px] rounded border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800"
                         >
                           <option value="ALL">All Cities</option>
-                          {Array.from(new Set(crmState.profiles.map((p) => p.customer.city).filter(Boolean))).map((city) => (
+                          {Array.from(
+                            new Set([
+                              ...crmState.profiles.map((p) => p.customer.city),
+                              ...crmState.leads.map((l) => l.city),
+                            ].filter(Boolean))
+                          ).map((city) => (
                             <option key={city} value={city}>{city}</option>
                           ))}
                         </select>
@@ -2701,16 +3006,26 @@ export const CRMWorkspaceView: React.FC<CRMWorkspaceViewProps> = ({
                           value={campRecipientSearch}
                           onChange={(e) => setCampRecipientSearch(e.target.value)}
                           placeholder="Filter people..."
-                          className="px-2 py-1 text-[10px] rounded border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 w-32"
+                          className="px-2 py-1 text-[10px] rounded border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 w-28"
                         />
                         <button
                           type="button"
                           onClick={() => {
-                            const eligibleIds = crmState.profiles
-                              .filter((p) => !p.customer.whatsappOptOut)
-                              .filter((p) => campRecipientCityFilter === 'ALL' || p.customer.city === campRecipientCityFilter)
-                              .map((p) => p.customer.id);
-                            setCampSelectedRecipientIds(eligibleIds);
+                            const custIds =
+                              campRecipientSourceTab !== 'leads'
+                                ? crmState.profiles
+                                    .filter((p) => !p.customer.whatsappOptOut)
+                                    .filter((p) => campRecipientCityFilter === 'ALL' || p.customer.city === campRecipientCityFilter)
+                                    .map((p) => p.customer.id)
+                                : [];
+                            const leadIds =
+                              campRecipientSourceTab !== 'customers'
+                                ? crmState.leads
+                                    .filter((l) => Boolean(l.phone && l.phone.trim()))
+                                    .filter((l) => campRecipientCityFilter === 'ALL' || l.city === campRecipientCityFilter)
+                                    .map((l) => l.id)
+                                : [];
+                            setCampSelectedRecipientIds(Array.from(new Set([...custIds, ...leadIds])));
                           }}
                           className="px-2 py-1 rounded bg-emerald-100 text-emerald-800 font-bold text-[10px] cursor-pointer"
                         >
@@ -2725,26 +3040,48 @@ export const CRMWorkspaceView: React.FC<CRMWorkspaceViewProps> = ({
                         </button>
                       </div>
                     </div>
-                    <div className="max-h-28 overflow-y-auto grid grid-cols-1 sm:grid-cols-2 gap-1.5 pt-1">
-                      {crmState.profiles
-                        .filter((p) => {
-                          if (campRecipientCityFilter !== 'ALL' && p.customer.city !== campRecipientCityFilter) return false;
+                    <div className="max-h-32 overflow-y-auto grid grid-cols-1 sm:grid-cols-2 gap-1.5 pt-1">
+                      {[
+                        ...(campRecipientSourceTab !== 'leads'
+                          ? crmState.profiles.map((p) => ({
+                              id: p.customer.id,
+                              name: p.customer.name,
+                              phone: p.customer.whatsapp || p.customer.phone,
+                              city: p.customer.city || '',
+                              optedOut: Boolean(p.customer.whatsappOptOut),
+                              kind: 'Customer' as const,
+                            }))
+                          : []),
+                        ...(campRecipientSourceTab !== 'customers'
+                          ? crmState.leads
+                              .filter((l) => Boolean(l.phone && l.phone.trim()))
+                              .map((l) => ({
+                                id: l.id,
+                                name: l.leadName,
+                                phone: l.whatsapp || l.phone,
+                                city: l.city || l.source || 'Lead',
+                                optedOut: false,
+                                kind: 'Lead' as const,
+                              }))
+                          : []),
+                      ]
+                        .filter((rec) => {
+                          if (campRecipientCityFilter !== 'ALL' && rec.city !== campRecipientCityFilter) return false;
                           const q = campRecipientSearch.trim().toLowerCase();
                           return (
                             !q ||
-                            p.customer.name.toLowerCase().includes(q) ||
-                            p.customer.phone.toLowerCase().includes(q) ||
-                            (p.customer.city || '').toLowerCase().includes(q)
+                            rec.name.toLowerCase().includes(q) ||
+                            rec.phone.toLowerCase().includes(q) ||
+                            rec.city.toLowerCase().includes(q)
                           );
                         })
-                        .map((p) => {
-                          const optedOut = Boolean(p.customer.whatsappOptOut);
-                          const isChecked = campSelectedRecipientIds.includes(p.customer.id);
+                        .map((rec) => {
+                          const isChecked = campSelectedRecipientIds.includes(rec.id);
                           return (
                             <label
-                              key={p.customer.id}
+                              key={rec.id}
                               className={`flex items-center gap-2 p-1.5 rounded border text-[11px] ${
-                                optedOut
+                                rec.optedOut
                                   ? 'opacity-50 cursor-not-allowed bg-slate-50 dark:bg-slate-850 border-slate-200'
                                   : isChecked
                                   ? 'bg-emerald-50 dark:bg-emerald-950/30 border-emerald-400 font-bold cursor-pointer'
@@ -2753,15 +3090,15 @@ export const CRMWorkspaceView: React.FC<CRMWorkspaceViewProps> = ({
                             >
                               <input
                                 type="checkbox"
-                                disabled={optedOut}
+                                disabled={rec.optedOut}
                                 checked={isChecked}
-                                onChange={() => toggleBundleRecipient(p.customer.id)}
+                                onChange={() => toggleBundleRecipient(rec.id)}
                               />
                               <span className="truncate flex-1">
-                                {p.customer.name} ({p.customer.city})
+                                {rec.name} ({rec.city || rec.kind})
                               </span>
                               <span className="font-mono text-[10px] text-slate-400 shrink-0">
-                                {optedOut ? 'OPTED OUT' : p.customer.phone}
+                                {rec.optedOut ? 'OPTED OUT' : `${rec.kind === 'Lead' ? 'Lead · ' : ''}${rec.phone}`}
                               </span>
                             </label>
                           );
@@ -2815,7 +3152,7 @@ export const CRMWorkspaceView: React.FC<CRMWorkspaceViewProps> = ({
                         type="url"
                         value={campCtaUrl}
                         onChange={(e) => setCampCtaUrl(e.target.value)}
-                        placeholder="https://www.madinamarket.pk/..."
+                        placeholder={buildCurrentOriginUrl('/?product=offer')}
                         className="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 font-mono text-[11px]"
                       />
                     </div>
@@ -2915,8 +3252,29 @@ export const CRMWorkspaceView: React.FC<CRMWorkspaceViewProps> = ({
                   const isBundle = c.campaignMode === 'manual_bundle' || (c.bundleProductIds && c.bundleProductIds.length > 0);
                   const isApprovedOrLaunched = c.status === 'Approved' || c.status === 'Launched' || c.status === 'approved' || c.status === 'active';
                   const isExpanded = activeBundleLauncherId === c.id;
-                  const targetProfiles = isBundle && c.targetRecipientIds
-                    ? crmState.profiles.filter((p) => c.targetRecipientIds!.includes(p.customer.id))
+                  const targetRecipients = isBundle && c.targetRecipientIds
+                    ? [
+                        ...crmState.profiles
+                          .filter((p) => c.targetRecipientIds!.includes(p.customer.id))
+                          .map((p) => ({
+                            id: p.customer.id,
+                            name: p.customer.name,
+                            phone: p.customer.phone,
+                            whatsapp: p.customer.whatsapp,
+                            whatsappOptOut: Boolean(p.customer.whatsappOptOut),
+                            isLead: false,
+                          })),
+                        ...crmState.leads
+                          .filter((l) => c.targetRecipientIds!.includes(l.id))
+                          .map((l) => ({
+                            id: l.id,
+                            name: l.leadName,
+                            phone: l.phone,
+                            whatsapp: l.whatsapp,
+                            whatsappOptOut: false,
+                            isLead: true,
+                          })),
+                      ]
                     : [];
 
                   return (
@@ -3013,7 +3371,7 @@ export const CRMWorkspaceView: React.FC<CRMWorkspaceViewProps> = ({
 
                           <div className="space-y-1">
                             <span className="text-[10px] font-bold uppercase text-slate-500 block">
-                              Selected Group Recipients ({targetProfiles.length}) — Click to open WhatsApp with full offer &amp; link:
+                              Selected Group Recipients ({targetRecipients.length}) — Click to open WhatsApp with full offer &amp; link:
                             </span>
                             {!isApprovedOrLaunched && (
                               <p className="text-[10px] text-amber-600 font-semibold">
@@ -3021,13 +3379,15 @@ export const CRMWorkspaceView: React.FC<CRMWorkspaceViewProps> = ({
                               </p>
                             )}
                             <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 max-h-40 overflow-y-auto">
-                              {targetProfiles.map((tp) => {
-                                const alreadySent = (sentRecipientIdsByCamp[c.id] || []).includes(tp.customer.id);
+                              {targetRecipients.map((tp) => {
+                                const alreadySent = (sentRecipientIdsByCamp[c.id] || []).includes(tp.id);
                                 return (
-                                  <div key={tp.customer.id} className="flex items-center justify-between gap-2 p-2 rounded border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900">
+                                  <div key={tp.id} className="flex items-center justify-between gap-2 p-2 rounded border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900">
                                     <div className="min-w-0">
-                                      <div className="font-bold text-[11px] truncate">{tp.customer.name}</div>
-                                      <div className="font-mono text-[10px] text-slate-400">{tp.customer.whatsapp || tp.customer.phone}</div>
+                                      <div className="font-bold text-[11px] truncate">
+                                        {tp.name} {tp.isLead ? <span className="text-[10px] text-amber-600">(Lead)</span> : null}
+                                      </div>
+                                      <div className="font-mono text-[10px] text-slate-400">{tp.whatsapp || tp.phone}</div>
                                     </div>
                                     <button
                                       type="button"

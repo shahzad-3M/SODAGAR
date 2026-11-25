@@ -14,6 +14,8 @@ import {
   Employee,
   GenderType,
   Investor,
+  InvestorProductOffering,
+  InvestorProductRequest,
   LuckyDrawEvent,
   LuckyDrawWinner,
   MonthlyExpense,
@@ -88,12 +90,16 @@ import {
   getMonthlyExpenses,
   saveMonthlyExpenses,
   apiLogCrmActivity,
+  getInvestorOfferings,
+  getInvestorRequests,
+  apiFetchInvestorOfferings,
 } from './utils/storage.ts';
 import { isProductPurchaseBlocked, normalizeTextKey } from './utils/locationCategoryHelpers.ts';
 import {
   buildCustomerPaymentReminderMessage,
   buildSaleInvoiceMessage,
   formatPaymentChannelsText,
+  getCurrentOrigin,
   openWhatsAppDirect,
 } from './utils/whatsapp.ts';
 import {
@@ -131,6 +137,7 @@ import { ProductBroadcastModal } from './components/ProductBroadcastModal.tsx';
 import { InvoiceModal } from './components/InvoiceModal.tsx';
 import { UserManagementView } from './components/UserManagementView.tsx';
 import { InvestorManagementView } from './components/InvestorManagementView.tsx';
+import { InvestorProductsView } from './components/InvestorProductsView.tsx';
 import { CustomerPortalView } from './components/CustomerPortalView.tsx';
 import { CategoryManagementModal } from './components/CategoryManagementModal.tsx';
 import { BranchManagementView } from './components/BranchManagementView.tsx';
@@ -173,6 +180,8 @@ export default function App() {
   const [attendance, setAttendance] = useState<AttendanceRecord[]>(getAttendance);
   const [resellers, setResellers] = useState<Reseller[]>(getResellers);
   const [investors, setInvestors] = useState<Investor[]>(getInvestors);
+  const [investorOfferings, setInvestorOfferings] = useState<InvestorProductOffering[]>(getInvestorOfferings);
+  const [investorRequests, setInvestorRequests] = useState<InvestorProductRequest[]>(getInvestorRequests);
   const [monthlyExpenses, setMonthlyExpenses] = useState<MonthlyExpense[]>(getMonthlyExpenses);
   const [initialProductId, setInitialProductId] = useState<string | null>(() => {
     try {
@@ -246,7 +255,7 @@ export default function App() {
         return;
       }
     } else if (activeRole === 'investor') {
-      const allowed = ['store', 'investors', 'lucky_draw'];
+      const allowed = ['store', 'investors', 'investor_products', 'lucky_draw'];
       if (!allowed.includes(tab)) {
         setCurrentTab('investors');
         return;
@@ -271,6 +280,7 @@ export default function App() {
         'reports',
         'hr_payroll',
         'financial_master',
+        'investor_products',
         'lucky_draw',
         ...(currentUser?.crmPermissions?.canViewCrmDashboard !== false ? ['crm'] : []),
       ];
@@ -292,6 +302,9 @@ export default function App() {
         setCurrentTab('walkin_pos');
         return;
       }
+    }
+    if (tab === 'investor_products') {
+      void apiFetchInvestorOfferings();
     }
     setCurrentTab(tab);
   };
@@ -403,6 +416,8 @@ export default function App() {
     const atts = getAttendance();
     const resells = getResellers();
     const invs = getInvestors();
+    const invOfferings = getInvestorOfferings();
+    const invReqs = getInvestorRequests();
     const exps = getMonthlyExpenses();
 
     const balanced = recalculateCustomerBalances(rawCusts, rawTxs);
@@ -424,6 +439,8 @@ export default function App() {
     setAttendance(atts);
     setResellers(resells);
     setInvestors(invs);
+    setInvestorOfferings(invOfferings);
+    setInvestorRequests(invReqs);
     setMonthlyExpenses(exps);
 
     const actRole = getActiveRole();
@@ -455,6 +472,15 @@ export default function App() {
     const updated = exists
       ? broadcastContacts.map((c) => (c.id === contact.id ? contact : c))
       : [contact, ...broadcastContacts];
+    setBroadcastContacts(updated);
+    saveBroadcastContacts(updated);
+  };
+
+  const handleBulkSaveBroadcastContacts = (newContacts: BroadcastContact[]) => {
+    if (newContacts.length === 0) return;
+    const existingIds = new Set(newContacts.map((c) => c.id));
+    const filteredPrev = broadcastContacts.filter((c) => !existingIds.has(c.id));
+    const updated = [...newContacts, ...filteredPrev];
     setBroadcastContacts(updated);
     saveBroadcastContacts(updated);
   };
@@ -1942,6 +1968,21 @@ export default function App() {
           />
         )}
 
+        {/* INVESTOR-ONLY PRODUCT OFFERINGS & REQUESTS */}
+        {currentTab === 'investor_products' && (
+          <InvestorProductsView
+            currentUser={currentUser}
+            userRole={activeRole}
+            offerings={investorOfferings}
+            requests={investorRequests}
+            products={products}
+            investors={investors}
+            profile={profile}
+            onRefreshData={handleRefreshAllData}
+            onBackToStore={() => setCurrentTab('store')}
+          />
+        )}
+
         {/* USER CREDENTIALS & SECURITY MANAGEMENT */}
         {currentTab === 'users' && (
           <UserManagementView
@@ -2202,15 +2243,25 @@ export default function App() {
             productBroadcasts={productBroadcasts}
             manualContacts={broadcastContacts}
             savedBroadcasts={savedBroadcasts}
+            products={products}
+            transactions={transactions}
+            codOrders={codOrders}
             onOpenScheduleWhatsApp={openScheduleWhatsApp}
             onOpenProductBroadcast={() => setIsProductBroadcastOpen(true)}
             onSaveManualContact={handleSaveBroadcastContact}
+            onBulkSaveManualContacts={handleBulkSaveBroadcastContacts}
+            onQueueNotifications={(items) => {
+              if (items.length === 0) return;
+              const updated = [...items, ...notifications];
+              setNotifications(updated);
+              saveWhatsAppNotifications(updated);
+            }}
             onDeleteManualContact={handleDeleteBroadcastContact}
             onResendSavedBroadcast={(camp) => {
               const product: ProductBroadcast = {
                 id: `prod_resend_${Date.now()}`,
                 productName: camp.productName,
-                productLink: camp.productLink || 'https://madinamarket.pk',
+                productLink: camp.productLink || getCurrentOrigin() || '/',
                 description: camp.messageText,
                 createdAt: new Date().toISOString().split('T')[0],
               };

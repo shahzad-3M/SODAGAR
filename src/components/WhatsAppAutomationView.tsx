@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useMemo, useRef, useState } from 'react';
 import {
   Send,
   Calendar,
@@ -14,19 +14,42 @@ import {
   Link as LinkIcon,
   Sparkles,
   X,
+  Upload,
+  FileSpreadsheet,
+  ChevronDown,
+  ChevronUp,
+  Users,
+  Download,
 } from 'lucide-react';
 import {
   AgeGroupType,
   BroadcastContact,
   BusinessProfile,
+  CODOrder,
+  CRMGroupSignalSummary,
   Customer,
   GenderType,
   ProductBroadcast,
+  ProductItem,
   ReminderTemplate,
   SavedBroadcastCampaign,
+  Transaction,
   WhatsAppNotification,
 } from '../types/index.ts';
-import { openWhatsAppDirect, formatPaymentChannelsText } from '../utils/whatsapp.ts';
+import {
+  openWhatsAppDirect,
+  formatPaymentChannelsText,
+  buildProductPageUrl,
+  getCurrentOrigin,
+} from '../utils/whatsapp.ts';
+import {
+  buildCustomer360Profile,
+  computeCrmCampaignSignals,
+  normalizeDigits,
+  renderCrmWhatsAppTemplate,
+} from '../utils/crmEngine.ts';
+import { buildSampleLeadsCsv, parseLeadUploadFile } from '../utils/leadImportParser.ts';
+import { apiBulkImportCrmLeads } from '../utils/storage.ts';
 import { ToastBanner, ToastMessage } from './AppDialogs.tsx';
 
 interface WhatsAppAutomationViewProps {
@@ -36,6 +59,9 @@ interface WhatsAppAutomationViewProps {
   productBroadcasts: ProductBroadcast[];
   manualContacts?: BroadcastContact[];
   savedBroadcasts?: SavedBroadcastCampaign[];
+  products?: ProductItem[];
+  transactions?: Transaction[];
+  codOrders?: CODOrder[];
   profile: BusinessProfile;
   onOpenScheduleWhatsApp: (customerId?: string, date?: string) => void;
   onOpenProductBroadcast: () => void;
@@ -45,6 +71,8 @@ interface WhatsAppAutomationViewProps {
   onRunWeeklyDueReminders: () => void;
   onRunMonthlyReminderBatch: () => void;
   onSaveManualContact?: (contact: BroadcastContact) => void;
+  onBulkSaveManualContacts?: (contacts: BroadcastContact[]) => void;
+  onQueueNotifications?: (items: WhatsAppNotification[]) => void;
   onDeleteManualContact?: (id: string) => void;
   onResendSavedBroadcast?: (campaign: SavedBroadcastCampaign) => void;
 }
@@ -56,6 +84,9 @@ export const WhatsAppAutomationView: React.FC<WhatsAppAutomationViewProps> = ({
   productBroadcasts,
   manualContacts = [],
   savedBroadcasts = [],
+  products = [],
+  transactions = [],
+  codOrders = [],
   profile,
   onOpenScheduleWhatsApp,
   onOpenProductBroadcast,
@@ -65,6 +96,8 @@ export const WhatsAppAutomationView: React.FC<WhatsAppAutomationViewProps> = ({
   onRunWeeklyDueReminders,
   onRunMonthlyReminderBatch,
   onSaveManualContact,
+  onBulkSaveManualContacts,
+  onQueueNotifications,
   onDeleteManualContact,
   onResendSavedBroadcast,
 }) => {
@@ -72,6 +105,23 @@ export const WhatsAppAutomationView: React.FC<WhatsAppAutomationViewProps> = ({
   const [queueFilter, setQueueFilter] = useState<'all' | 'due_today' | 'pending' | 'sent'>('pending');
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [editingTemplate, setEditingTemplate] = useState<ReminderTemplate | null>(null);
+
+  // Excel / CSV / TXT Lead Upload & Signals state
+  const broadcastFileInputRef = useRef<HTMLInputElement | null>(null);
+  const contactsFileInputRef = useRef<HTMLInputElement | null>(null);
+  const [isUploadingLeads, setIsUploadingLeads] = useState(false);
+  const [alsoSyncCrmLeads, setAlsoSyncCrmLeads] = useState(true);
+  const [leadUploadSummary, setLeadUploadSummary] = useState<{
+    fileName: string;
+    formatLabel: string;
+    addedContacts: number;
+    skippedDuplicates: number;
+    invalidRows: number;
+    syncedCrmLeads: number;
+    warnings: string[];
+  } | null>(null);
+  const [expandedSignalId, setExpandedSignalId] = useState<string | null>(null);
+  const [signalProductOverrides, setSignalProductOverrides] = useState<Record<string, string>>({});
 
   // Manual Contact Form State
   const [isContactModalOpen, setIsContactModalOpen] = useState(false);
@@ -154,6 +204,211 @@ export const WhatsAppAutomationView: React.FC<WhatsAppAutomationViewProps> = ({
     const newTemplates = templates.map((t) => (t.id === updated.id ? updated : t));
     onUpdateTemplates(newTemplates);
     setEditingTemplate(null);
+  };
+
+  // Compute Customer 360 profiles & Smart Buyer / Group Signals across all customer categories
+  const customerProfiles = useMemo(() => {
+    return customers.map((customer) =>
+      buildCustomer360Profile({
+        customer,
+        transactions,
+        codOrders,
+        products,
+      })
+    );
+  }, [customers, transactions, codOrders, products]);
+
+  const groupSignals = useMemo(() => {
+    return computeCrmCampaignSignals({
+      profiles: customerProfiles,
+      products,
+    });
+  }, [customerProfiles, products]);
+
+  const handleDownloadSampleLeads = () => {
+    const csv = buildSampleLeadsCsv();
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'whatsapp-leads-sample.csv';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  };
+
+  const handleLeadFileSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+
+    setIsUploadingLeads(true);
+    try {
+      const existingCustomerPhones = new Set(
+        customers.map((c) => normalizeDigits(c.phone)).filter(Boolean)
+      );
+      const parsed = await parseLeadUploadFile(file, {
+        defaultSource: 'WhatsApp',
+        defaultStage: 'New',
+        existingCustomerPhones,
+      });
+
+      const existingManualPhones = new Set(
+        manualContacts.map((c) => normalizeDigits(c.phone)).filter(Boolean)
+      );
+
+      const newContacts: BroadcastContact[] = [];
+      let skippedDuplicates = 0;
+      let invalidRows = 0;
+
+      for (const row of parsed.rows) {
+        if (!row.isValid) {
+          invalidRows++;
+          continue;
+        }
+        if (!row.normalizedPhone || existingManualPhones.has(row.normalizedPhone)) {
+          skippedDuplicates++;
+          continue;
+        }
+        existingManualPhones.add(row.normalizedPhone);
+        newContacts.push({
+          id: `cnt_imp_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          name: row.leadName || `WhatsApp Contact (${row.normalizedPhone.slice(-4)})`,
+          phone: row.phone,
+          city: row.city || 'Pakistan',
+          gender: 'unspecified',
+          ageGroup: '26-35',
+          type: 'lead',
+          notes: [row.interestedProductName ? `Interest: ${row.interestedProductName}` : '', row.notes || '']
+            .filter(Boolean)
+            .join(' · ') || `Imported (${parsed.formatLabel})`,
+          createdAt: row.createdAt ? row.createdAt.slice(0, 10) : todayStr,
+        });
+      }
+
+      if (newContacts.length > 0) {
+        if (onBulkSaveManualContacts) {
+          onBulkSaveManualContacts(newContacts);
+        } else if (onSaveManualContact) {
+          newContacts.forEach((c) => onSaveManualContact(c));
+        }
+      }
+
+      let syncedCrmLeads = 0;
+      if (alsoSyncCrmLeads) {
+        const validLeads = parsed.rows.filter((r) => r.isValid);
+        for (let i = 0; i < validLeads.length; i += 500) {
+          const chunk = validLeads.slice(i, i + 500).map((r) => ({
+            leadName: r.leadName,
+            phone: r.phone,
+            whatsapp: r.whatsapp,
+            email: r.email,
+            city: r.city,
+            source: r.source,
+            stage: r.stage,
+            interestedProductName: r.interestedProductName,
+            estimatedValue: r.estimatedValue,
+            followUpDate: r.followUpDate,
+            createdAt: r.createdAt,
+            notes: r.notes,
+          }));
+          const res = await apiBulkImportCrmLeads({
+            leads: chunk,
+            defaultSource: 'WhatsApp',
+            defaultStage: 'New',
+            skipDuplicates: true,
+          });
+          if (res.ok) {
+            syncedCrmLeads += res.importedCount || 0;
+          }
+        }
+      }
+
+      setLeadUploadSummary({
+        fileName: parsed.fileName,
+        formatLabel: parsed.formatLabel,
+        addedContacts: newContacts.length,
+        skippedDuplicates,
+        invalidRows,
+        syncedCrmLeads,
+        warnings: parsed.warnings,
+      });
+
+      if (newContacts.length > 0) {
+        pushToast(
+          `Imported ${newContacts.length} WhatsApp contacts from ${parsed.fileName}${
+            syncedCrmLeads > 0 ? ` (+${syncedCrmLeads} CRM leads synced)` : ''
+          }.`,
+          'success'
+        );
+      } else if (parsed.warnings.length > 0) {
+        pushToast(parsed.warnings[0], 'error');
+      } else {
+        pushToast('No new unique phone numbers found in uploaded file.', 'info');
+      }
+    } catch (err) {
+      pushToast(
+        err instanceof Error ? err.message : 'Failed to read uploaded file.',
+        'error'
+      );
+    } finally {
+      setIsUploadingLeads(false);
+    }
+  };
+
+  const handleQueueSignalGroup = (signal: CRMGroupSignalSummary) => {
+    const selectedProdId = signalProductOverrides[signal.id] || signal.recommendedProductId;
+    const matchedProd = products.find((p) => p.id === selectedProdId);
+    const prodName = matchedProd?.name || signal.recommendedProductName || 'Featured Products';
+    const websiteUrl = matchedProd ? buildProductPageUrl(matchedProd.id) : getCurrentOrigin() || '/';
+
+    const newItems: WhatsAppNotification[] = signal.buyers.map((buyer) => {
+      const buyerProd =
+        matchedProd ||
+        (buyer.recommendedProductId ? products.find((p) => p.id === buyer.recommendedProductId) : undefined);
+      const itemProdName = buyerProd?.name || buyer.recommendedProductName || prodName;
+      const itemLink = buyerProd ? buildProductPageUrl(buyerProd.id) : websiteUrl;
+      const msg = renderCrmWhatsAppTemplate(signal.templateType, {
+        customerName: buyer.customerName,
+        productName: itemProdName,
+        balance: buyer.outstandingBalance,
+        city: buyer.city,
+        storeName: profile.name,
+        websiteUrl: itemLink,
+      });
+      return {
+        id: `notif_sig_${signal.groupKey}_${buyer.customerId}_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`,
+        customerId: buyer.customerId,
+        customerName: buyer.customerName,
+        phone: buyer.phone,
+        amount: buyer.outstandingBalance > 0 ? buyer.outstandingBalance : buyerProd?.ourPrice || 0,
+        scheduledFor: todayStr,
+        type: signal.actionType === 'Payment Reminder' ? 'payment_reminder' : 'product_broadcast',
+        productLink: itemLink,
+        status: 'pending',
+        messageText: msg,
+        notes: `Signal (${signal.groupLabel} · ${signal.actionType}): ${itemProdName}`,
+        createdAt: new Date().toISOString(),
+      };
+    });
+
+    if (newItems.length === 0) {
+      pushToast('No reachable buyers with WhatsApp numbers in this group.', 'info');
+      return;
+    }
+
+    if (onQueueNotifications) {
+      onQueueNotifications(newItems);
+    } else if (newItems[0]) {
+      openWhatsAppDirect(newItems[0].phone, newItems[0].messageText);
+    }
+    pushToast(
+      `Queued ${newItems.length} personalized ${signal.actionType} messages for ${signal.groupLabel}.`,
+      'success'
+    );
+    setActiveTab('queue');
+    setQueueFilter('pending');
   };
 
   return (
@@ -546,7 +801,7 @@ export const WhatsAppAutomationView: React.FC<WhatsAppAutomationViewProps> = ({
                   Broadcast New Product &amp; Link to All Parties
                 </h2>
                 <p className="text-xs text-slate-500 dark:text-slate-400 mt-1 max-w-xl">
-                  Announce new stock arrivals, promotions, and special inventory lots to all registered customers with clickable product links and bilingual Urdu + English copy.
+                  Announce new stock arrivals, promotions, and special inventory lots to registered customers and imported WhatsApp leads with dynamic storefront links.
                 </p>
               </div>
 
@@ -558,6 +813,265 @@ export const WhatsAppAutomationView: React.FC<WhatsAppAutomationViewProps> = ({
                 + New Product Announcement
               </button>
             </div>
+          </div>
+
+          {/* Excel / CSV / TXT WhatsApp Lead Upload Card */}
+          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-5 shadow-xs space-y-4">
+            <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+              <div className="flex items-start gap-3">
+                <span className="p-2 rounded-lg bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-300 shrink-0">
+                  <FileSpreadsheet className="w-5 h-5" />
+                </span>
+                <div>
+                  <h3 className="text-sm font-bold text-slate-900 dark:text-white">
+                    Upload WhatsApp Leads from Excel / CSV / Notepad
+                  </h3>
+                  <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5 max-w-2xl">
+                    Import <span className="font-mono">.xlsx</span>, <span className="font-mono">.xls</span>, <span className="font-mono">.csv</span>, <span className="font-mono">.tsv</span>, or <span className="font-mono">.txt</span> contact lists directly into Broadcast Contacts (and optionally CRM Leads) so they are immediately available for segmented broadcasts.
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2 shrink-0">
+                <input
+                  ref={broadcastFileInputRef}
+                  type="file"
+                  accept=".xlsx,.xls,.csv,.tsv,.txt"
+                  onChange={(e) => void handleLeadFileSelected(e)}
+                  className="hidden"
+                />
+                <button
+                  type="button"
+                  onClick={handleDownloadSampleLeads}
+                  className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-700 dark:text-slate-200 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 rounded-lg transition-colors cursor-pointer"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  Sample CSV
+                </button>
+                <button
+                  type="button"
+                  disabled={isUploadingLeads}
+                  onClick={() => broadcastFileInputRef.current?.click()}
+                  className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 rounded-lg shadow-xs transition-colors cursor-pointer"
+                >
+                  <Upload className="w-3.5 h-3.5" />
+                  {isUploadingLeads ? 'Importing...' : 'Upload Excel / CSV / TXT'}
+                </button>
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center justify-between gap-3 pt-3 border-t border-slate-100 dark:border-slate-800 text-xs">
+              <label className="inline-flex items-center gap-2 text-slate-700 dark:text-slate-300 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={alsoSyncCrmLeads}
+                  onChange={(e) => setAlsoSyncCrmLeads(e.target.checked)}
+                  className="rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
+                />
+                <span>Also sync uploaded leads into CRM Leads pipeline</span>
+              </label>
+              <span className="text-slate-500 font-mono tabular-nums">
+                Active Manual Contacts: {manualContacts.length}
+              </span>
+            </div>
+
+            {leadUploadSummary && (
+              <div className="p-3.5 rounded-lg bg-slate-50 dark:bg-slate-850 border border-slate-200 dark:border-slate-800 space-y-2 text-xs">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="font-bold text-slate-900 dark:text-white">
+                    {leadUploadSummary.fileName} ({leadUploadSummary.formatLabel})
+                  </span>
+                  <button
+                    type="button"
+                    onClick={onOpenProductBroadcast}
+                    className="px-3 py-1 bg-indigo-600 hover:bg-indigo-700 text-white font-semibold rounded-md cursor-pointer"
+                  >
+                    Broadcast to Leads Now
+                  </button>
+                </div>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 font-mono tabular-nums text-[11px]">
+                  <div className="p-2 rounded bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
+                    <span className="text-slate-500 block font-sans">Added Contacts</span>
+                    <span className="font-bold text-emerald-600 dark:text-emerald-400">{leadUploadSummary.addedContacts}</span>
+                  </div>
+                  <div className="p-2 rounded bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
+                    <span className="text-slate-500 block font-sans">CRM Synced</span>
+                    <span className="font-bold text-indigo-600 dark:text-indigo-400">{leadUploadSummary.syncedCrmLeads}</span>
+                  </div>
+                  <div className="p-2 rounded bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
+                    <span className="text-slate-500 block font-sans">Duplicates Skipped</span>
+                    <span className="font-bold text-amber-600 dark:text-amber-400">{leadUploadSummary.skippedDuplicates}</span>
+                  </div>
+                  <div className="p-2 rounded bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
+                    <span className="text-slate-500 block font-sans">Invalid Rows</span>
+                    <span className="font-bold text-slate-700 dark:text-slate-300">{leadUploadSummary.invalidRows}</span>
+                  </div>
+                </div>
+                {leadUploadSummary.warnings.length > 0 && (
+                  <p className="text-amber-700 dark:text-amber-300 text-[11px]">
+                    {leadUploadSummary.warnings.join(' · ')}
+                  </p>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* Smart Buyer & Group Signals Panel */}
+          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-5 shadow-xs space-y-4">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-3 border-b border-slate-100 dark:border-slate-800">
+              <div className="flex items-center gap-2">
+                <Sparkles className="w-4 h-4 text-amber-500 shrink-0" />
+                <div>
+                  <h3 className="text-sm font-bold text-slate-900 dark:text-white">
+                    Smart Buyer &amp; Group Signals (All Categories)
+                  </h3>
+                  <p className="text-xs text-slate-500 dark:text-slate-400">
+                    Recommended product, offer, or reminder for VIP, Recent, Repeat, Regular, Cold/Inactive, Payment Due, and Category buyer groups.
+                  </p>
+                </div>
+              </div>
+              <span className="text-xs font-mono tabular-nums text-slate-500">
+                {groupSignals.length} Active Signals
+              </span>
+            </div>
+
+            {groupSignals.length === 0 ? (
+              <div className="py-8 text-center text-xs text-slate-500">
+                No customer purchase signals detected yet. Add orders or customers to generate targeted group signals.
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                {groupSignals.map((sig) => {
+                  const isExpanded = expandedSignalId === sig.id;
+                  const chosenProdId = signalProductOverrides[sig.id] || sig.recommendedProductId || '';
+                  const chosenProd = products.find((p) => p.id === chosenProdId);
+                  return (
+                    <div
+                      key={sig.id}
+                      className="p-4 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-850/70 space-y-3"
+                    >
+                      <div className="flex items-start justify-between gap-2">
+                        <div>
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="text-xs font-bold text-slate-900 dark:text-white">
+                              {sig.groupLabel}
+                            </span>
+                            <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-amber-100 text-amber-900 dark:bg-amber-950/60 dark:text-amber-300">
+                              {sig.actionType}
+                            </span>
+                          </div>
+                          <p className="text-[11px] text-slate-600 dark:text-slate-400 mt-1">
+                            {sig.reason}
+                          </p>
+                        </div>
+                        <span className="inline-flex items-center gap-1 px-2 py-1 rounded bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-xs font-mono font-bold tabular-nums text-slate-900 dark:text-white shrink-0">
+                          <Users className="w-3 h-3 text-slate-400" />
+                          {sig.buyerCount}
+                        </span>
+                      </div>
+
+                      <div className="flex flex-col sm:flex-row sm:items-center gap-2 text-xs">
+                        <span className="text-[11px] font-semibold text-slate-500 shrink-0">
+                          Target Product:
+                        </span>
+                        {products.length > 0 ? (
+                          <select
+                            value={chosenProdId}
+                            onChange={(e) =>
+                              setSignalProductOverrides((prev) => ({ ...prev, [sig.id]: e.target.value }))
+                            }
+                            className="flex-1 min-w-0 px-2.5 py-1.5 rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs text-slate-900 dark:text-white"
+                          >
+                            <option value="">{sig.recommendedProductName}</option>
+                            {products
+                              .filter((p) => !p.isUpcoming)
+                              .slice(0, 80)
+                              .map((p) => (
+                                <option key={p.id} value={p.id}>
+                                  {p.name} ({profile.currencySymbol} {Number(p.ourPrice || 0).toLocaleString('en-PK')})
+                                </option>
+                              ))}
+                          </select>
+                        ) : (
+                          <span className="font-semibold text-slate-800 dark:text-slate-200">
+                            {sig.recommendedProductName}
+                          </span>
+                        )}
+                      </div>
+
+                      <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-slate-200/80 dark:border-slate-800">
+                        <button
+                          type="button"
+                          onClick={() => setExpandedSignalId(isExpanded ? null : sig.id)}
+                          className="inline-flex items-center gap-1 text-[11px] font-semibold text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white cursor-pointer"
+                        >
+                          {isExpanded ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+                          {isExpanded ? 'Hide Buyers' : `View ${sig.buyerCount} Buyers`}
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => handleQueueSignalGroup(sig)}
+                          className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-700 rounded-md transition-colors cursor-pointer"
+                        >
+                          <Send className="w-3 h-3" />
+                          Queue {sig.actionType} ({sig.buyerCount})
+                        </button>
+                      </div>
+
+                      {isExpanded && (
+                        <div className="pt-2 space-y-1.5 max-h-56 overflow-y-auto border-t border-slate-200 dark:border-slate-800">
+                          {sig.buyers.map((buyer) => {
+                            const bProd = chosenProd || products.find((p) => p.id === buyer.recommendedProductId);
+                            const bProdName = bProd?.name || buyer.recommendedProductName;
+                            const bLink = bProd ? buildProductPageUrl(bProd.id) : getCurrentOrigin() || '/';
+                            return (
+                              <div
+                                key={`${sig.id}_${buyer.customerId}`}
+                                className="p-2 rounded bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 flex items-center justify-between gap-2 text-[11px]"
+                              >
+                                <div className="min-w-0">
+                                  <p className="font-bold text-slate-900 dark:text-white truncate">
+                                    {buyer.customerName}{' '}
+                                    <span className="font-mono font-normal text-slate-500">({buyer.phone})</span>
+                                  </p>
+                                  <p className="text-slate-500 truncate">
+                                    Rec: <span className="font-medium text-slate-700 dark:text-slate-300">{bProdName}</span> · Spend{' '}
+                                    <span className="font-mono tabular-nums">{profile.currencySymbol} {buyer.totalSpend.toLocaleString('en-PK')}</span>
+                                    {buyer.outstandingBalance > 0 && (
+                                      <span className="text-red-600 dark:text-red-400 font-mono tabular-nums">
+                                        {' '}· Due {profile.currencySymbol} {buyer.outstandingBalance.toLocaleString('en-PK')}
+                                      </span>
+                                    )}
+                                  </p>
+                                </div>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    const msg = renderCrmWhatsAppTemplate(sig.templateType, {
+                                      customerName: buyer.customerName,
+                                      productName: bProdName,
+                                      balance: buyer.outstandingBalance,
+                                      city: buyer.city,
+                                      storeName: profile.name,
+                                      websiteUrl: bLink,
+                                    });
+                                    openWhatsAppDirect(buyer.phone, msg);
+                                  }}
+                                  className="px-2 py-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded font-semibold shrink-0 cursor-pointer inline-flex items-center gap-1"
+                                >
+                                  <Send className="w-3 h-3" /> Send
+                                </button>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </div>
 
           {/* Past Broadcast History */}
@@ -717,28 +1231,61 @@ export const WhatsAppAutomationView: React.FC<WhatsAppAutomationViewProps> = ({
                   Manual Broadcast Contacts Directory (دستی براڈکاسٹ رابطے)
                 </h2>
                 <p className="text-xs text-slate-500 dark:text-slate-400 mt-1 max-w-xl">
-                  Maintain non-ledger customer leads, retail shop owners, and targeted contact lists with area, age group, and gender for segmented WhatsApp broadcasting.
+                  Maintain non-ledger customer leads, retail shop owners, and Excel/CSV imported WhatsApp contact lists with area, age group, and gender for segmented broadcasting.
                 </p>
               </div>
 
-              <button
-                onClick={() => {
-                  setEditingContact(null);
-                  setCName('');
-                  setCPhone('');
-                  setCCity('Lahore');
-                  setCArea('');
-                  setCGender('unspecified');
-                  setCAgeGroup('26-35');
-                  setCType('retail');
-                  setCNotes('');
-                  setIsContactModalOpen(true);
-                }}
-                className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-slate-950 bg-amber-500 hover:bg-amber-400 rounded-xl shadow-xs transition-colors cursor-pointer shrink-0"
-              >
-                <span>+ Add Manual Contact (نیا رابطہ شامل کریں)</span>
-              </button>
+              <div className="flex flex-wrap items-center gap-2 shrink-0">
+                <input
+                  ref={contactsFileInputRef}
+                  type="file"
+                  accept=".xlsx,.xls,.csv,.tsv,.txt"
+                  onChange={(e) => void handleLeadFileSelected(e)}
+                  className="hidden"
+                />
+                <button
+                  type="button"
+                  disabled={isUploadingLeads}
+                  onClick={() => contactsFileInputRef.current?.click()}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 rounded-xl shadow-xs transition-colors cursor-pointer"
+                >
+                  <Upload className="w-3.5 h-3.5" />
+                  {isUploadingLeads ? 'Importing...' : 'Import Excel / CSV / TXT'}
+                </button>
+                <button
+                  onClick={() => {
+                    setEditingContact(null);
+                    setCName('');
+                    setCPhone('');
+                    setCCity('Lahore');
+                    setCArea('');
+                    setCGender('unspecified');
+                    setCAgeGroup('26-35');
+                    setCType('retail');
+                    setCNotes('');
+                    setIsContactModalOpen(true);
+                  }}
+                  className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-slate-950 bg-amber-500 hover:bg-amber-400 rounded-xl shadow-xs transition-colors cursor-pointer"
+                >
+                  <span>+ Add Manual Contact (نیا رابطہ شامل کریں)</span>
+                </button>
+              </div>
             </div>
+
+            {leadUploadSummary && (
+              <div className="mt-4 p-3 rounded-lg bg-slate-50 dark:bg-slate-850 border border-slate-200 dark:border-slate-800 text-xs flex flex-wrap items-center justify-between gap-2">
+                <span>
+                  Imported <b>{leadUploadSummary.addedContacts}</b> contacts from <span className="font-mono">{leadUploadSummary.fileName}</span> ({leadUploadSummary.skippedDuplicates} duplicates skipped).
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setLeadUploadSummary(null)}
+                  className="text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 cursor-pointer"
+                >
+                  Dismiss
+                </button>
+              </div>
+            )}
           </div>
 
           {/* Contacts Table */}

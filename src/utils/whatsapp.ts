@@ -366,6 +366,20 @@ export function extractCustomerLastName(fullName?: string): string {
   return rawLast.charAt(0).toUpperCase() + rawLast.slice(1);
 }
 
+export function getCurrentOrigin(): string {
+  if (typeof window !== 'undefined' && window.location?.origin) {
+    return window.location.origin.replace(/\/+$/, '');
+  }
+  return '';
+}
+
+export function buildCurrentOriginUrl(pathOrQuery = ''): string {
+  const origin = getCurrentOrigin();
+  if (!pathOrQuery) return origin || '/';
+  const suffix = pathOrQuery.startsWith('/') || pathOrQuery.startsWith('?') ? pathOrQuery : `/${pathOrQuery}`;
+  return origin ? `${origin}${suffix}` : suffix;
+}
+
 export function resolvePublicProductImageUrl(imageUrl?: string): string {
   const trimmed = (imageUrl || '').trim();
   if (!trimmed || /^data:/i.test(trimmed) || /^blob:/i.test(trimmed)) return '';
@@ -383,7 +397,7 @@ export function resolvePublicProductImageUrl(imageUrl?: string): string {
 
 export function buildProductPageUrl(productId: string): string {
   if (typeof window === 'undefined') {
-    return `https://madinamarket.pk/?product=${encodeURIComponent(productId)}`;
+    return `/?product=${encodeURIComponent(productId)}`;
   }
   try {
     const url = new URL(window.location.href);

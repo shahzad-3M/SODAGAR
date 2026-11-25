@@ -30,7 +30,7 @@ import {
   apiChangeOwnPassword,
   apiChangeMasterPin,
 } from '../utils/storage.ts';
-import { openWhatsAppDirect } from '../utils/whatsapp.ts';
+import { getCurrentOrigin, openWhatsAppDirect } from '../utils/whatsapp.ts';
 
 function normalizePhoneOrId(val: string): string {
   const clean = val.trim().replace(/[\s-]/g, '');
@@ -310,16 +310,17 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
   };
 
   const buildConfirmationText = (conf: RegistrationConfirmationState) => {
+    const siteOrigin = getCurrentOrigin() || 'our store portal';
     return [
       `Assalam-o-Alaikum ${conf.fullName}!`,
-      `Your 100DAGAR / madinamarket.pk customer account is registered and confirmed.`,
+      `Your 100DAGAR customer account is registered and confirmed.`,
       ``,
       `Login Mobile: ${conf.phone}`,
       `Notification WhatsApp: ${conf.whatsappNumber}`,
       ...(conf.email ? [`Email: ${conf.email}`] : []),
       `Temporary Password: ${conf.temporaryPassword}`,
       ``,
-      `Please sign in at https://www.madinamarket.pk and change your temporary password from your account settings.`,
+      `Please sign in at ${siteOrigin} and change your temporary password from your account settings.`,
     ].join('\n');
   };
 
@@ -396,7 +397,7 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
     });
     openWhatsAppDirect(
       supportNumber,
-      `Assalam-o-Alaikum! I need an administrator-verified temporary password reset for my 100DAGAR / madinamarket.pk account (${clean}). Please send a temporary password to my registered WhatsApp / Email.`
+      `Assalam-o-Alaikum! I need an administrator-verified temporary password reset for my 100DAGAR account (${clean}) on ${getCurrentOrigin() || 'the portal'}. Please send a temporary password to my registered WhatsApp / Email.`
     );
     setForgotSuccess(
       `Recovery request opened for "${clean}". Store support (${supportNumber}) will verify your identity and send a temporary password to your registered WhatsApp / Email.`

@@ -213,7 +213,11 @@ export function parseProductFromHtmlInBrowser(
   html: string,
   categories: CategoryRecord[]
 ): { product: ProductItem; diagnostics: ClientScrapeDiagnostics } {
-  const safeUrl = sourceUrl || 'https://madinamarket.pk/products/imported-item';
+  const fallbackOrigin =
+    typeof window !== 'undefined' && window.location?.origin
+      ? window.location.origin
+      : 'https://localhost';
+  const safeUrl = sourceUrl || `${fallbackOrigin}/products/imported-item`;
   const parsedUrl = new URL(safeUrl);
   const domain = parsedUrl.hostname.replace(/^www\./, '');
   const strategiesUsed: string[] = [];
@@ -737,6 +741,6 @@ export async function tryFetchProductInBrowserFallback(
   return {
     ok: false,
     error:
-      'Unable to reach backend scraper (HTTP 404 on this static preview host) and the target website blocked direct browser CORS access. Click "Paste HTML Source" below (Ctrl+U -> Ctrl+A -> Ctrl+C on the product page) and click "Extract from Pasted HTML" — it now parses completely offline in your browser!',
+      'Could not reach the backend scraper or direct store page (blocked by host/CORS). Click "Paste HTML Source" below (Ctrl+U -> Ctrl+A -> Ctrl+C on the product page) and click "Extract from Pasted HTML" — it parses directly in your browser.',
   };
 }

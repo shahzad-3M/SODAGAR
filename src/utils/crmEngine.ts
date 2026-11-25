@@ -1,4 +1,4 @@
-import {
+import type {
   CODOrder,
   CRMActivityEvent,
   CRMAutoSegmentName,
@@ -7,6 +7,8 @@ import {
   CRMDashboardKPIs,
   CRMFollowUpTask,
   CRMLead,
+  CRMBuyerSignal,
+  CRMGroupSignalSummary,
   CRMLoyaltyAccount,
   CRMLoyaltyConfig,
   CRMLoyaltyCoupon,
@@ -14,11 +16,12 @@ import {
   CRMSupportTicket,
   CRMWhatsAppTemplateType,
   Customer,
+  Customer360Profile,
   ProductItem,
   Reseller,
   ReviewRewardSubmission,
   Transaction,
-} from '../types';
+} from '../types/index.ts';
 
 export const ALL_AUTO_SEGMENTS: CRMAutoSegmentName[] = [
   'New Customer',
@@ -52,7 +55,7 @@ export const CRM_WHATSAPP_TEMPLATES: CRMWhatsAppTemplateDefinition[] = [
     type: 'welcome',
     label: 'Welcome',
     urduLabel: 'خوش آمدید',
-    body: 'Assalam-o-Alaikum {{customerName}}! Welcome to {{storeName}} (madinamarket.pk). We appreciate your trust. For super best prices, express Muzaffarabad delivery & nationwide dispatch, browse {{websiteUrl}} anytime.',
+    body: 'Assalam-o-Alaikum {{customerName}}! Welcome to {{storeName}}. We appreciate your trust. For super best prices, express Muzaffarabad delivery & nationwide dispatch, browse {{websiteUrl}} anytime.',
   },
   {
     type: 'order_confirmation',
@@ -154,7 +157,11 @@ export function renderCrmWhatsAppTemplate(
     '{{city}}': vars.city || 'Pakistan',
     '{{couponCode}}': vars.couponCode || 'MADINA-VIP',
     '{{storeName}}': vars.storeName || '100DAGAR · Madina Market',
-    '{{websiteUrl}}': vars.websiteUrl || 'https://www.madinamarket.pk',
+    '{{websiteUrl}}':
+      vars.websiteUrl ||
+      (typeof window !== 'undefined' && window.location?.origin
+        ? window.location.origin
+        : '/'),
   };
   for (const [token, val] of Object.entries(replacements)) {
     text = text.split(token).join(val);
@@ -1415,3 +1422,342 @@ export function buildExcelHtmlContent(title: string, columns: string[], rows: Ar
     title
   )}</h3><table border="1" cellspacing="0" cellpadding="4"><thead><tr>${ths}</tr></thead><tbody>${trs}</tbody></table></body></html>`;
 }
+
+export function computeCrmCampaignSignals(params: {
+  profiles: Customer360Profile[];
+  products: ProductItem[];
+}): CRMGroupSignalSummary[] {
+  const { profiles, products } = params;
+  const activeProducts = products.filter((p) => p.status !== 'draft' && !p.isUpcoming);
+  const topCatalogProduct =
+    [...activeProducts].sort((a, b) => (b.salesCount || 0) - (a.salesCount || 0))[0] ||
+    activeProducts[0] ||
+    products[0];
+
+  const pickBestProductForProfile = (profile: Customer360Profile): ProductItem | undefined => {
+    if (profile.recommendedProducts && profile.recommendedProducts.length > 0) {
+      return profile.recommendedProducts[0];
+    }
+    const boughtIds = new Set(profile.purchasedProducts.map((p) => p.productId).filter(Boolean));
+    for (const cat of profile.preferredCategories) {
+      const catMatch = activeProducts.find(
+        (p) => p.category.toLowerCase().includes(cat.toLowerCase()) && !boughtIds.has(p.id)
+      );
+      if (catMatch) return catMatch;
+    }
+    return topCatalogProduct;
+  };
+
+  const recentBuyers: CRMBuyerSignal[] = [];
+  const coldBuyers: CRMBuyerSignal[] = [];
+  const repeatBuyers: CRMBuyerSignal[] = [];
+  const regularBuyers: CRMBuyerSignal[] = [];
+  const vipBuyers: CRMBuyerSignal[] = [];
+  const dueBuyers: CRMBuyerSignal[] = [];
+  const byCategoryMap = new Map<string, CRMBuyerSignal[]>();
+
+  for (const prof of profiles) {
+    if (prof.customer.status === 'archived' || prof.customer.whatsappOptOut) continue;
+    const phone = (prof.customer.phone || '').trim();
+    if (!phone) continue;
+
+    const bestProd = pickBestProductForProfile(prof);
+    const prodName = bestProd?.name || 'New Arrival Wholesale Lot';
+    const prodId = bestProd?.id;
+    const prodPrice = bestProd?.ourPrice;
+    const prefCat = prof.preferredCategories[0] || bestProd?.category || 'General';
+    const dSince = prof.daysSinceLastOrder ?? undefined;
+
+    // 1. VIP Customers
+    if (prof.autoSegments.includes('VIP Customer')) {
+      vipBuyers.push({
+        customerId: prof.customer.id,
+        customerName: prof.customer.name,
+        phone,
+        city: prof.customer.city,
+        groupKey: 'vip_customers',
+        groupLabel: 'VIP Customers',
+        actionType: 'Offer',
+        templateType: 'vip_offer',
+        recommendedProductId: prodId,
+        recommendedProductName: prodName,
+        recommendedProductPrice: prodPrice,
+        preferredCategory: prefCat,
+        daysSinceLastOrder: dSince,
+        totalOrders: prof.totalOrders,
+        totalSpend: prof.totalPurchaseValue,
+        outstandingBalance: prof.outstandingBalance,
+        reason: `VIP buyer (${prof.totalOrders} orders, Rs. ${prof.totalPurchaseValue.toLocaleString('en-PK')}) — send exclusive VIP offer on ${prodName}`,
+        priorityScore: 95,
+      });
+    }
+
+    // 2. Cold / Inactive Customers (30+ days)
+    if (
+      (dSince !== undefined && dSince >= 30) ||
+      prof.autoSegments.includes('Inactive 30 Days') ||
+      prof.autoSegments.includes('Inactive 60 Days') ||
+      prof.autoSegments.includes('Inactive 90 Days') ||
+      prof.autoSegments.includes('Lost Customer')
+    ) {
+      coldBuyers.push({
+        customerId: prof.customer.id,
+        customerName: prof.customer.name,
+        phone,
+        city: prof.customer.city,
+        groupKey: 'cold_customers',
+        groupLabel: 'Cold / Inactive Customers',
+        actionType: 'Win-Back',
+        templateType: 'inactive_recovery',
+        recommendedProductId: prodId,
+        recommendedProductName: prodName,
+        recommendedProductPrice: prodPrice,
+        preferredCategory: prefCat,
+        daysSinceLastOrder: dSince,
+        totalOrders: prof.totalOrders,
+        totalSpend: prof.totalPurchaseValue,
+        outstandingBalance: prof.outstandingBalance,
+        reason: `${dSince ?? 30}+ days inactive in ${prefCat} — send win-back discount offer on ${prodName}`,
+        priorityScore: 90,
+      });
+    }
+
+    // 3. Recent Buyers (last 14 days)
+    if (dSince !== undefined && dSince <= 14 && prof.totalOrders >= 1) {
+      recentBuyers.push({
+        customerId: prof.customer.id,
+        customerName: prof.customer.name,
+        phone,
+        city: prof.customer.city,
+        groupKey: 'recent_buyers',
+        groupLabel: 'Recent Buyers (0-14 Days)',
+        actionType: 'New Arrival',
+        templateType: 'product_recommendation',
+        recommendedProductId: prodId,
+        recommendedProductName: prodName,
+        recommendedProductPrice: prodPrice,
+        preferredCategory: prefCat,
+        daysSinceLastOrder: dSince,
+        totalOrders: prof.totalOrders,
+        totalSpend: prof.totalPurchaseValue,
+        outstandingBalance: prof.outstandingBalance,
+        reason: `Ordered ${dSince}d ago in ${prefCat} — send cross-sell recommendation for ${prodName}`,
+        priorityScore: 85,
+      });
+    }
+
+    // 4. Repeat Buyers
+    if (prof.autoSegments.includes('Repeat Customer') || prof.totalOrders >= 2) {
+      repeatBuyers.push({
+        customerId: prof.customer.id,
+        customerName: prof.customer.name,
+        phone,
+        city: prof.customer.city,
+        groupKey: 'repeat_buyers',
+        groupLabel: 'Repeat Buyers',
+        actionType: 'Reminder',
+        templateType: 'repeat_purchase_reminder',
+        recommendedProductId: prodId,
+        recommendedProductName: prodName,
+        recommendedProductPrice: prodPrice,
+        preferredCategory: prefCat,
+        daysSinceLastOrder: dSince,
+        totalOrders: prof.totalOrders,
+        totalSpend: prof.totalPurchaseValue,
+        outstandingBalance: prof.outstandingBalance,
+        reason: `Repeat buyer (${prof.totalOrders} orders) — send restock reminder & bundle offer for ${prodName}`,
+        priorityScore: 82,
+      });
+    }
+
+    // 5. Regular Customers
+    if (prof.autoSegments.includes('Regular Customer') || prof.totalOrders >= 3) {
+      regularBuyers.push({
+        customerId: prof.customer.id,
+        customerName: prof.customer.name,
+        phone,
+        city: prof.customer.city,
+        groupKey: 'regular_customers',
+        groupLabel: 'Regular Customers',
+        actionType: 'Offer',
+        templateType: 'discount_offer',
+        recommendedProductId: prodId,
+        recommendedProductName: prodName,
+        recommendedProductPrice: prodPrice,
+        preferredCategory: prefCat,
+        daysSinceLastOrder: dSince,
+        totalOrders: prof.totalOrders,
+        totalSpend: prof.totalPurchaseValue,
+        outstandingBalance: prof.outstandingBalance,
+        reason: `Consistent buyer in ${prefCat} — send monthly loyalty offer on ${prodName}`,
+        priorityScore: 80,
+      });
+    }
+
+    // 6. Payment Due Reminder
+    if (prof.outstandingBalance > 0) {
+      dueBuyers.push({
+        customerId: prof.customer.id,
+        customerName: prof.customer.name,
+        phone,
+        city: prof.customer.city,
+        groupKey: 'payment_due',
+        groupLabel: 'Outstanding Khata Reminders',
+        actionType: 'Payment Reminder',
+        templateType: 'payment_reminder',
+        recommendedProductId: prodId,
+        recommendedProductName: prodName,
+        recommendedProductPrice: prodPrice,
+        preferredCategory: prefCat,
+        daysSinceLastOrder: dSince,
+        totalOrders: prof.totalOrders,
+        totalSpend: prof.totalPurchaseValue,
+        outstandingBalance: prof.outstandingBalance,
+        reason: `Pending balance Rs. ${prof.outstandingBalance.toLocaleString('en-PK')} — send polite Khata payment reminder`,
+        priorityScore: 98,
+      });
+    }
+
+    // 7. Category-wise Affinity Groups
+    if (prefCat && prefCat !== 'General') {
+      const catList = byCategoryMap.get(prefCat) || [];
+      catList.push({
+        customerId: prof.customer.id,
+        customerName: prof.customer.name,
+        phone,
+        city: prof.customer.city,
+        groupKey: 'category_affinity',
+        groupLabel: `${prefCat} Buyers`,
+        actionType: 'Offer',
+        templateType: 'product_recommendation',
+        recommendedProductId: prodId,
+        recommendedProductName: prodName,
+        recommendedProductPrice: prodPrice,
+        preferredCategory: prefCat,
+        daysSinceLastOrder: dSince,
+        totalOrders: prof.totalOrders,
+        totalSpend: prof.totalPurchaseValue,
+        outstandingBalance: prof.outstandingBalance,
+        reason: `Active interest in ${prefCat} — send targeted offer for ${prodName}`,
+        priorityScore: 75,
+      });
+      byCategoryMap.set(prefCat, catList);
+    }
+  }
+
+  const pickTopProdForGroup = (list: CRMBuyerSignal[]) => {
+    const freq = new Map<string, { count: number; sample: CRMBuyerSignal }>();
+    for (const b of list) {
+      const key = b.recommendedProductId || b.recommendedProductName;
+      const cur = freq.get(key) || { count: 0, sample: b };
+      cur.count += 1;
+      freq.set(key, cur);
+    }
+    const best = Array.from(freq.values()).sort((a, b) => b.count - a.count)[0]?.sample;
+    return {
+      id: best?.recommendedProductId || topCatalogProduct?.id,
+      name: best?.recommendedProductName || topCatalogProduct?.name || 'Featured Product',
+      price: best?.recommendedProductPrice ?? topCatalogProduct?.ourPrice,
+    };
+  };
+
+  const summaries: CRMGroupSignalSummary[] = [];
+  const pushSummary = (
+    id: string,
+    groupKey: CRMGroupSignalSummary['groupKey'],
+    groupLabel: string,
+    actionType: CRMGroupSignalSummary['actionType'],
+    templateType: CRMWhatsAppTemplateType,
+    buyers: CRMBuyerSignal[],
+    reason: string,
+    categoryName?: string
+  ) => {
+    if (buyers.length === 0) return;
+    const topP = pickTopProdForGroup(buyers);
+    summaries.push({
+      id,
+      groupKey,
+      groupLabel,
+      categoryName,
+      actionType,
+      templateType,
+      recommendedProductId: topP.id,
+      recommendedProductName: topP.name,
+      recommendedProductPrice: topP.price,
+      buyerCount: buyers.length,
+      buyers: [...buyers].sort((a, b) => b.priorityScore - a.priorityScore || b.totalSpend - a.totalSpend),
+      reason,
+    });
+  };
+
+  pushSummary(
+    'sig_vip',
+    'vip_customers',
+    'VIP Customers',
+    'Offer',
+    'vip_offer',
+    vipBuyers,
+    'High-spend loyal buyers ready for exclusive VIP bundle offers and priority stock access.'
+  );
+  pushSummary(
+    'sig_recent',
+    'recent_buyers',
+    'Recent Buyers (0-14 Days)',
+    'New Arrival',
+    'product_recommendation',
+    recentBuyers,
+    'Bought recently — high open rate for complementary product offers and feedback vouchers.'
+  );
+  pushSummary(
+    'sig_repeat',
+    'repeat_buyers',
+    'Repeat Buyers',
+    'Reminder',
+    'repeat_purchase_reminder',
+    repeatBuyers,
+    'Customers with 2+ orders — ideal for restock reminders and multi-unit bundle discounts.'
+  );
+  pushSummary(
+    'sig_regular',
+    'regular_customers',
+    'Regular Customers',
+    'Offer',
+    'discount_offer',
+    regularBuyers,
+    'Steady monthly buyers — nurture with seasonal category offers and loyalty coupons.'
+  );
+  pushSummary(
+    'sig_cold',
+    'cold_customers',
+    'Cold / Inactive Customers (30+ Days)',
+    'Win-Back',
+    'inactive_recovery',
+    coldBuyers,
+    'Haven’t ordered in 30+ days — send win-back coupon and top-selling product reminder.'
+  );
+  pushSummary(
+    'sig_due',
+    'payment_due',
+    'Outstanding Khata / Payment Due',
+    'Payment Reminder',
+    'payment_reminder',
+    dueBuyers,
+    'Active receivable balances — send polite payment recovery reminder via WhatsApp.'
+  );
+
+  for (const [catName, list] of Array.from(byCategoryMap.entries()).sort((a, b) => b[1].length - a[1].length).slice(0, 6)) {
+    pushSummary(
+      `sig_cat_${catName.toLowerCase().replace(/[^a-z0-9]+/g, '_')}`,
+      'category_affinity',
+      `Category: ${catName}`,
+      'Offer',
+      'product_recommendation',
+      list,
+      `Buyers with proven purchase history in ${catName} — promote matching products or new arrivals.`,
+      catName
+    );
+  }
+
+  return summaries;
+}
+

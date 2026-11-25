@@ -1385,4 +1385,102 @@ export type CRMReportKey =
   | 'daily_sales_report'
   | 'monthly_profit_loss_report';
 
+export interface InvestorProductOffering {
+  id: string;
+  productId?: string;
+  title: string;
+  urduTitle?: string;
+  category: string;
+  imageUrl?: string;
+  description?: string;
+  unitPrice: number;
+  minInvestQty: number;
+  maxAvailableQty: number;
+  reservedQty: number;
+  otherExpenses: number;
+  otherExpensesNote?: string;
+  expectedProfitSharePercent?: number;
+  estimatedMonthlyReturnText?: string;
+  status: 'active' | 'funded' | 'closed';
+  createdById?: string;
+  createdAt: string;
+  updatedAt?: string;
+}
+
+export interface InvestorProductRequest {
+  id: string;
+  offeringId: string;
+  offeringTitle: string;
+  productId?: string;
+  investorId?: string;
+  userId?: string;
+  investorName: string;
+  investorPhone: string;
+  requestedQty: number;
+  unitPrice: number;
+  subtotalAmount: number;
+  otherExpensesShare: number;
+  totalInvestment: number;
+  notes?: string;
+  status: 'pending' | 'approved' | 'rejected';
+  reviewedById?: string;
+  reviewedByName?: string;
+  reviewedAt?: string;
+  rejectionReason?: string;
+  createdAt: string;
+  updatedAt?: string;
+}
+
+export type CRMSignalGroupKey =
+  | 'recent_buyers'
+  | 'cold_customers'
+  | 'repeat_buyers'
+  | 'regular_customers'
+  | 'vip_customers'
+  | 'category_affinity'
+  | 'payment_due';
+
+export type CRMSignalActionType =
+  | 'Offer'
+  | 'Reminder'
+  | 'Win-Back'
+  | 'Payment Reminder'
+  | 'New Arrival';
+
+export interface CRMBuyerSignal {
+  customerId: string;
+  customerName: string;
+  phone: string;
+  city?: string;
+  groupKey: CRMSignalGroupKey;
+  groupLabel: string;
+  actionType: CRMSignalActionType;
+  templateType: CRMWhatsAppTemplateType;
+  recommendedProductId?: string;
+  recommendedProductName: string;
+  recommendedProductPrice?: number;
+  preferredCategory?: string;
+  daysSinceLastOrder?: number;
+  totalOrders: number;
+  totalSpend: number;
+  outstandingBalance: number;
+  reason: string;
+  priorityScore: number;
+}
+
+export interface CRMGroupSignalSummary {
+  id: string;
+  groupKey: CRMSignalGroupKey;
+  groupLabel: string;
+  categoryName?: string;
+  actionType: CRMSignalActionType;
+  templateType: CRMWhatsAppTemplateType;
+  recommendedProductId?: string;
+  recommendedProductName: string;
+  recommendedProductPrice?: number;
+  buyerCount: number;
+  buyers: CRMBuyerSignal[];
+  reason: string;
+}
+
 

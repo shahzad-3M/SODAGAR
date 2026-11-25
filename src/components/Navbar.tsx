@@ -10,6 +10,7 @@ import {
   Trophy,
   CalendarClock,
   Package,
+  PackageCheck,
   FileText,
   Eye,
   SlidersHorizontal,
@@ -142,10 +143,11 @@ export const Navbar: React.FC<NavbarProps> = ({
     { id: 'lucky_draw', label: 'Lucky Draw & Rewards', urdu: 'لکی ڈرا اور انعامات', icon: Trophy },
   ];
 
-  // 3. Investor Navigation (Strictly isolated portfolio)
+  // 3. Investor Navigation (Strictly isolated portfolio + investor-only product offerings)
   const investorNavItems: NavItem[] = [
     { id: 'store', label: 'Shop & Catalog', urdu: 'مارکیٹ کیٹلاگ', icon: ShoppingBag },
     { id: 'investors', label: 'Investor Portfolio', urdu: 'انویسٹر پورٹل و منافع', icon: TrendingUp },
+    { id: 'investor_products', label: 'Investor Offers', urdu: 'انویسٹر پروڈکٹس', icon: PackageCheck },
   ];
   const investorDropdownItems: NavItem[] = [
     { id: 'lucky_draw', label: 'Lucky Draw', urdu: 'لکی ڈرا', icon: Trophy },
@@ -197,6 +199,7 @@ export const Navbar: React.FC<NavbarProps> = ({
     { id: 'payment_terms', label: 'Payment Terms Alerts', urdu: '۳ روزہ یاددہانی', icon: CalendarClock, badge: pendingAlertsCount > 0 ? pendingAlertsCount : undefined },
     { id: 'history', label: 'Transaction History & Audit', urdu: 'کھاتہ ہسٹری', icon: Clock },
     { id: 'monthly_statement', label: 'Monthly Statements', urdu: 'ماہانہ اسٹیٹمنٹ', icon: FileText },
+    { id: 'investor_products', label: 'Investor Product Offers', urdu: 'انویسٹر پروڈکٹس', icon: PackageCheck },
     { id: 'lucky_draw', label: 'Lucky Draw & Winners', urdu: 'لکی ڈرا', icon: Trophy },
   ];
 
@@ -225,6 +228,7 @@ export const Navbar: React.FC<NavbarProps> = ({
     { id: 'dashboard', label: 'Ledger Overview', urdu: 'کھاتہ خلاصہ', icon: FileText },
     { id: 'customers', label: 'Customers Khata', urdu: 'کسٹمرز کھاتہ', icon: Users },
     { id: 'recurring', label: 'Recurring Billing', urdu: 'مقررہ بلنگ', icon: CalendarClock },
+    { id: 'investor_products', label: 'Investor Product Offers', urdu: 'انویسٹر پروڈکٹس', icon: PackageCheck },
     { id: 'whatsapp', label: 'WhatsApp Queue', urdu: 'واٹس ایپ کیو', icon: Phone },
   ];
 

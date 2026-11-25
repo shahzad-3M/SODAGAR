@@ -22,6 +22,10 @@ import type {
   Customer,
   DeliveryAreaConfig,
   DeliveryCityConfig,
+  Investor,
+  InvestorProductOffering,
+  InvestorProductRequest,
+  InvestorTransaction,
   MonthlyExpense,
   ProductItem,
   Reseller,
@@ -170,6 +174,8 @@ const DEFAULT_COLLECTION_MAP: Record<string, unknown> = {
   login_audits: defaultLoginAuditLogs,
   import_logs: defaultImportLogs,
   monthly_expenses: [] as MonthlyExpense[],
+  investor_offerings: [] as InvestorProductOffering[],
+  investor_requests: [] as InvestorProductRequest[],
   business_profile: defaultBusinessProfile,
 };
 
@@ -3433,6 +3439,8 @@ export function redactStateForRole(
     }
     if (isStaff) {
       cloned.monthly_expenses = [];
+      cloned.investor_offerings = [];
+      cloned.investor_requests = [];
     }
     return cloned;
   }
@@ -3448,6 +3456,12 @@ export function redactStateForRole(
   const allInvestorTxs = Array.isArray(cloned.investor_transactions)
     ? (cloned.investor_transactions as Array<Record<string, unknown>>)
     : [];
+  const allOfferings = Array.isArray(cloned.investor_offerings)
+    ? (cloned.investor_offerings as InvestorProductOffering[])
+    : [];
+  const allRequests = Array.isArray(cloned.investor_requests)
+    ? (cloned.investor_requests as InvestorProductRequest[])
+    : [];
   const allReviews = Array.isArray(cloned.review_rewards)
     ? (cloned.review_rewards as ReviewRewardSubmission[])
     : [];
@@ -3460,6 +3474,8 @@ export function redactStateForRole(
     'wasal_settlements',
     'investors',
     'investor_transactions',
+    'investor_offerings',
+    'investor_requests',
     'resellers',
     'user_accounts',
     'branches',
@@ -3553,6 +3569,12 @@ export function redactStateForRole(
     cloned.investors = ownInvestors;
     cloned.investor_transactions = allInvestorTxs.filter((tx) =>
       ownedInvIds.has(String(tx.investorId || ''))
+    );
+    cloned.investor_offerings = allOfferings;
+    cloned.investor_requests = allRequests.filter(
+      (reqItem) =>
+        (reqItem.investorId && ownedInvIds.has(String(reqItem.investorId))) ||
+        (actor.id && reqItem.userId === actor.id)
     );
   }
 

@@ -44,6 +44,7 @@ import {
   resolveCategoryIdsFromProduct,
   getCategoryBreadcrumb,
 } from '../utils/locationCategoryHelpers.ts';
+import { buildCurrentOriginUrl } from '../utils/whatsapp.ts';
 import { CategoryCascadingSelect } from './CategoryCascadingSelect.tsx';
 import { ProductSpecSizingShowcase } from './ProductSpecSizingShowcase.tsx';
 
@@ -188,10 +189,10 @@ export const ProductImporterModal: React.FC<ProductImporterModalProps> = ({
         if (normalizedUrl) {
           new URL(normalizedUrl);
         } else {
-          normalizedUrl = 'https://madinamarket.pk/products/imported-item';
+          normalizedUrl = buildCurrentOriginUrl('/products/imported-item');
         }
       } catch {
-        normalizedUrl = 'https://madinamarket.pk/products/imported-item';
+        normalizedUrl = buildCurrentOriginUrl('/products/imported-item');
       }
     } else {
       if (!normalizedUrl) {
@@ -936,7 +937,7 @@ export const ProductImporterModal: React.FC<ProductImporterModalProps> = ({
                       <button
                         type="button"
                         disabled={isLoading || !htmlFallbackSource.trim()}
-                        onClick={() => handleStartImport(importUrl || 'https://madinamarket.pk/products/imported-item', htmlFallbackSource)}
+                        onClick={() => handleStartImport(importUrl || buildCurrentOriginUrl('/products/imported-item'), htmlFallbackSource)}
                         className="px-4 py-1.5 bg-slate-900 dark:bg-amber-500 text-white dark:text-slate-950 font-bold text-xs rounded-lg cursor-pointer disabled:opacity-50"
                       >
                         Extract from Pasted HTML

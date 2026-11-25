@@ -591,7 +591,12 @@ async function fetchHtmlWithHeaders(parsedUrl: URL): Promise<{ html: string; fin
     }
     if ([401, 403, 406, 429, 503].includes(attempt.status)) {
       throw new Error(
-        `${domain} blocked automated fetching (HTTP ${attempt.status}). Open the product page in your browser, copy Page Source (Ctrl+U → Ctrl+A → Ctrl+C), and paste it into "Paste HTML Source" below.`
+        `${domain} blocked automated fetching (HTTP ${attempt.status}). Open the product page in your browser, copy Page Source (Ctrl+U -> Ctrl+A -> Ctrl+C), and paste it into "Paste HTML Source" below.`
+      );
+    }
+    if ([500, 502, 504, 505].includes(attempt.status)) {
+      throw new Error(
+        `${domain} returned HTTP ${attempt.status} (${attempt.statusText || 'Gateway/Protocol error'}). Open the product page in your browser, copy Page Source (Ctrl+U -> Ctrl+A -> Ctrl+C), and paste it into "Paste HTML Source" below.`
       );
     }
     throw new Error(
@@ -1735,26 +1740,40 @@ export async function scrapeProductFromUrl(
     };
   });
 
-  // Download & cache unique product + variant images locally on the server
+  // Download & cache unique product + variant images locally on the server (bounded total budget to prevent gateway 502/504/505 timeouts)
   const allRemoteImagesToCache = Array.from(
     new Set([
       ...rawGalleryList,
       ...preCachedVariations.map((v) => v.image).filter((x): x is string => Boolean(x)),
     ])
-  ).slice(0, 24);
+  ).slice(0, 16);
 
   const remoteToLocalMap = new Map<string, string>();
   let imagesDownloaded = 0;
 
   const CONCURRENCY = 6;
+  const IMAGE_CACHE_BUDGET_MS = 7500;
+  const cacheStart = Date.now();
   for (let i = 0; i < allRemoteImagesToCache.length; i += CONCURRENCY) {
+    if (Date.now() - cacheStart >= IMAGE_CACHE_BUDGET_MS) {
+      break;
+    }
     const batch = allRemoteImagesToCache.slice(i, i + CONCURRENCY);
-    const results = await Promise.all(
-      batch.map(async (u) => ({
-        remote: u,
-        res: await downloadAndCacheExternalImage(u, finalUrl),
-      }))
-    );
+    const remainingBudget = Math.max(1200, IMAGE_CACHE_BUDGET_MS - (Date.now() - cacheStart));
+    const results = await Promise.race([
+      Promise.all(
+        batch.map(async (u) => ({
+          remote: u,
+          res: await downloadAndCacheExternalImage(u, finalUrl),
+        }))
+      ),
+      new Promise<Array<{ remote: string; res: { localUrl: string; downloaded: boolean } }>>((resolve) =>
+        setTimeout(
+          () => resolve(batch.map((u) => ({ remote: u, res: { localUrl: u, downloaded: false } }))),
+          remainingBudget
+        )
+      ),
+    ]);
     for (const item of results) {
       remoteToLocalMap.set(item.remote, item.res.localUrl);
       if (item.res.downloaded) imagesDownloaded += 1;

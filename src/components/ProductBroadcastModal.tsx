@@ -20,7 +20,7 @@ import {
   ReminderTemplate,
 } from '../types/index.ts';
 import { BroadcastSegmentFilters } from '../utils/automationEngine.ts';
-import { buildProductBroadcastMessage, openWhatsAppDirect } from '../utils/whatsapp.ts';
+import { buildCurrentOriginUrl, buildProductBroadcastMessage, openWhatsAppDirect } from '../utils/whatsapp.ts';
 
 interface ProductBroadcastModalProps {
   isOpen: boolean;
@@ -50,7 +50,7 @@ export const ProductBroadcastModal: React.FC<ProductBroadcastModalProps> = ({
   const [urduProductName, setUrduProductName] = useState('');
   const [description, setDescription] = useState('');
   const [price, setPrice] = useState('');
-  const [productLink, setProductLink] = useState('https://madinamarket.pk/new-arrival');
+  const [productLink, setProductLink] = useState(() => buildCurrentOriginUrl('/?view=store'));
   const [copied, setCopied] = useState(false);
 
   // Segmentation Filters (Area-wise, Age-wise, Gender-wise, Group-wise)
@@ -264,7 +264,7 @@ export const ProductBroadcastModal: React.FC<ProductBroadcastModalProps> = ({
               <input
                 type="url"
                 required
-                placeholder="https://madinamarket.pk/products/item-link"
+                placeholder={`${buildCurrentOriginUrl('/?product=item-id')}`}
                 value={productLink}
                 onChange={(e) => setProductLink(e.target.value)}
                 className="w-full px-3 py-1.5 font-mono text-[11px] rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white"
