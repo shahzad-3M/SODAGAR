@@ -1,6 +1,11 @@
 import type { DatabaseSync as SqliteDatabaseSync } from 'node:sqlite';
 import mysql, { type Pool, type PoolConnection, type ResultSetHeader, type RowDataPacket } from 'mysql2/promise';
 
+import {
+  toMysqlDatetimeUtcStrict,
+  validateAndNormalizeDateTime,
+} from './dateUtils.ts';
+
 export type DbDriver = 'sqlite' | 'mysql';
 
 export interface DbRunResult {
@@ -34,37 +39,94 @@ export interface MysqlConnectionConfig {
 }
 
 export function resolveDbDriver(): DbDriver {
+  const isProduction = process.env.NODE_ENV === 'production';
   const raw = (process.env.DB_DRIVER || '').trim().toLowerCase();
-  if (!raw || raw === 'sqlite') return 'sqlite';
+
   if (raw === 'mysql') return 'mysql';
-  throw new Error(`Unsupported DB_DRIVER "${raw}". Expected "sqlite" or "mysql".`);
+  if (raw === 'sqlite') {
+    if (isProduction) {
+      throw new Error(
+        'Production mode (NODE_ENV=production) must use MySQL via mysql2. SQLite fallback is disabled in production to prevent data loss.'
+      );
+    }
+    return 'sqlite';
+  }
+  if (raw) {
+    throw new Error(`Unsupported DB_DRIVER "${raw}". Expected "mysql" or "sqlite".`);
+  }
+
+  if (isProduction) {
+    return 'mysql';
+  }
+  if (
+    process.env.DB_HOST?.trim() ||
+    process.env.DB_NAME?.trim() ||
+    process.env.DB_USER?.trim()
+  ) {
+    return 'mysql';
+  }
+  return 'sqlite';
 }
 
 export function getMysqlConfigFromEnv(): MysqlConnectionConfig {
-  const host = (process.env.DB_HOST || '127.0.0.1').trim();
-  const portRaw = (process.env.DB_PORT || '3306').trim();
+  const host = (process.env.DB_HOST || '').trim();
+  const portRaw = (process.env.DB_PORT || '').trim();
   const port = Number(portRaw);
   const database = (process.env.DB_NAME || '').trim();
   const user = (process.env.DB_USER || '').trim();
   const password = process.env.DB_PASSWORD;
 
-  if (!host) {
-    throw new Error('DB_HOST environment variable is required when DB_DRIVER=mysql.');
-  }
-  if (!Number.isInteger(port) || port <= 0 || port > 65535) {
-    throw new Error(`Invalid DB_PORT value "${portRaw}" for MySQL.`);
-  }
-  if (!database) {
-    throw new Error('DB_NAME environment variable is required when DB_DRIVER=mysql.');
-  }
-  if (!user) {
-    throw new Error('DB_USER environment variable is required when DB_DRIVER=mysql.');
-  }
-  if (password === undefined) {
-    throw new Error('DB_PASSWORD environment variable is required when DB_DRIVER=mysql.');
+  const missingOrInvalid: string[] = [];
+  if (!host) missingOrInvalid.push('DB_HOST');
+  if (!portRaw || !Number.isInteger(port) || port <= 0 || port > 65535) missingOrInvalid.push('DB_PORT');
+  if (!database) missingOrInvalid.push('DB_NAME');
+  if (!user) missingOrInvalid.push('DB_USER');
+  if (password === undefined || password === '') missingOrInvalid.push('DB_PASSWORD');
+
+  if (missingOrInvalid.length > 0) {
+    throw new Error(
+      `Missing or invalid MySQL environment variable(s): ${missingOrInvalid.join(', ')}. SQLite fallback is disabled in production.`
+    );
   }
 
-  return { host, port, database, user, password };
+  return { host, port, database, user, password: String(password) };
+}
+
+export function validateProductionEnv(): void {
+  if (process.env.NODE_ENV !== 'production') return;
+
+  const rawDriver = (process.env.DB_DRIVER || '').trim().toLowerCase();
+  if (rawDriver === 'sqlite') {
+    throw new Error(
+      'Production mode (NODE_ENV=production) must use MySQL. SQLite fallback is disabled in production to prevent data loss.'
+    );
+  }
+  if (rawDriver && rawDriver !== 'mysql') {
+    throw new Error(`Unsupported DB_DRIVER "${rawDriver}" in production. Expected "mysql" or unset.`);
+  }
+
+  const missingOrInvalid: string[] = [];
+  if (!process.env.SESSION_SECRET || !process.env.SESSION_SECRET.trim()) {
+    missingOrInvalid.push('SESSION_SECRET');
+  }
+  const host = (process.env.DB_HOST || '').trim();
+  const portRaw = (process.env.DB_PORT || '').trim();
+  const port = Number(portRaw);
+  const database = (process.env.DB_NAME || '').trim();
+  const user = (process.env.DB_USER || '').trim();
+  const password = process.env.DB_PASSWORD;
+
+  if (!host) missingOrInvalid.push('DB_HOST');
+  if (!portRaw || !Number.isInteger(port) || port <= 0 || port > 65535) missingOrInvalid.push('DB_PORT');
+  if (!database) missingOrInvalid.push('DB_NAME');
+  if (!user) missingOrInvalid.push('DB_USER');
+  if (password === undefined || password === '') missingOrInvalid.push('DB_PASSWORD');
+
+  if (missingOrInvalid.length > 0) {
+    throw new Error(
+      `Missing or invalid required production environment variable(s): ${missingOrInvalid.join(', ')}. Application aborted without creating or using any SQLite database.`
+    );
+  }
 }
 
 function sanitizeParams(params: unknown[] = []): Array<string | number | bigint | Buffer | null> {
@@ -123,12 +185,6 @@ function assertSafeSqlIdentifier(name: string): string {
   return name;
 }
 
-function toMysqlDatetimeUtc(iso?: string): string {
-  const d = iso ? new Date(iso) : new Date();
-  const valid = Number.isNaN(d.getTime()) ? new Date() : d;
-  return valid.toISOString().slice(0, 19).replace('T', ' ');
-}
-
 export class SqliteDbAdapter implements DbAdapter {
   readonly driver: DbDriver = 'sqlite';
   readonly rawDb: SqliteDatabaseSync;
@@ -139,7 +195,10 @@ export class SqliteDbAdapter implements DbAdapter {
   }
 
   formatTimestamp(iso?: string): string {
-    return iso || new Date().toISOString();
+    if (iso === undefined || iso === null || !iso.trim()) {
+      return new Date().toISOString();
+    }
+    return validateAndNormalizeDateTime(iso, 'timestamp')!;
   }
 
   async get<T = Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<T | undefined> {
@@ -271,9 +330,12 @@ export class MysqlDbAdapter implements DbAdapter {
 
   formatTimestamp(iso?: string): string {
     if (this.usesDatetimeColumns) {
-      return toMysqlDatetimeUtc(iso);
+      return toMysqlDatetimeUtcStrict(iso, 'timestamp');
     }
-    return iso || new Date().toISOString();
+    if (iso === undefined || iso === null || !iso.trim()) {
+      return new Date().toISOString();
+    }
+    return validateAndNormalizeDateTime(iso, 'timestamp')!;
   }
 
   async get<T = Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<T | undefined> {

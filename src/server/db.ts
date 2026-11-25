@@ -75,6 +75,15 @@ import {
   UPCOMING_CATEGORY_NAME,
 } from '../utils/locationCategoryHelpers.ts';
 import {
+  hasRecordContentChanges,
+  mergePreservingOmittedFields,
+  normalizeStoredDateValue,
+  resolvePreservedCreatedAt,
+  resolveUpdatedAt,
+  validateAndNormalizeDateOnly,
+  validateAndNormalizeDateTime,
+} from './dateUtils.ts';
+import {
   buildUpsertSql,
   type DbAdapter,
   type DbDriver,
@@ -85,6 +94,7 @@ import {
   parseJsonSafe,
   resolveDbDriver,
   SqliteDbAdapter,
+  validateProductionEnv,
 } from './dbAdapter.ts';
 
 export { buildUpsertSql, insertIgnoreKeyword, parseJsonSafe };
@@ -92,7 +102,15 @@ export type { DbAdapter, DbDriver, DbExecutor };
 
 const DATA_DIR = path.resolve(process.cwd(), 'data');
 const BACKUP_DIR = path.join(DATA_DIR, 'backups');
-const DB_PATH = path.join(DATA_DIR, 'madinamarket.db');
+const DEFAULT_SQLITE_PATH = path.join(DATA_DIR, 'madinamarket.db');
+
+function resolveSqliteDbPath(): string {
+  const custom = process.env.SQLITE_DB_PATH?.trim();
+  if (custom && process.env.NODE_ENV !== 'production') {
+    return path.resolve(custom);
+  }
+  return DEFAULT_SQLITE_PATH;
+}
 
 export const EXPECTED_MYSQL_TABLES = [
   'admin_audit_logs',
@@ -168,9 +186,12 @@ export function touchSyncVersion(): string {
   return lastSyncVersion;
 }
 
-function ensureDirectories() {
+function ensureDirectories(sqlitePath?: string) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
   fs.mkdirSync(BACKUP_DIR, { recursive: true });
+  if (sqlitePath) {
+    fs.mkdirSync(path.dirname(sqlitePath), { recursive: true });
+  }
 }
 
 export async function initDb(): Promise<DbAdapter> {
@@ -178,22 +199,27 @@ export async function initDb(): Promise<DbAdapter> {
   if (dbInitPromise) return dbInitPromise;
 
   dbInitPromise = (async () => {
+    validateProductionEnv();
     const driver = resolveDbDriver();
 
     if (driver === 'mysql') {
       const mysqlCfg = getMysqlConfigFromEnv();
       const adapter = await MysqlDbAdapter.create(mysqlCfg);
       dbAdapterInstance = adapter;
-      await verifyMysqlImportedSchema(adapter);
-      await seedCrmDefaultsIfEmpty(adapter);
+      await ensureMysqlSchemaAndMigrations(adapter);
       await initServerSessionSecret(adapter);
       return adapter;
     }
 
-    ensureDirectories();
-    const hadExistingDb = fs.existsSync(DB_PATH) && fs.statSync(DB_PATH).size > 0;
+    if (process.env.NODE_ENV === 'production') {
+      throw new Error('Refusing to initialize SQLite in production. Configure MySQL via DB_* environment variables.');
+    }
+
+    const activeSqlitePath = resolveSqliteDbPath();
+    ensureDirectories(activeSqlitePath);
+    const hadExistingDb = fs.existsSync(activeSqlitePath) && fs.statSync(activeSqlitePath).size > 0;
     const { DatabaseSync } = await import('node:sqlite');
-    const sqliteRaw = new DatabaseSync(DB_PATH);
+    const sqliteRaw = new DatabaseSync(activeSqlitePath);
     sqliteRaw.exec('PRAGMA busy_timeout = 5000;');
     try {
       sqliteRaw.exec('PRAGMA journal_mode = WAL;');
@@ -249,6 +275,11 @@ export async function initServerSessionSecret(dbArg?: DbExecutor): Promise<strin
   if (process.env.SESSION_SECRET && process.env.SESSION_SECRET.trim()) {
     return process.env.SESSION_SECRET.trim();
   }
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error(
+      'SESSION_SECRET environment variable is required in production (NODE_ENV=production).'
+    );
+  }
   if (cachedFallbackSessionSecret) return cachedFallbackSessionSecret;
 
   const db = dbArg || (await getDb());
@@ -286,6 +317,11 @@ export function getCachedServerSessionSecret(): string {
   if (process.env.SESSION_SECRET && process.env.SESSION_SECRET.trim()) {
     return process.env.SESSION_SECRET.trim();
   }
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error(
+      'SESSION_SECRET environment variable is required in production (NODE_ENV=production).'
+    );
+  }
   if (!cachedFallbackSessionSecret) {
     throw new Error('Server session secret is not initialized yet.');
   }
@@ -301,17 +337,18 @@ export async function createVerifiedBackup(reason: string): Promise<BackupMetada
   const jsonBackupPath = path.join(BACKUP_DIR, `${id}.json`);
 
   let sqliteFile: string | null = null;
-  if (dbAdapterInstance?.driver === 'sqlite' && fs.existsSync(DB_PATH) && fs.statSync(DB_PATH).size > 0) {
+  const activeSqlitePath = resolveSqliteDbPath();
+  if (dbAdapterInstance?.driver === 'sqlite' && fs.existsSync(activeSqlitePath) && fs.statSync(activeSqlitePath).size > 0) {
     try {
       if (dbAdapterInstance instanceof SqliteDbAdapter) {
         const escaped = sqliteBackupPath.replace(/'/g, "''");
         dbAdapterInstance.rawDb.exec(`VACUUM INTO '${escaped}';`);
       } else {
-        fs.copyFileSync(DB_PATH, sqliteBackupPath);
+        fs.copyFileSync(activeSqlitePath, sqliteBackupPath);
       }
       sqliteFile = path.basename(sqliteBackupPath);
     } catch {
-      fs.copyFileSync(DB_PATH, sqliteBackupPath);
+      fs.copyFileSync(activeSqlitePath, sqliteBackupPath);
       sqliteFile = path.basename(sqliteBackupPath);
     }
   }
@@ -374,19 +411,265 @@ export function listBackups(): Array<{ file: string; sizeBytes: number; createdA
     .slice(0, 30);
 }
 
-async function verifyMysqlImportedSchema(db: DbAdapter): Promise<void> {
+async function ensureMysqlSchemaAndMigrations(db: MysqlDbAdapter): Promise<void> {
+  // Strictly idempotent MySQL DDL: creates missing tables without dropping, truncating, or seeding sample business data.
+  const mysqlTableStatements = [
+    `CREATE TABLE IF NOT EXISTS schema_migrations (
+      id VARCHAR(191) PRIMARY KEY,
+      applied_at VARCHAR(40) NOT NULL,
+      notes TEXT
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+    `CREATE TABLE IF NOT EXISTS categories (
+      id VARCHAR(191) PRIMARY KEY,
+      name VARCHAR(255) NOT NULL,
+      urdu_name VARCHAR(255),
+      parent_category_id VARCHAR(191),
+      level INT NOT NULL DEFAULT 1,
+      description TEXT,
+      is_upcoming TINYINT(1) NOT NULL DEFAULT 0,
+      is_active TINYINT(1) NOT NULL DEFAULT 1,
+      display_order INT NOT NULL DEFAULT 0,
+      created_at VARCHAR(40) NOT NULL,
+      updated_at VARCHAR(40) NOT NULL,
+      INDEX idx_categories_parent (parent_category_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+    `CREATE TABLE IF NOT EXISTS cities (
+      id VARCHAR(191) PRIMARY KEY,
+      name VARCHAR(191) NOT NULL,
+      province VARCHAR(128),
+      allowed TINYINT(1) NOT NULL DEFAULT 1,
+      delivery_charge DOUBLE,
+      display_order INT NOT NULL DEFAULT 0,
+      created_at VARCHAR(40) NOT NULL,
+      updated_at VARCHAR(40) NOT NULL,
+      UNIQUE KEY idx_cities_name (name)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+    `CREATE TABLE IF NOT EXISTS city_areas (
+      id VARCHAR(191) PRIMARY KEY,
+      city_id VARCHAR(191) NOT NULL,
+      name VARCHAR(191) NOT NULL,
+      allowed TINYINT(1) NOT NULL DEFAULT 1,
+      delivery_charge DOUBLE,
+      area_type VARCHAR(64),
+      created_at VARCHAR(40) NOT NULL,
+      updated_at VARCHAR(40) NOT NULL,
+      INDEX idx_city_areas_city (city_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+    `CREATE TABLE IF NOT EXISTS products (
+      id VARCHAR(191) PRIMARY KEY,
+      name VARCHAR(255) NOT NULL,
+      urdu_name VARCHAR(255),
+      category VARCHAR(255) NOT NULL,
+      parent_category_id VARCHAR(191),
+      subcategory_id VARCHAR(191),
+      child_subcategory_id VARCHAR(191),
+      sku VARCHAR(191),
+      cost_price DOUBLE NOT NULL DEFAULT 0,
+      market_price DOUBLE NOT NULL DEFAULT 0,
+      our_price DOUBLE NOT NULL DEFAULT 0,
+      stock_qty INT NOT NULL DEFAULT 0,
+      min_stock_alert INT NOT NULL DEFAULT 5,
+      is_upcoming TINYINT(1) NOT NULL DEFAULT 0,
+      upcoming_status VARCHAR(64) NOT NULL DEFAULT 'available',
+      expected_arrival_date VARCHAR(40),
+      delivery_fee_type VARCHAR(32) NOT NULL DEFAULT 'default',
+      custom_delivery_charge DOUBLE,
+      status VARCHAR(32) NOT NULL DEFAULT 'published',
+      created_at VARCHAR(40) NOT NULL,
+      updated_at VARCHAR(40) NOT NULL,
+      data_json LONGTEXT NOT NULL,
+      INDEX idx_products_category (category),
+      INDEX idx_products_parent_cat (parent_category_id),
+      INDEX idx_products_sku (sku)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+    `CREATE TABLE IF NOT EXISTS customers (
+      id VARCHAR(191) PRIMARY KEY,
+      name VARCHAR(255) NOT NULL,
+      phone VARCHAR(64) NOT NULL,
+      city VARCHAR(128),
+      area VARCHAR(128),
+      mohalla VARCHAR(191),
+      landmark VARCHAR(191),
+      address TEXT,
+      balance DOUBLE NOT NULL DEFAULT 0,
+      status VARCHAR(32) NOT NULL DEFAULT 'active',
+      created_at VARCHAR(40) NOT NULL,
+      updated_at VARCHAR(40) NOT NULL,
+      data_json LONGTEXT NOT NULL,
+      INDEX idx_customers_phone (phone),
+      INDEX idx_customers_city (city)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+    `CREATE TABLE IF NOT EXISTS app_collections (
+      collection_key VARCHAR(191) PRIMARY KEY,
+      data_json LONGTEXT NOT NULL,
+      updated_at VARCHAR(40) NOT NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+    `CREATE TABLE IF NOT EXISTS admin_audit_logs (
+      id VARCHAR(191) PRIMARY KEY,
+      action VARCHAR(128) NOT NULL,
+      entity_type VARCHAR(128) NOT NULL,
+      entity_id VARCHAR(191) NOT NULL,
+      actor_id VARCHAR(191),
+      actor_name VARCHAR(255),
+      actor_role VARCHAR(64),
+      details_json LONGTEXT,
+      created_at VARCHAR(40) NOT NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+    `CREATE TABLE IF NOT EXISTS crm_follow_ups (
+      id VARCHAR(191) PRIMARY KEY,
+      customer_id VARCHAR(191),
+      lead_id VARCHAR(191),
+      assigned_employee_id VARCHAR(191),
+      follow_up_date VARCHAR(40) NOT NULL,
+      priority VARCHAR(32) NOT NULL DEFAULT 'medium',
+      status VARCHAR(32) NOT NULL DEFAULT 'Pending',
+      created_at VARCHAR(40) NOT NULL,
+      updated_at VARCHAR(40) NOT NULL,
+      data_json LONGTEXT NOT NULL,
+      INDEX idx_crm_follow_ups_date_status (follow_up_date, status)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+    `CREATE TABLE IF NOT EXISTS crm_leads (
+      id VARCHAR(191) PRIMARY KEY,
+      phone VARCHAR(64) NOT NULL,
+      stage VARCHAR(64) NOT NULL DEFAULT 'New',
+      source VARCHAR(64) NOT NULL DEFAULT 'WhatsApp',
+      assigned_salesperson_id VARCHAR(191),
+      converted_customer_id VARCHAR(191),
+      created_at VARCHAR(40) NOT NULL,
+      updated_at VARCHAR(40) NOT NULL,
+      data_json LONGTEXT NOT NULL,
+      INDEX idx_crm_leads_stage (stage),
+      INDEX idx_crm_leads_phone (phone)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+    `CREATE TABLE IF NOT EXISTS crm_campaigns (
+      id VARCHAR(191) PRIMARY KEY,
+      status VARCHAR(32) NOT NULL DEFAULT 'draft',
+      created_at VARCHAR(40) NOT NULL,
+      updated_at VARCHAR(40) NOT NULL,
+      data_json LONGTEXT NOT NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+    `CREATE TABLE IF NOT EXISTS crm_support_tickets (
+      id VARCHAR(191) PRIMARY KEY,
+      ticket_number VARCHAR(191) NOT NULL,
+      customer_id VARCHAR(191),
+      order_id VARCHAR(191),
+      category VARCHAR(128) NOT NULL,
+      priority VARCHAR(32) NOT NULL DEFAULT 'medium',
+      status VARCHAR(32) NOT NULL DEFAULT 'Open',
+      assigned_employee_id VARCHAR(191),
+      due_at VARCHAR(40) NOT NULL,
+      created_at VARCHAR(40) NOT NULL,
+      updated_at VARCHAR(40) NOT NULL,
+      data_json LONGTEXT NOT NULL,
+      UNIQUE KEY idx_crm_tickets_num (ticket_number)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+    `CREATE TABLE IF NOT EXISTS crm_loyalty_accounts (
+      customer_id VARCHAR(191) PRIMARY KEY,
+      points_balance INT NOT NULL DEFAULT 0,
+      lifetime_points_earned INT NOT NULL DEFAULT 0,
+      lifetime_points_redeemed INT NOT NULL DEFAULT 0,
+      tier VARCHAR(64) NOT NULL DEFAULT 'Bronze',
+      updated_at VARCHAR(40) NOT NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+    `CREATE TABLE IF NOT EXISTS crm_loyalty_ledger (
+      id VARCHAR(191) PRIMARY KEY,
+      customer_id VARCHAR(191) NOT NULL,
+      type VARCHAR(64) NOT NULL,
+      points INT NOT NULL,
+      order_number VARCHAR(128),
+      coupon_code VARCHAR(128),
+      notes TEXT,
+      created_at VARCHAR(40) NOT NULL,
+      INDEX idx_crm_loyalty_ledger_cust (customer_id, created_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+    `CREATE TABLE IF NOT EXISTS crm_coupons (
+      id VARCHAR(191) PRIMARY KEY,
+      code VARCHAR(128) NOT NULL,
+      customer_id VARCHAR(191),
+      status VARCHAR(32) NOT NULL DEFAULT 'active',
+      expires_at VARCHAR(40),
+      created_at VARCHAR(40) NOT NULL,
+      data_json LONGTEXT NOT NULL,
+      UNIQUE KEY idx_crm_coupons_code (code)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+    `CREATE TABLE IF NOT EXISTS crm_custom_segments (
+      id VARCHAR(191) PRIMARY KEY,
+      name VARCHAR(255) NOT NULL,
+      is_active TINYINT(1) NOT NULL DEFAULT 1,
+      created_at VARCHAR(40) NOT NULL,
+      updated_at VARCHAR(40) NOT NULL,
+      data_json LONGTEXT NOT NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+    `CREATE TABLE IF NOT EXISTS crm_automation_rules (
+      id VARCHAR(191) PRIMARY KEY,
+      trigger_type VARCHAR(128) NOT NULL,
+      enabled TINYINT(1) NOT NULL DEFAULT 1,
+      last_run_at VARCHAR(40),
+      total_triggered_count INT NOT NULL DEFAULT 0,
+      data_json LONGTEXT NOT NULL,
+      UNIQUE KEY idx_crm_rules_trigger (trigger_type)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+    `CREATE TABLE IF NOT EXISTS crm_automation_logs (
+      id VARCHAR(191) PRIMARY KEY,
+      rule_id VARCHAR(191) NOT NULL,
+      trigger_type VARCHAR(128) NOT NULL,
+      customer_id VARCHAR(191) NOT NULL,
+      idempotency_key VARCHAR(191) NOT NULL,
+      status VARCHAR(32) NOT NULL,
+      created_at VARCHAR(40) NOT NULL,
+      data_json LONGTEXT NOT NULL,
+      UNIQUE KEY idx_crm_auto_logs_idem (idempotency_key)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+    `CREATE TABLE IF NOT EXISTS crm_activity_events (
+      id VARCHAR(191) PRIMARY KEY,
+      customer_id VARCHAR(191),
+      phone VARCHAR(64),
+      event_type VARCHAR(64) NOT NULL,
+      product_id VARCHAR(191),
+      category VARCHAR(255),
+      order_number VARCHAR(128),
+      created_at VARCHAR(40) NOT NULL,
+      data_json LONGTEXT NOT NULL,
+      INDEX idx_crm_activity_cust (customer_id, created_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+  ];
+
+  for (const ddl of mysqlTableStatements) {
+    await db.exec(ddl);
+  }
+
+  // Safe idempotent column additions on pre-existing MySQL tables (never drops or modifies existing columns)
+  const safeColumnChecks: Array<[string, string, string]> = [
+    ['cities', 'delivery_charge', 'ALTER TABLE cities ADD COLUMN delivery_charge DOUBLE NULL'],
+    ['cities', 'province', 'ALTER TABLE cities ADD COLUMN province VARCHAR(128) NULL'],
+    ['city_areas', 'delivery_charge', 'ALTER TABLE city_areas ADD COLUMN delivery_charge DOUBLE NULL'],
+    ['city_areas', 'area_type', 'ALTER TABLE city_areas ADD COLUMN area_type VARCHAR(64) NULL'],
+    ['products', 'delivery_fee_type', "ALTER TABLE products ADD COLUMN delivery_fee_type VARCHAR(32) NOT NULL DEFAULT 'default'"],
+    ['products', 'custom_delivery_charge', 'ALTER TABLE products ADD COLUMN custom_delivery_charge DOUBLE NULL'],
+  ];
+
+  for (const [table, col, alterSql] of safeColumnChecks) {
+    if (!(await db.columnExists(table, col))) {
+      await db.exec(alterSql);
+    }
+  }
+
   const missingTables: string[] = [];
   for (const tbl of EXPECTED_MYSQL_TABLES) {
-    const exists = await db.tableExists(tbl);
-    if (!exists) {
+    if (!(await db.tableExists(tbl))) {
       missingTables.push(tbl);
     }
   }
   if (missingTables.length > 0) {
     throw new Error(
-      `Imported MySQL schema is missing required tables: ${missingTables.join(', ')}. Aborting without modifying or dropping existing tables.`
+      `MySQL schema verification failed for required tables: ${missingTables.join(', ')}. Aborting cleanly.`
     );
   }
+
+  await db.run(
+    'INSERT IGNORE INTO schema_migrations (id, applied_at, notes) VALUES (?, ?, ?)',
+    ['mysql_idempotent_schema_v1', db.formatTimestamp(), 'Verified MySQL tables and safe additive columns']
+  );
 }
 
 async function runSqliteMigrations(db: SqliteDbAdapter, hadExistingDb: boolean) {
@@ -542,78 +825,82 @@ async function runSqliteMigrations(db: SqliteDbAdapter, hadExistingDb: boolean) 
     );
   }
 
-  // MIGRATION 002: Seed defaults ONLY into empty tables/keys (strictly non-destructive)
+  // MIGRATION 002: Only initialize non-sample collections if requested explicitly via ALLOW_SAMPLE_SEED=true
   if (!(await hasMigration('002_seed_defaults_if_empty'))) {
     const now = db.formatTimestamp();
+    const allowSampleSeed =
+      process.env.NODE_ENV !== 'production' && process.env.ALLOW_SAMPLE_SEED === 'true';
 
-    const catCountRow = await db.get<{ cnt: number }>('SELECT COUNT(*) as cnt FROM categories');
-    if (Number(catCountRow?.cnt || 0) === 0) {
-      for (const c of defaultCategoryRecords) {
-        const level = c.level || computeCategoryLevel(c, defaultCategoryRecords);
-        await db.run(
-          `${insertIgnoreKeyword(db.driver)} INTO categories (id, name, urdu_name, parent_category_id, level, description, is_upcoming, is_active, display_order, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          [
-            c.id,
-            c.name,
-            c.urduName || null,
-            c.parentCategoryId || null,
-            level,
-            c.description || null,
-            c.isUpcoming ? 1 : 0,
-            c.isActive === false ? 0 : 1,
-            c.displayOrder || 0,
-            now,
-            now,
-          ]
-        );
-      }
-    }
-
-    const cityCountRow = await db.get<{ cnt: number }>('SELECT COUNT(*) as cnt FROM cities');
-    if (Number(cityCountRow?.cnt || 0) === 0) {
-      for (let idx = 0; idx < defaultDeliveryCities.length; idx++) {
-        const city = defaultDeliveryCities[idx];
-        const cityId = city.id || slugifyId('city', city.name);
-        await db.run(
-          `${insertIgnoreKeyword(db.driver)} INTO cities (id, name, allowed, delivery_charge, display_order, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`,
-          [cityId, city.name, city.allowed ? 1 : 0, city.deliveryCharge ?? null, idx + 1, now, now]
-        );
-        for (const area of city.areas || []) {
-          const areaId = area.id || slugifyId('area', `${city.name}_${area.name}`);
+    if (allowSampleSeed) {
+      const catCountRow = await db.get<{ cnt: number }>('SELECT COUNT(*) as cnt FROM categories');
+      if (Number(catCountRow?.cnt || 0) === 0) {
+        for (const c of defaultCategoryRecords) {
+          const level = c.level || computeCategoryLevel(c, defaultCategoryRecords);
           await db.run(
-            `${insertIgnoreKeyword(db.driver)} INTO city_areas (id, city_id, name, allowed, delivery_charge, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)`,
-            [areaId, cityId, area.name, area.allowed ? 1 : 0, area.deliveryCharge ?? null, now, now]
+            `${insertIgnoreKeyword(db.driver)} INTO categories (id, name, urdu_name, parent_category_id, level, description, is_upcoming, is_active, display_order, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+              c.id,
+              c.name,
+              c.urduName || null,
+              c.parentCategoryId || null,
+              level,
+              c.description || null,
+              c.isUpcoming ? 1 : 0,
+              c.isActive === false ? 0 : 1,
+              c.displayOrder || 0,
+              now,
+              now,
+            ]
           );
         }
       }
-    }
 
-    const prodCountRow = await db.get<{ cnt: number }>('SELECT COUNT(*) as cnt FROM products');
-    if (Number(prodCountRow?.cnt || 0) === 0) {
-      for (const p of defaultProducts) {
-        await upsertProductRow(db, p);
+      const cityCountRow = await db.get<{ cnt: number }>('SELECT COUNT(*) as cnt FROM cities');
+      if (Number(cityCountRow?.cnt || 0) === 0) {
+        for (let idx = 0; idx < defaultDeliveryCities.length; idx++) {
+          const city = defaultDeliveryCities[idx];
+          const cityId = city.id || slugifyId('city', city.name);
+          await db.run(
+            `${insertIgnoreKeyword(db.driver)} INTO cities (id, name, allowed, delivery_charge, display_order, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            [cityId, city.name, city.allowed ? 1 : 0, city.deliveryCharge ?? null, idx + 1, now, now]
+          );
+          for (const area of city.areas || []) {
+            const areaId = area.id || slugifyId('area', `${city.name}_${area.name}`);
+            await db.run(
+              `${insertIgnoreKeyword(db.driver)} INTO city_areas (id, city_id, name, allowed, delivery_charge, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)`,
+              [areaId, cityId, area.name, area.allowed ? 1 : 0, area.deliveryCharge ?? null, now, now]
+            );
+          }
+        }
+      }
+
+      const prodCountRow = await db.get<{ cnt: number }>('SELECT COUNT(*) as cnt FROM products');
+      if (Number(prodCountRow?.cnt || 0) === 0) {
+        for (const p of defaultProducts) {
+          await upsertProductRow(db, p);
+        }
+      }
+
+      const custCountRow = await db.get<{ cnt: number }>('SELECT COUNT(*) as cnt FROM customers');
+      if (Number(custCountRow?.cnt || 0) === 0) {
+        for (const cust of defaultCustomers) {
+          await upsertCustomerRow(db, cust);
+        }
+      }
+
+      for (const [key, val] of Object.entries(DEFAULT_COLLECTION_MAP)) {
+        await db.run(
+          `${insertIgnoreKeyword(db.driver)} INTO app_collections (collection_key, data_json, updated_at)
+           VALUES (?, ?, ?)`,
+          [key, JSON.stringify(val), now]
+        );
       }
     }
 
-    const custCountRow = await db.get<{ cnt: number }>('SELECT COUNT(*) as cnt FROM customers');
-    if (Number(custCountRow?.cnt || 0) === 0) {
-      for (const cust of defaultCustomers) {
-        await upsertCustomerRow(db, cust);
-      }
-    }
-
-    for (const [key, val] of Object.entries(DEFAULT_COLLECTION_MAP)) {
-      await db.run(
-        `${insertIgnoreKeyword(db.driver)} INTO app_collections (collection_key, data_json, updated_at)
-         VALUES (?, ?, ?)`,
-        [key, JSON.stringify(val), now]
-      );
-    }
-
-    await recordMigration('002_seed_defaults_if_empty', 'Seeded empty tables safely');
+    await recordMigration('002_seed_defaults_if_empty', allowSampleSeed ? 'Seeded empty tables via ALLOW_SAMPLE_SEED' : 'Skipped auto sample seeding on startup');
   }
 
   // MIGRATION 003: Non-destructive normalization for Upcoming Viral Products | Coming Soon, 3-level hierarchy & City areas
@@ -1182,7 +1469,9 @@ async function runSqliteMigrations(db: SqliteDbAdapter, hadExistingDb: boolean) 
       console.warn('Migration 009 secret hardening warning:', err);
     }
 
-    await seedCrmDefaultsIfEmpty(db);
+    if (process.env.NODE_ENV !== 'production' && process.env.ALLOW_SAMPLE_SEED === 'true') {
+      await seedCrmDefaultsIfEmpty(db);
+    }
 
     await recordMigration(
       '009_crm_schema_and_security_hardening',
@@ -1243,17 +1532,61 @@ export async function getAllCategoriesFromDb(dbArg?: DbExecutor): Promise<Catego
       isUpcoming: Boolean(r.is_upcoming),
       isActive: r.is_active === undefined || r.is_active === null ? true : Boolean(r.is_active),
       displayOrder: Number(r.display_order || 0),
-      createdAt: r.created_at ? String(r.created_at) : undefined,
-      updatedAt: r.updated_at ? String(r.updated_at) : undefined,
+      createdAt: normalizeStoredDateValue(r.created_at),
+      updatedAt: normalizeStoredDateValue(r.updated_at),
     })
   );
 }
 
 export async function upsertCategoryRow(db: DbExecutor, cat: CategoryRecord): Promise<CategoryRecord> {
-  const normalized = normalizeUpcomingCategoryRecord(cat);
+  const nowIso = new Date().toISOString();
+  const existingRow = await db.get<Record<string, unknown>>('SELECT * FROM categories WHERE id = ?', [cat.id]);
+  const existingCat: CategoryRecord | undefined = existingRow
+    ? normalizeUpcomingCategoryRecord({
+        id: String(existingRow.id),
+        name: String(existingRow.name),
+        urduName: existingRow.urdu_name ? String(existingRow.urdu_name) : undefined,
+        parentCategoryId: existingRow.parent_category_id ? String(existingRow.parent_category_id) : undefined,
+        level: (Number(existingRow.level) as 1 | 2 | 3) || 1,
+        description: existingRow.description ? String(existingRow.description) : undefined,
+        isUpcoming: Boolean(existingRow.is_upcoming),
+        isActive:
+          existingRow.is_active === undefined || existingRow.is_active === null
+            ? true
+            : Boolean(existingRow.is_active),
+        displayOrder: Number(existingRow.display_order || 0),
+        createdAt: normalizeStoredDateValue(existingRow.created_at),
+        updatedAt: normalizeStoredDateValue(existingRow.updated_at),
+      })
+    : undefined;
+
+  const merged = mergePreservingOmittedFields(
+    existingCat as Record<string, unknown> | undefined,
+    cat as unknown as Partial<Record<string, unknown>>
+  ) as unknown as CategoryRecord;
+  const normalized = normalizeUpcomingCategoryRecord(merged);
   const allCats = await getAllCategoriesFromDb(db);
   const level = computeCategoryLevel(normalized, allCats.filter((c) => c.id !== normalized.id).concat(normalized));
-  const now = db.formatTimestamp();
+
+  const preservedCreatedAt = resolvePreservedCreatedAt({
+    existingCreatedAt: existingCat?.createdAt,
+    incomingCreatedAt: cat.createdAt,
+    fallbackIso: nowIso,
+    fieldName: 'createdAt',
+  });
+  const candidate = { ...normalized, level };
+  const hasChanges = hasRecordContentChanges(
+    existingCat as Record<string, unknown> | undefined,
+    candidate as unknown as Record<string, unknown>
+  );
+  const resolvedUpdatedAt = resolveUpdatedAt({
+    isNew: !existingCat,
+    hasChanges,
+    existingUpdatedAt: existingCat?.updatedAt,
+    incomingUpdatedAt: cat.updatedAt,
+    createdAtValue: preservedCreatedAt,
+    nowIso,
+  });
 
   const sql = buildUpsertSql({
     driver: db.driver,
@@ -1295,11 +1628,11 @@ export async function upsertCategoryRow(db: DbExecutor, cat: CategoryRecord): Pr
     normalized.isUpcoming ? 1 : 0,
     normalized.isActive === false ? 0 : 1,
     normalized.displayOrder || 0,
-    normalized.createdAt || now,
-    now,
+    db.formatTimestamp(preservedCreatedAt),
+    db.formatTimestamp(resolvedUpdatedAt),
   ]);
 
-  return { ...normalized, level, updatedAt: now };
+  return { ...normalized, level, createdAt: preservedCreatedAt, updatedAt: resolvedUpdatedAt };
 }
 
 export async function getAllCitiesFromDb(dbArg?: DbExecutor): Promise<DeliveryCityConfig[]> {
@@ -1464,11 +1797,19 @@ export async function getAllProductsFromDb(dbArg?: DbExecutor): Promise<ProductI
         totalRevenue: 0,
         totalProfit: 0,
         isWinningItem: false,
-        createdAt: String(r.created_at),
+        createdAt: normalizeStoredDateValue(r.created_at) || '',
       };
     }
 
     const isUpcoming = Boolean(r.is_upcoming) || isProductPurchaseBlocked(parsed);
+    const createdAt =
+      normalizeStoredDateValue(parsed.createdAt) || normalizeStoredDateValue(r.created_at) || '';
+    const updatedAt =
+      normalizeStoredDateValue(parsed.updatedAt) || normalizeStoredDateValue(r.updated_at);
+    const expectedArrivalDate = r.expected_arrival_date
+      ? normalizeStoredDateValue(r.expected_arrival_date)
+      : normalizeStoredDateValue(parsed.expectedArrivalDate);
+
     return {
       ...parsed,
       id: String(r.id),
@@ -1498,9 +1839,8 @@ export async function getAllProductsFromDb(dbArg?: DbExecutor): Promise<ProductI
       minStockAlert: Number(r.min_stock_alert ?? parsed.minStockAlert ?? 5),
       isUpcoming,
       upcomingStatus: isUpcoming ? 'coming_soon' : 'available',
-      expectedArrivalDate: r.expected_arrival_date
-        ? String(r.expected_arrival_date)
-        : parsed.expectedArrivalDate,
+      expectedArrivalDate,
+      activatedAt: normalizeStoredDateValue(parsed.activatedAt),
       deliveryFeeType: ((r.delivery_fee_type ? String(r.delivery_fee_type) : parsed.deliveryFeeType) ||
         'default') as ProductItem['deliveryFeeType'],
       customDeliveryCharge:
@@ -1508,20 +1848,78 @@ export async function getAllProductsFromDb(dbArg?: DbExecutor): Promise<ProductI
           ? Number(r.custom_delivery_charge)
           : parsed.customDeliveryCharge,
       status: String(r.status || parsed.status || 'published') as 'draft' | 'published',
-      updatedAt: r.updated_at ? String(r.updated_at) : parsed.updatedAt,
+      createdAt,
+      updatedAt,
     };
   });
 }
 
 export async function upsertProductRow(db: DbExecutor, product: ProductItem): Promise<ProductItem> {
-  const allCats = await getAllCategoriesFromDb(db);
-  const blockedUpcoming = isProductPurchaseBlocked(product);
   const nowIso = new Date().toISOString();
-  const nowSql = db.formatTimestamp(nowIso);
+  const existingRow = await db.get<Record<string, unknown>>('SELECT * FROM products WHERE id = ?', [product.id]);
+  let existingObj: ProductItem | undefined;
+  if (existingRow) {
+    try {
+      existingObj = parseJsonSafe<ProductItem>(existingRow.data_json);
+    } catch {
+      existingObj = undefined;
+    }
+    if (!existingObj) {
+      existingObj = {
+        id: String(existingRow.id),
+        name: String(existingRow.name),
+        category: String(existingRow.category || 'General Wholesale'),
+        sku: String(existingRow.sku || ''),
+        costPrice: Number(existingRow.cost_price || 0),
+        marketPrice: Number(existingRow.market_price || 0),
+        ourPrice: Number(existingRow.our_price || 0),
+        stockQty: Number(existingRow.stock_qty || 0),
+        minStockAlert: Number(existingRow.min_stock_alert || 5),
+        salesCount: 0,
+        totalRevenue: 0,
+        totalProfit: 0,
+        isWinningItem: false,
+        createdAt: normalizeStoredDateValue(existingRow.created_at) || nowIso,
+      };
+    }
+  }
+
+  // Strictly validate incoming date fields before merging/persisting (throws HTTP 400 DateValidationError on malformed dates)
+  const incomingExpectedArrival =
+    product.expectedArrivalDate === ''
+      ? undefined
+      : validateAndNormalizeDateOnly(product.expectedArrivalDate, 'expectedArrivalDate');
+  const incomingActivatedAt = validateAndNormalizeDateTime(product.activatedAt, 'activatedAt');
+
+  const mergedInput = mergePreservingOmittedFields(
+    existingObj as Record<string, unknown> | undefined,
+    product as unknown as Partial<Record<string, unknown>>
+  ) as unknown as ProductItem;
+
+  const existingCreatedAt = existingObj?.createdAt || normalizeStoredDateValue(existingRow?.created_at);
+  const existingUpdatedAt = existingObj?.updatedAt || normalizeStoredDateValue(existingRow?.updated_at);
+  const preservedCreatedAt = resolvePreservedCreatedAt({
+    existingCreatedAt,
+    incomingCreatedAt: product.createdAt,
+    fallbackIso: nowIso,
+    fieldName: 'createdAt',
+  });
+
+  const resolvedExpectedArrival =
+    product.expectedArrivalDate === ''
+      ? undefined
+      : incomingExpectedArrival ??
+        validateAndNormalizeDateOnly(existingObj?.expectedArrivalDate ?? existingRow?.expected_arrival_date, 'expectedArrivalDate');
+  const resolvedActivatedAt =
+    incomingActivatedAt ??
+    validateAndNormalizeDateTime(existingObj?.activatedAt, 'activatedAt');
+
+  const allCats = await getAllCategoriesFromDb(db);
+  const blockedUpcoming = isProductPurchaseBlocked(mergedInput);
 
   const resolvedIds = blockedUpcoming
     ? { parentCategoryId: UPCOMING_CATEGORY_ID, subcategoryId: undefined, childSubcategoryId: undefined }
-    : resolveCategoryIdsFromProduct(product, allCats);
+    : resolveCategoryIdsFromProduct(mergedInput, allCats);
 
   const normalizedCategory = blockedUpcoming
     ? UPCOMING_CATEGORY_NAME
@@ -1531,38 +1929,59 @@ export async function upsertProductRow(db: DbExecutor, product: ProductItem): Pr
         resolvedIds.parentCategoryId,
         resolvedIds.subcategoryId,
         resolvedIds.childSubcategoryId,
-        product.category
+        mergedInput.category
       )
-    : product.category || 'General Wholesale';
+    : mergedInput.category || 'General Wholesale';
 
   const normalizedDeliveryFeeType: ProductItem['deliveryFeeType'] =
-    product.deliveryFeeType === 'free'
+    mergedInput.deliveryFeeType === 'free'
       ? 'free'
-      : product.deliveryFeeType === 'custom'
+      : mergedInput.deliveryFeeType === 'custom'
       ? 'custom'
       : 'default';
   const normalizedCustomDeliveryCharge =
     normalizedDeliveryFeeType === 'custom' &&
-    product.customDeliveryCharge !== undefined &&
-    product.customDeliveryCharge !== null &&
-    Number.isFinite(Number(product.customDeliveryCharge)) &&
-    Number(product.customDeliveryCharge) >= 0
-      ? Math.round(Number(product.customDeliveryCharge))
+    mergedInput.customDeliveryCharge !== undefined &&
+    mergedInput.customDeliveryCharge !== null &&
+    Number.isFinite(Number(mergedInput.customDeliveryCharge)) &&
+    Number(mergedInput.customDeliveryCharge) >= 0
+      ? Math.round(Number(mergedInput.customDeliveryCharge))
       : undefined;
 
-  const normalizedProduct: ProductItem = {
-    ...product,
+  const candidateBeforeUpdateAt: ProductItem = {
+    ...mergedInput,
     category: normalizedCategory,
     parentCategoryId: resolvedIds.parentCategoryId,
     subcategoryId: resolvedIds.subcategoryId,
     childSubcategoryId: resolvedIds.childSubcategoryId,
     deliveryFeeType: normalizedDeliveryFeeType,
     customDeliveryCharge: normalizedCustomDeliveryCharge,
+    expectedArrivalDate: resolvedExpectedArrival,
+    activatedAt: resolvedActivatedAt,
     isUpcoming: blockedUpcoming,
     upcomingStatus: blockedUpcoming ? 'coming_soon' : 'available',
-    stockQty: blockedUpcoming ? 0 : Math.max(0, Number(product.stockQty || 0)),
-    status: product.status || 'published',
-    updatedAt: nowIso,
+    stockQty: blockedUpcoming ? 0 : Math.max(0, Number(mergedInput.stockQty || 0)),
+    status: mergedInput.status || 'published',
+    createdAt: preservedCreatedAt,
+  };
+
+  const hasChanges = hasRecordContentChanges(
+    existingObj as Record<string, unknown> | undefined,
+    candidateBeforeUpdateAt as unknown as Record<string, unknown>
+  );
+  const resolvedUpdatedAt = resolveUpdatedAt({
+    isNew: !existingRow,
+    hasChanges,
+    existingUpdatedAt,
+    incomingUpdatedAt: product.updatedAt,
+    createdAtValue: preservedCreatedAt,
+    nowIso,
+  });
+
+  const normalizedProduct: ProductItem = {
+    ...candidateBeforeUpdateAt,
+    createdAt: preservedCreatedAt,
+    updatedAt: resolvedUpdatedAt,
   };
 
   const sql = buildUpsertSql({
@@ -1637,8 +2056,8 @@ export async function upsertProductRow(db: DbExecutor, product: ProductItem): Pr
     normalizedProduct.deliveryFeeType || 'default',
     normalizedProduct.customDeliveryCharge ?? null,
     normalizedProduct.status || 'published',
-    normalizedProduct.createdAt || nowIso.split('T')[0],
-    nowSql,
+    db.formatTimestamp(preservedCreatedAt),
+    db.formatTimestamp(resolvedUpdatedAt),
     JSON.stringify(normalizedProduct),
   ]);
 
@@ -1665,7 +2084,7 @@ export async function getAllCustomersFromDb(dbArg?: DbExecutor): Promise<Custome
         phone: String(r.phone),
         creditLimit: 5000,
         paymentTermsDays: 7,
-        createdAt: String(r.created_at),
+        createdAt: normalizeStoredDateValue(r.created_at) || '',
         balance: Number(r.balance || 0),
         status: String(r.status || 'active') as 'active' | 'archived',
       };
@@ -1682,20 +2101,92 @@ export async function getAllCustomersFromDb(dbArg?: DbExecutor): Promise<Custome
       address: r.address ? String(r.address) : parsed.address,
       balance: Number(r.balance ?? parsed.balance ?? 0),
       status: String(r.status || parsed.status || 'active') as 'active' | 'archived',
+      createdAt:
+        normalizeStoredDateValue(parsed.createdAt) || normalizeStoredDateValue(r.created_at) || '',
+      updatedAt:
+        normalizeStoredDateValue(parsed.updatedAt) || normalizeStoredDateValue(r.updated_at),
     };
   });
 }
 
 export async function upsertCustomerRow(db: DbExecutor, customer: Customer): Promise<Customer> {
   const nowIso = new Date().toISOString();
-  const nowSql = db.formatTimestamp(nowIso);
+  const existingRow = await db.get<Record<string, unknown>>('SELECT * FROM customers WHERE id = ?', [customer.id]);
+  let existingObj: Customer | undefined;
+  if (existingRow) {
+    try {
+      existingObj = parseJsonSafe<Customer>(existingRow.data_json);
+    } catch {
+      existingObj = undefined;
+    }
+    if (!existingObj) {
+      existingObj = {
+        id: String(existingRow.id),
+        name: String(existingRow.name),
+        customerType: 'individual',
+        phone: String(existingRow.phone || ''),
+        creditLimit: 5000,
+        paymentTermsDays: 7,
+        balance: Number(existingRow.balance || 0),
+        status: String(existingRow.status || 'active') as 'active' | 'archived',
+        createdAt: normalizeStoredDateValue(existingRow.created_at) || nowIso,
+      };
+    }
+  }
+
+  const incomingBirthday =
+    customer.birthday === '' ? undefined : validateAndNormalizeDateOnly(customer.birthday, 'birthday');
+  const incomingLastPurchase =
+    customer.lastPurchaseDate === ''
+      ? undefined
+      : validateAndNormalizeDateOnly(customer.lastPurchaseDate, 'lastPurchaseDate');
+
+  const merged = mergePreservingOmittedFields(
+    existingObj as Record<string, unknown> | undefined,
+    customer as unknown as Partial<Record<string, unknown>>
+  ) as unknown as Customer;
+
+  const existingCreatedAt = existingObj?.createdAt || normalizeStoredDateValue(existingRow?.created_at);
+  const existingUpdatedAt = existingObj?.updatedAt || normalizeStoredDateValue(existingRow?.updated_at);
+  const preservedCreatedAt = resolvePreservedCreatedAt({
+    existingCreatedAt,
+    incomingCreatedAt: customer.createdAt,
+    fallbackIso: nowIso,
+    fieldName: 'createdAt',
+  });
+
+  const candidate: Customer = {
+    ...merged,
+    city: merged.city?.trim() || undefined,
+    area: merged.area?.trim() || undefined,
+    mohalla: merged.mohalla?.trim() || undefined,
+    landmark: merged.landmark?.trim() || undefined,
+    address: merged.address?.trim() || undefined,
+    birthday: customer.birthday === '' ? undefined : incomingBirthday ?? existingObj?.birthday,
+    lastPurchaseDate:
+      customer.lastPurchaseDate === ''
+        ? undefined
+        : incomingLastPurchase ?? existingObj?.lastPurchaseDate,
+    createdAt: preservedCreatedAt,
+  };
+
+  const hasChanges = hasRecordContentChanges(
+    existingObj as Record<string, unknown> | undefined,
+    candidate as unknown as Record<string, unknown>
+  );
+  const resolvedUpdatedAt = resolveUpdatedAt({
+    isNew: !existingRow,
+    hasChanges,
+    existingUpdatedAt,
+    incomingUpdatedAt: customer.updatedAt,
+    createdAtValue: preservedCreatedAt,
+    nowIso,
+  });
+
   const normalized: Customer = {
-    ...customer,
-    city: customer.city?.trim() || undefined,
-    area: customer.area?.trim() || undefined,
-    mohalla: customer.mohalla?.trim() || undefined,
-    landmark: customer.landmark?.trim() || undefined,
-    address: customer.address?.trim() || undefined,
+    ...candidate,
+    createdAt: preservedCreatedAt,
+    updatedAt: resolvedUpdatedAt,
   };
 
   const sql = buildUpsertSql({
@@ -1743,8 +2234,8 @@ export async function upsertCustomerRow(db: DbExecutor, customer: Customer): Pro
     normalized.address || null,
     Number(normalized.balance || 0),
     normalized.status || 'active',
-    normalized.createdAt || nowIso.split('T')[0],
-    nowSql,
+    db.formatTimestamp(preservedCreatedAt),
+    db.formatTimestamp(resolvedUpdatedAt),
     JSON.stringify(normalized),
   ]);
   return normalized;
@@ -2077,6 +2568,9 @@ export async function saveCrmLoyaltyConfig(db: DbExecutor, config: CRMLoyaltyCon
 }
 
 export async function seedCrmDefaultsIfEmpty(db: DbExecutor): Promise<void> {
+  if (process.env.NODE_ENV === 'production') {
+    return;
+  }
   const existingCfg = await db.get(
     "SELECT collection_key FROM app_collections WHERE collection_key = 'crm_loyalty_config'"
   );
@@ -2138,12 +2632,55 @@ export async function getAllCrmFollowUps(dbArg?: DbExecutor): Promise<CRMFollowU
 
 export async function upsertCrmFollowUp(db: DbExecutor, task: CRMFollowUpTask): Promise<CRMFollowUpTask> {
   const nowIso = new Date().toISOString();
-  const nowSql = db.formatTimestamp(nowIso);
+  const existingRow = await db.get<{ data_json: unknown; created_at: unknown; updated_at: unknown }>(
+    'SELECT data_json, created_at, updated_at FROM crm_follow_ups WHERE id = ?',
+    [task.id]
+  );
+  const existing = existingRow ? parseJsonSafe<CRMFollowUpTask>(existingRow.data_json) : undefined;
+  const merged = mergePreservingOmittedFields(
+    existing as Record<string, unknown> | undefined,
+    task as unknown as Partial<Record<string, unknown>>
+  ) as unknown as CRMFollowUpTask;
+
+  const followUpDate =
+    validateAndNormalizeDateOnly(merged.followUpDate, 'followUpDate') ||
+    validateAndNormalizeDateOnly(nowIso, 'followUpDate')!;
+  const nextFollowUpDate = validateAndNormalizeDateOnly(merged.nextFollowUpDate, 'nextFollowUpDate');
+  const completedAt =
+    merged.status === 'Completed'
+      ? validateAndNormalizeDateTime(merged.completedAt, 'completedAt') || nowIso
+      : validateAndNormalizeDateTime(merged.completedAt, 'completedAt');
+
+  const preservedCreatedAt = resolvePreservedCreatedAt({
+    existingCreatedAt: existing?.createdAt || existingRow?.created_at,
+    incomingCreatedAt: task.createdAt,
+    fallbackIso: nowIso,
+    fieldName: 'createdAt',
+  });
+  const candidate: CRMFollowUpTask = {
+    ...merged,
+    followUpDate,
+    nextFollowUpDate,
+    completedAt,
+    createdAt: preservedCreatedAt,
+  };
+  const hasChanges = hasRecordContentChanges(
+    existing as Record<string, unknown> | undefined,
+    candidate as unknown as Record<string, unknown>
+  );
+  const resolvedUpdatedAt = resolveUpdatedAt({
+    isNew: !existingRow,
+    hasChanges,
+    existingUpdatedAt: existing?.updatedAt || existingRow?.updated_at,
+    incomingUpdatedAt: task.updatedAt,
+    createdAtValue: preservedCreatedAt,
+    nowIso,
+  });
+
   const saved: CRMFollowUpTask = {
-    ...task,
-    createdAt: task.createdAt || nowIso,
-    updatedAt: nowIso,
-    completedAt: task.status === 'Completed' ? task.completedAt || nowIso : task.completedAt,
+    ...candidate,
+    createdAt: preservedCreatedAt,
+    updatedAt: resolvedUpdatedAt,
   };
   const sql = buildUpsertSql({
     driver: db.driver,
@@ -2180,8 +2717,8 @@ export async function upsertCrmFollowUp(db: DbExecutor, task: CRMFollowUpTask): 
     saved.followUpDate,
     saved.priority,
     saved.status,
-    db.formatTimestamp(saved.createdAt),
-    nowSql,
+    db.formatTimestamp(preservedCreatedAt),
+    db.formatTimestamp(resolvedUpdatedAt),
     JSON.stringify(saved),
   ]);
   return saved;
@@ -2201,11 +2738,47 @@ export async function getAllCrmLeads(dbArg?: DbExecutor): Promise<CRMLead[]> {
 
 export async function upsertCrmLead(db: DbExecutor, lead: CRMLead): Promise<CRMLead> {
   const nowIso = new Date().toISOString();
-  const nowSql = db.formatTimestamp(nowIso);
+  const existingRow = await db.get<{ data_json: unknown; created_at: unknown; updated_at: unknown }>(
+    'SELECT data_json, created_at, updated_at FROM crm_leads WHERE id = ?',
+    [lead.id]
+  );
+  const existing = existingRow ? parseJsonSafe<CRMLead>(existingRow.data_json) : undefined;
+  const merged = mergePreservingOmittedFields(
+    existing as Record<string, unknown> | undefined,
+    lead as unknown as Partial<Record<string, unknown>>
+  ) as unknown as CRMLead;
+
+  const followUpDate = validateAndNormalizeDateOnly(merged.followUpDate, 'followUpDate');
+  const convertedAt = validateAndNormalizeDateTime(merged.convertedAt, 'convertedAt');
+  const preservedCreatedAt = resolvePreservedCreatedAt({
+    existingCreatedAt: existing?.createdAt || existingRow?.created_at,
+    incomingCreatedAt: lead.createdAt,
+    fallbackIso: nowIso,
+    fieldName: 'createdAt',
+  });
+  const candidate: CRMLead = {
+    ...merged,
+    followUpDate,
+    convertedAt,
+    createdAt: preservedCreatedAt,
+  };
+  const hasChanges = hasRecordContentChanges(
+    existing as Record<string, unknown> | undefined,
+    candidate as unknown as Record<string, unknown>
+  );
+  const resolvedUpdatedAt = resolveUpdatedAt({
+    isNew: !existingRow,
+    hasChanges,
+    existingUpdatedAt: existing?.updatedAt || existingRow?.updated_at,
+    incomingUpdatedAt: lead.updatedAt,
+    createdAtValue: preservedCreatedAt,
+    nowIso,
+  });
+
   const saved: CRMLead = {
-    ...lead,
-    createdAt: lead.createdAt || nowIso,
-    updatedAt: nowIso,
+    ...candidate,
+    createdAt: preservedCreatedAt,
+    updatedAt: resolvedUpdatedAt,
   };
   const sql = buildUpsertSql({
     driver: db.driver,
@@ -2239,8 +2812,8 @@ export async function upsertCrmLead(db: DbExecutor, lead: CRMLead): Promise<CRML
     saved.source,
     saved.assignedSalespersonId || null,
     saved.convertedCustomerId || null,
-    db.formatTimestamp(saved.createdAt),
-    nowSql,
+    db.formatTimestamp(preservedCreatedAt),
+    db.formatTimestamp(resolvedUpdatedAt),
     JSON.stringify(saved),
   ]);
   return saved;
@@ -2256,11 +2829,45 @@ export async function getAllCrmCampaigns(dbArg?: DbExecutor): Promise<CRMCampaig
 
 export async function upsertCrmCampaign(db: DbExecutor, campaign: CRMCampaign): Promise<CRMCampaign> {
   const nowIso = new Date().toISOString();
-  const nowSql = db.formatTimestamp(nowIso);
+  const existingRow = await db.get<{ data_json: unknown; created_at: unknown; updated_at: unknown }>(
+    'SELECT data_json, created_at, updated_at FROM crm_campaigns WHERE id = ?',
+    [campaign.id]
+  );
+  const existing = existingRow ? parseJsonSafe<CRMCampaign>(existingRow.data_json) : undefined;
+  const merged = mergePreservingOmittedFields(
+    existing as Record<string, unknown> | undefined,
+    campaign as unknown as Partial<Record<string, unknown>>
+  ) as unknown as CRMCampaign;
+
+  const adminApprovedAt = validateAndNormalizeDateTime(merged.adminApprovedAt, 'adminApprovedAt');
+  const preservedCreatedAt = resolvePreservedCreatedAt({
+    existingCreatedAt: existing?.createdAt || existingRow?.created_at,
+    incomingCreatedAt: campaign.createdAt,
+    fallbackIso: nowIso,
+    fieldName: 'createdAt',
+  });
+  const candidate: CRMCampaign = {
+    ...merged,
+    adminApprovedAt,
+    createdAt: preservedCreatedAt,
+  };
+  const hasChanges = hasRecordContentChanges(
+    existing as Record<string, unknown> | undefined,
+    candidate as unknown as Record<string, unknown>
+  );
+  const resolvedUpdatedAt = resolveUpdatedAt({
+    isNew: !existingRow,
+    hasChanges,
+    existingUpdatedAt: existing?.updatedAt || existingRow?.updated_at,
+    incomingUpdatedAt: campaign.updatedAt,
+    createdAtValue: preservedCreatedAt,
+    nowIso,
+  });
+
   const saved: CRMCampaign = {
-    ...campaign,
-    createdAt: campaign.createdAt || nowIso,
-    updatedAt: nowIso,
+    ...candidate,
+    createdAt: preservedCreatedAt,
+    updatedAt: resolvedUpdatedAt,
   };
   const sql = buildUpsertSql({
     driver: db.driver,
@@ -2272,8 +2879,8 @@ export async function upsertCrmCampaign(db: DbExecutor, campaign: CRMCampaign): 
   await db.run(sql, [
     saved.id,
     saved.status,
-    db.formatTimestamp(saved.createdAt),
-    nowSql,
+    db.formatTimestamp(preservedCreatedAt),
+    db.formatTimestamp(resolvedUpdatedAt),
     JSON.stringify(saved),
   ]);
   return saved;
@@ -2289,13 +2896,50 @@ export async function getAllCrmTickets(dbArg?: DbExecutor): Promise<CRMSupportTi
 
 export async function upsertCrmTicket(db: DbExecutor, ticket: CRMSupportTicket): Promise<CRMSupportTicket> {
   const nowIso = new Date().toISOString();
-  const nowSql = db.formatTimestamp(nowIso);
+  const existingRow = await db.get<{ data_json: unknown; created_at: unknown; updated_at: unknown }>(
+    'SELECT data_json, created_at, updated_at FROM crm_support_tickets WHERE id = ?',
+    [ticket.id]
+  );
+  const existing = existingRow ? parseJsonSafe<CRMSupportTicket>(existingRow.data_json) : undefined;
+  const merged = mergePreservingOmittedFields(
+    existing as Record<string, unknown> | undefined,
+    ticket as unknown as Partial<Record<string, unknown>>
+  ) as unknown as CRMSupportTicket;
+
+  const dueAt = validateAndNormalizeDateTime(merged.dueAt, 'dueAt') || nowIso;
+  const resolvedAt =
+    merged.status === 'Resolved' || merged.status === 'Closed'
+      ? validateAndNormalizeDateTime(merged.resolvedAt, 'resolvedAt') || nowIso
+      : validateAndNormalizeDateTime(merged.resolvedAt, 'resolvedAt');
+  const preservedCreatedAt = resolvePreservedCreatedAt({
+    existingCreatedAt: existing?.createdAt || existingRow?.created_at,
+    incomingCreatedAt: ticket.createdAt,
+    fallbackIso: nowIso,
+    fieldName: 'createdAt',
+  });
+  const candidate: CRMSupportTicket = {
+    ...merged,
+    dueAt,
+    resolvedAt,
+    createdAt: preservedCreatedAt,
+  };
+  const hasChanges = hasRecordContentChanges(
+    existing as Record<string, unknown> | undefined,
+    candidate as unknown as Record<string, unknown>
+  );
+  const resolvedUpdatedAt = resolveUpdatedAt({
+    isNew: !existingRow,
+    hasChanges,
+    existingUpdatedAt: existing?.updatedAt || existingRow?.updated_at,
+    incomingUpdatedAt: ticket.updatedAt,
+    createdAtValue: preservedCreatedAt,
+    nowIso,
+  });
+
   const saved: CRMSupportTicket = {
-    ...ticket,
-    createdAt: ticket.createdAt || nowIso,
-    updatedAt: nowIso,
-    resolvedAt:
-      ticket.status === 'Resolved' || ticket.status === 'Closed' ? ticket.resolvedAt || nowIso : ticket.resolvedAt,
+    ...candidate,
+    createdAt: preservedCreatedAt,
+    updatedAt: resolvedUpdatedAt,
   };
   const sql = buildUpsertSql({
     driver: db.driver,
@@ -2337,8 +2981,8 @@ export async function upsertCrmTicket(db: DbExecutor, ticket: CRMSupportTicket):
     saved.status,
     saved.assignedEmployeeId || null,
     db.formatTimestamp(saved.dueAt),
-    db.formatTimestamp(saved.createdAt),
-    nowSql,
+    db.formatTimestamp(preservedCreatedAt),
+    db.formatTimestamp(resolvedUpdatedAt),
     JSON.stringify(saved),
   ]);
   return saved;
@@ -2463,10 +3107,31 @@ export async function getAllCrmCoupons(dbArg?: DbExecutor): Promise<CRMLoyaltyCo
 }
 
 export async function upsertCrmCoupon(db: DbExecutor, coupon: CRMLoyaltyCoupon): Promise<CRMLoyaltyCoupon> {
+  const nowIso = new Date().toISOString();
+  const existingRow = await db.get<{ data_json: unknown; created_at: unknown }>(
+    'SELECT data_json, created_at FROM crm_coupons WHERE id = ?',
+    [coupon.id]
+  );
+  const existing = existingRow ? parseJsonSafe<CRMLoyaltyCoupon>(existingRow.data_json) : undefined;
+  const merged = mergePreservingOmittedFields(
+    existing as Record<string, unknown> | undefined,
+    coupon as unknown as Partial<Record<string, unknown>>
+  ) as unknown as CRMLoyaltyCoupon;
+  const expiresAt = validateAndNormalizeDateTime(merged.expiresAt, 'expiresAt');
+  const redeemedAt = validateAndNormalizeDateTime(merged.redeemedAt, 'redeemedAt');
+  const preservedCreatedAt = resolvePreservedCreatedAt({
+    existingCreatedAt: existing?.createdAt || existingRow?.created_at,
+    incomingCreatedAt: coupon.createdAt,
+    fallbackIso: nowIso,
+    fieldName: 'createdAt',
+  });
+
   const saved: CRMLoyaltyCoupon = {
-    ...coupon,
-    code: coupon.code.trim().toUpperCase(),
-    createdAt: coupon.createdAt || new Date().toISOString(),
+    ...merged,
+    code: merged.code.trim().toUpperCase(),
+    expiresAt,
+    redeemedAt,
+    createdAt: preservedCreatedAt,
   };
   const sql = buildUpsertSql({
     driver: db.driver,
@@ -2487,7 +3152,7 @@ export async function upsertCrmCoupon(db: DbExecutor, coupon: CRMLoyaltyCoupon):
     saved.customerId || null,
     saved.status,
     saved.expiresAt ? db.formatTimestamp(saved.expiresAt) : null,
-    db.formatTimestamp(saved.createdAt),
+    db.formatTimestamp(preservedCreatedAt),
     JSON.stringify(saved),
   ]);
   return saved;
@@ -2503,8 +3168,39 @@ export async function getAllCrmCustomSegments(dbArg?: DbExecutor): Promise<CRMCu
 
 export async function upsertCrmCustomSegment(db: DbExecutor, rule: CRMCustomSegmentRule): Promise<CRMCustomSegmentRule> {
   const nowIso = new Date().toISOString();
-  const nowSql = db.formatTimestamp(nowIso);
-  const saved: CRMCustomSegmentRule = { ...rule, createdAt: rule.createdAt || nowIso, updatedAt: nowIso };
+  const existingRow = await db.get<{ data_json: unknown; created_at: unknown; updated_at: unknown }>(
+    'SELECT data_json, created_at, updated_at FROM crm_custom_segments WHERE id = ?',
+    [rule.id]
+  );
+  const existing = existingRow ? parseJsonSafe<CRMCustomSegmentRule>(existingRow.data_json) : undefined;
+  const merged = mergePreservingOmittedFields(
+    existing as Record<string, unknown> | undefined,
+    rule as unknown as Partial<Record<string, unknown>>
+  ) as unknown as CRMCustomSegmentRule;
+  const preservedCreatedAt = resolvePreservedCreatedAt({
+    existingCreatedAt: existing?.createdAt || existingRow?.created_at,
+    incomingCreatedAt: rule.createdAt,
+    fallbackIso: nowIso,
+    fieldName: 'createdAt',
+  });
+  const hasChanges = hasRecordContentChanges(
+    existing as Record<string, unknown> | undefined,
+    { ...merged, createdAt: preservedCreatedAt } as unknown as Record<string, unknown>
+  );
+  const resolvedUpdatedAt = resolveUpdatedAt({
+    isNew: !existingRow,
+    hasChanges,
+    existingUpdatedAt: existing?.updatedAt || existingRow?.updated_at,
+    incomingUpdatedAt: rule.updatedAt,
+    createdAtValue: preservedCreatedAt,
+    nowIso,
+  });
+
+  const saved: CRMCustomSegmentRule = {
+    ...merged,
+    createdAt: preservedCreatedAt,
+    updatedAt: resolvedUpdatedAt,
+  };
   const sql = buildUpsertSql({
     driver: db.driver,
     table: 'crm_custom_segments',
@@ -2521,8 +3217,8 @@ export async function upsertCrmCustomSegment(db: DbExecutor, rule: CRMCustomSegm
     saved.id,
     saved.name,
     saved.isActive ? 1 : 0,
-    db.formatTimestamp(saved.createdAt),
-    nowSql,
+    db.formatTimestamp(preservedCreatedAt),
+    db.formatTimestamp(resolvedUpdatedAt),
     JSON.stringify(saved),
   ]);
   return saved;
@@ -2542,13 +3238,15 @@ export async function getAllCrmAutomationRules(dbArg?: DbExecutor): Promise<CRMA
     return {
       ...parsed,
       enabled: Boolean(r.enabled),
-      lastRunAt: r.last_run_at ? String(r.last_run_at) : parsed.lastRunAt,
+      lastRunAt: normalizeStoredDateValue(r.last_run_at) || normalizeStoredDateValue(parsed.lastRunAt),
       totalTriggeredCount: Number(r.total_triggered_count ?? parsed.totalTriggeredCount ?? 0),
     };
   });
 }
 
 export async function upsertCrmAutomationRule(db: DbExecutor, rule: CRMAutomationRule): Promise<CRMAutomationRule> {
+  const lastRunAt = validateAndNormalizeDateTime(rule.lastRunAt, 'lastRunAt');
+  const saved: CRMAutomationRule = { ...rule, lastRunAt };
   const sql = buildUpsertSql({
     driver: db.driver,
     table: 'crm_automation_rules',
@@ -2562,14 +3260,14 @@ export async function upsertCrmAutomationRule(db: DbExecutor, rule: CRMAutomatio
     ],
   });
   await db.run(sql, [
-    rule.id,
-    rule.triggerType,
-    rule.enabled ? 1 : 0,
-    rule.lastRunAt ? db.formatTimestamp(rule.lastRunAt) : null,
-    rule.totalTriggeredCount || 0,
-    JSON.stringify(rule),
+    saved.id,
+    saved.triggerType,
+    saved.enabled ? 1 : 0,
+    lastRunAt ? db.formatTimestamp(lastRunAt) : null,
+    saved.totalTriggeredCount || 0,
+    JSON.stringify(saved),
   ]);
-  return rule;
+  return saved;
 }
 
 export async function getAllCrmAutomationLogs(dbArg?: DbExecutor, limit = 200): Promise<CRMAutomationLog[]> {
@@ -2583,6 +3281,7 @@ export async function getAllCrmAutomationLogs(dbArg?: DbExecutor, limit = 200): 
 }
 
 export async function insertCrmAutomationLog(db: DbExecutor, log: CRMAutomationLog): Promise<boolean> {
+  const createdAt = validateAndNormalizeDateTime(log.createdAt, 'createdAt') || new Date().toISOString();
   const info = await db.run(
     `${insertIgnoreKeyword(db.driver)} INTO crm_automation_logs (id, rule_id, trigger_type, customer_id, idempotency_key, status, created_at, data_json)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -2593,8 +3292,8 @@ export async function insertCrmAutomationLog(db: DbExecutor, log: CRMAutomationL
       log.customerId,
       log.idempotencyKey,
       log.status,
-      db.formatTimestamp(log.createdAt),
-      JSON.stringify(log),
+      db.formatTimestamp(createdAt),
+      JSON.stringify({ ...log, createdAt }),
     ]
   );
   return Number(info.changes || 0) > 0;
@@ -2609,7 +3308,8 @@ export async function insertCrmActivityEvent(
   db: DbExecutor,
   event: Omit<CRMActivityEvent, 'id' | 'createdAt'> & { id?: string; createdAt?: string }
 ): Promise<CRMActivityEvent> {
-  const createdAtIso = event.createdAt || new Date().toISOString();
+  const createdAtIso =
+    validateAndNormalizeDateTime(event.createdAt, 'createdAt') || new Date().toISOString();
   const entry: CRMActivityEvent = {
     ...event,
     id: event.id || `act_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
@@ -2870,9 +3570,14 @@ export async function getFullSyncState(actorOrRole?: ActorContext | string): Pro
     getAdminAuditLogs(db),
   ]);
 
+  const isProduction = process.env.NODE_ENV === 'production';
   const profileWithCities: BusinessProfile = {
     ...profile,
-    deliveryCities: ensureCityAreasShape(cities.length > 0 ? cities : profile.deliveryCities || defaultDeliveryCities),
+    deliveryCities: ensureCityAreasShape(
+      cities.length > 0
+        ? cities
+        : profile.deliveryCities || (isProduction ? [] : defaultDeliveryCities)
+    ),
   };
 
   const state: Record<string, unknown> = {
@@ -2885,15 +3590,142 @@ export async function getFullSyncState(actorOrRole?: ActorContext | string): Pro
     admin_audit_logs: auditLogs,
   };
 
+  const allowSampleFallback = !isProduction && process.env.ALLOW_SAMPLE_SEED === 'true';
   const keys = Object.keys(DEFAULT_COLLECTION_MAP).filter((k) => k !== 'business_profile');
   const collectionValues = await Promise.all(
-    keys.map((key) => getCollectionValue(db, key, DEFAULT_COLLECTION_MAP[key]))
+    keys.map((key) => {
+      const defVal = DEFAULT_COLLECTION_MAP[key];
+      const fallback =
+        allowSampleFallback || (!isProduction && key === 'templates')
+          ? defVal
+          : Array.isArray(defVal)
+          ? []
+          : defVal;
+      return getCollectionValue(db, key, fallback);
+    })
   );
   keys.forEach((key, idx) => {
     state[key] = collectionValues[idx];
   });
 
   return redactStateForRole(state, actorOrRole);
+}
+
+const COLLECTION_DATE_ONLY_FIELDS = new Set([
+  'date',
+  'dueDate',
+  'payoutDate',
+  'joinDate',
+  'expectedArrivalDate',
+  'birthday',
+  'lastPurchaseDate',
+]);
+
+const COLLECTION_DATETIME_FIELDS = new Set([
+  'updatedAt',
+  'dispatchedAt',
+  'deliveredAt',
+  'returnedAt',
+  'sentAt',
+  'lastLoginAt',
+  'timestamp',
+  'activatedAt',
+  'convertedAt',
+  'resolvedAt',
+  'completedAt',
+  'redeemedAt',
+  'expiresAt',
+]);
+
+export function sanitizeAndValidateCollectionItemDates(
+  item: Record<string, unknown>,
+  existing?: Record<string, unknown>,
+  nowIso = new Date().toISOString()
+): Record<string, unknown> {
+  const merged = mergePreservingOmittedFields(existing, item);
+  for (const field of COLLECTION_DATE_ONLY_FIELDS) {
+    if (merged[field] !== undefined && merged[field] !== null && merged[field] !== '') {
+      merged[field] = validateAndNormalizeDateOnly(merged[field], field);
+    }
+  }
+  for (const field of COLLECTION_DATETIME_FIELDS) {
+    if (merged[field] !== undefined && merged[field] !== null && merged[field] !== '') {
+      merged[field] = validateAndNormalizeDateTime(merged[field], field);
+    }
+  }
+
+  const preservedCreatedAt = resolvePreservedCreatedAt({
+    existingCreatedAt: existing?.createdAt,
+    incomingCreatedAt: item.createdAt,
+    fallbackIso: nowIso,
+    fieldName: 'createdAt',
+  });
+  const candidate = { ...merged, createdAt: preservedCreatedAt };
+  const hasChanges = hasRecordContentChanges(existing, candidate);
+  const resolvedUpdatedAt = resolveUpdatedAt({
+    isNew: !existing,
+    hasChanges,
+    existingUpdatedAt: existing?.updatedAt,
+    incomingUpdatedAt: item.updatedAt,
+    createdAtValue: preservedCreatedAt,
+    nowIso,
+  });
+
+  return {
+    ...candidate,
+    createdAt: preservedCreatedAt,
+    updatedAt: resolvedUpdatedAt,
+  };
+}
+
+export async function mergeCollectionArrayNonDestructively<T extends Record<string, unknown>>(
+  db: DbExecutor,
+  key: string,
+  incomingArr: T[],
+  options?: { idField?: string }
+): Promise<{ items: T[]; changed: boolean; insertedCount: number; updatedCount: number }> {
+  const currentArr = await getCollectionValue<T[]>(db, key, []);
+  if (!Array.isArray(incomingArr) || incomingArr.length === 0) {
+    return { items: currentArr, changed: false, insertedCount: 0, updatedCount: 0 };
+  }
+
+  const idField = options?.idField || 'id';
+  const nowIso = new Date().toISOString();
+  const byId = new Map<string, number>();
+  const working: T[] = [...currentArr];
+
+  working.forEach((item, idx) => {
+    const idVal = item?.[idField] ? String(item[idField]) : '';
+    if (idVal) byId.set(idVal, idx);
+  });
+
+  let insertedCount = 0;
+  let updatedCount = 0;
+
+  for (const rawItem of incomingArr) {
+    if (!rawItem || typeof rawItem !== 'object') continue;
+    const itemId = rawItem[idField] ? String(rawItem[idField]) : '';
+    const existingIdx = itemId ? byId.get(itemId) : undefined;
+    const existing = existingIdx !== undefined ? working[existingIdx] : undefined;
+    const sanitized = sanitizeAndValidateCollectionItemDates(rawItem, existing, nowIso) as T;
+
+    if (existingIdx !== undefined) {
+      if (hasRecordContentChanges(existing as Record<string, unknown>, sanitized as Record<string, unknown>, [])) {
+        working[existingIdx] = sanitized;
+        updatedCount++;
+      }
+    } else {
+      working.push(sanitized);
+      if (itemId) byId.set(itemId, working.length - 1);
+      insertedCount++;
+    }
+  }
+
+  const changed = insertedCount > 0 || updatedCount > 0;
+  if (changed) {
+    await saveCollectionValue(db, key, working);
+  }
+  return { items: working, changed, insertedCount, updatedCount };
 }
 
 export async function mergeLocalSnapshotNonDestructively(localCollections: Record<string, unknown>): Promise<{
@@ -2903,10 +3735,8 @@ export async function mergeLocalSnapshotNonDestructively(localCollections: Recor
   const hasAnyData = Object.keys(localCollections || {}).length > 0;
   if (!hasAnyData) return { mergedCounts };
 
-  await createVerifiedBackup('before_local_merge');
-
   await withDbTransaction(async (db) => {
-    if (Array.isArray(localCollections.categories)) {
+    if (Array.isArray(localCollections.categories) && localCollections.categories.length > 0) {
       const currentCats = await getAllCategoriesFromDb(db);
       const existingIds = new Set(currentCats.map((c) => c.id));
       const existingNameParent = new Set(
@@ -2927,7 +3757,7 @@ export async function mergeLocalSnapshotNonDestructively(localCollections: Recor
       if (added > 0) mergedCounts.categories = added;
     }
 
-    if (Array.isArray(localCollections.products)) {
+    if (Array.isArray(localCollections.products) && localCollections.products.length > 0) {
       const existingIds = new Set((await getAllProductsFromDb(db)).map((p) => p.id));
       let added = 0;
       for (const p of localCollections.products as ProductItem[]) {
@@ -2940,7 +3770,7 @@ export async function mergeLocalSnapshotNonDestructively(localCollections: Recor
       if (added > 0) mergedCounts.products = added;
     }
 
-    if (Array.isArray(localCollections.customers)) {
+    if (Array.isArray(localCollections.customers) && localCollections.customers.length > 0) {
       const existingIds = new Set((await getAllCustomersFromDb(db)).map((c) => c.id));
       let added = 0;
       for (const c of localCollections.customers as Customer[]) {
@@ -2997,6 +3827,7 @@ export async function mergeLocalSnapshotNonDestructively(localCollections: Recor
       }
     }
 
+    const nowIso = new Date().toISOString();
     for (const key of Object.keys(DEFAULT_COLLECTION_MAP)) {
       if (key === 'business_profile') continue;
       const incomingArr = localCollections[key];
@@ -3007,7 +3838,8 @@ export async function mergeLocalSnapshotNonDestructively(localCollections: Recor
       for (const item of incomingArr as Array<Record<string, unknown>>) {
         const id = item?.id ? String(item.id) : '';
         if (id && !existingIds.has(id)) {
-          currentArr.push(item);
+          const sanitized = sanitizeAndValidateCollectionItemDates(item, undefined, nowIso);
+          currentArr.push(sanitized);
           existingIds.add(id);
           added++;
         }
@@ -3335,6 +4167,8 @@ export interface HealthCheckResponse {
   app: 'ok';
   database: DbDriver;
   status: 'ok' | 'error';
+  connected: boolean;
+  environment: string;
   tables: {
     products: boolean;
     customers: boolean;
@@ -3344,7 +4178,13 @@ export interface HealthCheckResponse {
 }
 
 export async function checkDatabaseHealth(): Promise<HealthCheckResponse> {
-  const driver = resolveDbDriver();
+  const environment = process.env.NODE_ENV || 'development';
+  let driver: DbDriver = 'mysql';
+  try {
+    driver = resolveDbDriver();
+  } catch {
+    driver = process.env.NODE_ENV === 'production' ? 'mysql' : 'sqlite';
+  }
   try {
     const db = await getDb();
     await db.ping();
@@ -3358,6 +4198,8 @@ export async function checkDatabaseHealth(): Promise<HealthCheckResponse> {
       app: 'ok',
       database: db.driver,
       status: allPresent ? 'ok' : 'error',
+      connected: true,
+      environment,
       tables: {
         products,
         customers,
@@ -3370,6 +4212,8 @@ export async function checkDatabaseHealth(): Promise<HealthCheckResponse> {
       app: 'ok',
       database: driver,
       status: 'error',
+      connected: false,
+      environment,
       tables: {
         products: false,
         customers: false,

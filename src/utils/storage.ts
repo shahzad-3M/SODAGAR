@@ -315,6 +315,61 @@ function queueServerCollectionWrite(collectionKey: string, value: unknown) {
   pendingWriteQueues.set(collectionKey, next);
 }
 
+function queueServerEndpointDelete(
+  collectionKey: string,
+  url: string
+): Promise<{ ok: boolean; error?: string }> {
+  if (typeof window === 'undefined') return Promise.resolve({ ok: true });
+  const prev = pendingWriteQueues.get(collectionKey) || Promise.resolve();
+  let result: { ok: boolean; error?: string } = { ok: true };
+  const next = prev
+    .then(async () => {
+      const res = await fetch(url, {
+        method: 'DELETE',
+        headers: getAuthHeaders(),
+        cache: 'no-store',
+      });
+      const parsed = await safeParseJsonResponse<{ ok?: boolean; syncVersion?: string; error?: string }>(res);
+      if (!parsed.ok) {
+        result = { ok: false, error: parsed.data?.error || parsed.error || `Delete failed (HTTP ${res.status})` };
+        console.warn(`Explicit delete failed for ${url}:`, result.error);
+        return;
+      }
+      if (parsed.data?.syncVersion) {
+        currentSyncVersion = parsed.data.syncVersion;
+      }
+      result = { ok: true };
+    })
+    .catch((err) => {
+      result = { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+      console.warn(`Explicit delete network failure for ${url}:`, err);
+    });
+  pendingWriteQueues.set(collectionKey, next);
+  return next.then(() => result);
+}
+
+export function apiDeleteProduct(id: string): Promise<{ ok: boolean; error?: string }> {
+  return queueServerEndpointDelete('products', `/api/products/${encodeURIComponent(id)}`);
+}
+
+export function apiDeleteCustomer(id: string): Promise<{ ok: boolean; error?: string }> {
+  return queueServerEndpointDelete('customers', `/api/customers/${encodeURIComponent(id)}`);
+}
+
+export function apiDeleteExpense(id: string): Promise<{ ok: boolean; error?: string }> {
+  return queueServerEndpointDelete('monthly_expenses', `/api/expenses/${encodeURIComponent(id)}`);
+}
+
+export function apiDeleteCollectionItem(
+  collectionKey: string,
+  itemId: string
+): Promise<{ ok: boolean; error?: string }> {
+  return queueServerEndpointDelete(
+    collectionKey,
+    `/api/collections/${encodeURIComponent(collectionKey)}/items/${encodeURIComponent(itemId)}`
+  );
+}
+
 // Safe localStorage + central backend setter
 function saveToStorage<T>(key: string, value: T, skipRemotePush = false): void {
   memoryStore.set(key, value);
