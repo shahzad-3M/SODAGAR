@@ -29,6 +29,7 @@ export interface Customer {
   pin?: string; // 6-digit security PIN (default: last 6 digits of mobile number)
   notes?: string;
   createdAt: string;
+  updatedAt?: string;
   balance: number; // positive: customer owes you (receivable); negative: you owe customer
   status: 'active' | 'archived';
   lastReminderSentAt?: string;

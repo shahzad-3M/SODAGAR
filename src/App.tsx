@@ -80,6 +80,9 @@ import {
   apiUpdateCODOrderStatus,
   apiAuditAndRepairOrders,
   apiSaveProduct,
+  apiDeleteProduct,
+  apiDeleteExpense,
+  apiDeleteCollectionItem,
   getCartItems,
   saveCartItems,
   getMonthlyExpenses,
@@ -460,6 +463,7 @@ export default function App() {
     const updated = broadcastContacts.filter((c) => c.id !== id);
     setBroadcastContacts(updated);
     saveBroadcastContacts(updated);
+    void apiDeleteCollectionItem('broadcast_contacts', id);
   };
 
   const handleSaveBroadcastCampaign = (campaign: SavedBroadcastCampaign) => {
@@ -1088,6 +1092,7 @@ export default function App() {
     const updated = employees.filter((e) => e.id !== empId);
     setEmployees(updated);
     saveEmployees(updated);
+    void apiDeleteCollectionItem('employees', empId);
     pushToast('Employee record removed.', 'info');
   };
 
@@ -1095,6 +1100,7 @@ export default function App() {
     const updated = attendance.filter((a) => a.id !== recId);
     setAttendance(updated);
     saveAttendance(updated);
+    void apiDeleteCollectionItem('attendance', recId);
     pushToast('Attendance entry deleted.', 'info');
   };
 
@@ -1112,6 +1118,7 @@ export default function App() {
     const updated = monthlyExpenses.filter((e) => e.id !== expenseId);
     setMonthlyExpenses(updated);
     saveMonthlyExpenses(updated);
+    void apiDeleteExpense(expenseId);
   };
 
   const handleCloneRecurringExpenses = (fromMonth: string, toMonth: string): number => {
@@ -1348,6 +1355,7 @@ export default function App() {
         const updated = products.filter((p) => p.id !== productId);
         setProducts(updated);
         saveProducts(updated);
+        void apiDeleteProduct(productId);
         pushToast('Product removed from catalog.', 'info');
       },
     });
@@ -1735,6 +1743,7 @@ export default function App() {
         const updated = recurringInvoices.filter((r) => r.id !== id);
         setRecurringInvoices(updated);
         saveRecurringInvoices(updated);
+        void apiDeleteCollectionItem('recurring_invoices', id);
         pushToast('Recurring schedule deleted.', 'info');
       },
     });
@@ -2141,6 +2150,7 @@ export default function App() {
                 onConfirm: () => {
                   const updated = transactions.filter((t) => t.id !== txId);
                   syncTransactionsAndBalances(updated, customers);
+                  void apiDeleteCollectionItem('transactions', txId);
                   pushToast('Transaction deleted.', 'info');
                 },
               });
@@ -2240,6 +2250,7 @@ export default function App() {
               const updated = notifications.filter((n) => n.id !== id);
               setNotifications(updated);
               saveWhatsAppNotifications(updated);
+              void apiDeleteCollectionItem('notifications', id);
             }}
             onUpdateTemplates={(updated) => {
               setTemplates(updated);
