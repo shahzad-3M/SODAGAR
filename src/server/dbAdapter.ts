@@ -58,8 +58,15 @@ export function resolveDbDriver(): DbDriver {
   if (isProduction) {
     return 'mysql';
   }
+  const host = (process.env.DB_HOST || '').trim().toLowerCase();
+  const isLoopbackHost = host === '127.0.0.1' || host === 'localhost' || host === '::1';
+  const kService = process.env.K_SERVICE || '';
+  const isAiStudioSandbox = kService.startsWith('ais-dev-') || kService.startsWith('ais-pre-');
+  if (isAiStudioSandbox && (!host || isLoopbackHost)) {
+    return 'sqlite';
+  }
   if (
-    process.env.DB_HOST?.trim() ||
+    host ||
     process.env.DB_NAME?.trim() ||
     process.env.DB_USER?.trim()
   ) {
