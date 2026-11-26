@@ -17,8 +17,6 @@ import {
   Users,
   Lock,
   Unlock,
-  Eye,
-  EyeOff,
   Search,
   Filter,
   History,
@@ -44,8 +42,7 @@ import {
   getLoginAudits,
   saveLoginAudits,
   apiChangeMasterPin,
-  updateCustomerPin,
-  updateResellerPin,
+  apiAdminResetPassword,
   getDefaultPinForPhone,
   getCustomers,
   saveCustomers,
@@ -59,6 +56,15 @@ import {
   apiUpdateCityArea,
   apiDeleteCityArea,
   apiCreateServerBackup,
+  apiFetchHealth,
+  apiFetchBackups,
+  apiDownloadBackupFile,
+  apiDownloadLiveBackup,
+  apiRestoreServerBackup,
+  isServerProductionMode,
+  type ServerBackupEntry,
+  type ServerHealthInfo,
+  type ServerRestoreSummary,
 } from '../utils/storage.ts';
 import {
   DEFAULT_CITY_CENTER_DELIVERY_CHARGE,
@@ -118,7 +124,18 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [userDirPage, setUserDirPage] = useState(1);
   const USER_DIR_PAGE_SIZE = 25;
   const [userListNotice, setUserListNotice] = useState<string | null>(null);
-  const [revealedPins, setRevealedPins] = useState<Record<string, boolean>>({});
+  const [serverHealth, setServerHealth] = useState<ServerHealthInfo | null>(null);
+  const [serverBackups, setServerBackups] = useState<ServerBackupEntry[]>([]);
+  const [dailyBackupLastAt, setDailyBackupLastAt] = useState<string | null>(null);
+  const [backupLoading, setBackupLoading] = useState(false);
+  const [creatingBackup, setCreatingBackup] = useState(false);
+  const [downloadingLiveBackup, setDownloadingLiveBackup] = useState(false);
+  const [pendingRestoreFile, setPendingRestoreFile] = useState<{
+    fileName: string;
+    payload: Record<string, unknown>;
+    preview: ServerRestoreSummary;
+  } | null>(null);
+  const [executingRestore, setExecutingRestore] = useState(false);
   const [newDeliveryCity, setNewDeliveryCity] = useState('');
   const [newDeliveryCityProvince, setNewDeliveryCityProvince] = useState<string>('Azad Kashmir (AJK)');
   const [newDeliveryCityCharge, setNewDeliveryCityCharge] = useState('');
@@ -137,6 +154,40 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
   const [confirmDialog, setConfirmDialog] = useState<ConfirmDialogState | null>(null);
   const [inputPrompt, setInputPrompt] = useState<InputPromptState | null>(null);
+
+  const loadBackupStatus = async () => {
+    setBackupLoading(true);
+    try {
+      const [hRes, bRes] = await Promise.all([apiFetchHealth(), apiFetchBackups()]);
+      if (hRes.health) {
+        setServerHealth(hRes.health);
+        setDailyBackupLastAt(hRes.health.lastDailyBackupAt || null);
+      }
+      if (bRes.ok) {
+        setServerBackups(bRes.backups || []);
+        if (bRes.schedule?.lastDailyBackupAt !== undefined) {
+          setDailyBackupLastAt(bRes.schedule.lastDailyBackupAt);
+        }
+      }
+    } finally {
+      setBackupLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    void apiFetchHealth().then((hRes) => {
+      if (hRes.health) {
+        setServerHealth(hRes.health);
+        setDailyBackupLastAt(hRes.health.lastDailyBackupAt || null);
+      }
+    });
+  }, []);
+
+  useEffect(() => {
+    if (activeTab === 'backup') {
+      void loadBackupStatus();
+    }
+  }, [activeTab]);
 
   useEffect(() => {
     setFormData((prev) => ({
@@ -546,56 +597,54 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     setTimeout(() => setPinChangeMsg(null), 3500);
   };
 
-  // 1-CLICK RESET USER PIN TO DEFAULT
-  const handleResetUserPinToDefault = (user: Customer | Reseller, role: 'customer' | 'reseller') => {
+  // 1-CLICK RESET USER PIN TO DEFAULT (SERVER HASHED)
+  const handleResetUserPinToDefault = async (user: Customer | Reseller, role: 'customer' | 'reseller') => {
     const defaultPin = getDefaultPinForPhone(user.phone);
-    if (role === 'customer') {
-      updateCustomerPin(user.id, defaultPin);
-      if (onUpdateCustomer) {
-        onUpdateCustomer({ ...(user as Customer), pin: defaultPin });
-      }
-      setUserListNotice(
-        `کسٹمر "${user.name}" کا پن ڈیفالٹ پر ری سیٹ کر دیا گیا: ${defaultPin} (موبائل کے آخری 6 ہندسے)`
-      );
-    } else {
-      updateResellerPin(user.id, defaultPin);
-      if (onUpdateReseller) {
-        onUpdateReseller({ ...(user as Reseller), pin: defaultPin });
-      }
-      setUserListNotice(
-        `ری سیلر "${user.name}" کا پن ڈیفالٹ پر ری سیٹ کر دیا گیا: ${defaultPin} (موبائل کے آخری 6 ہندسے)`
-      );
+    const res = await apiAdminResetPassword(user.id, defaultPin);
+    if (!res.ok) {
+      pushToast(res.error || `Failed to reset PIN for ${user.name}.`, 'error');
+      return;
     }
+    if (role === 'customer' && onUpdateCustomer) {
+      onUpdateCustomer({ ...(user as Customer), pin: undefined });
+    } else if (role === 'reseller' && onUpdateReseller) {
+      onUpdateReseller({ ...(user as Reseller), pin: undefined });
+    }
+    onRefreshAllData();
+    const roleUrdu = role === 'customer' ? 'کسٹمر' : 'ری سیلر';
+    setUserListNotice(
+      `${roleUrdu} "${user.name}" کا پن ڈیفالٹ (موبائل کے آخری 6 ہندسے) پر محفوظ طریقے سے ری سیٹ ہو گیا۔`
+    );
+    pushToast(`Security PIN reset to default for ${user.name}.`, 'success');
     setTimeout(() => setUserListNotice(null), 4000);
   };
 
-  // SET CUSTOM PIN FOR A USER
+  // SET CUSTOM PIN FOR A USER (SERVER HASHED)
   const handleSetCustomUserPin = (user: Customer | Reseller, role: 'customer' | 'reseller') => {
-    const defaultPin = getDefaultPinForPhone(user.phone);
     setInputPrompt({
       title: 'Set Custom Security PIN',
-      label: `نیا 6 ہندسوں کا پن کوڈ درج کریں برائے ${user.name} (${user.phone}):\n(Default: ${defaultPin})`,
-      initialValue: user.pin || defaultPin,
-      submitLabel: 'Save PIN',
-      onSubmit: (input) => {
+      label: `نیا کم از کم 4 ہندسوں کا پن کوڈ درج کریں برائے ${user.name} (${user.phone}):`,
+      initialValue: '',
+      submitLabel: 'Save Hashed PIN',
+      onSubmit: async (input) => {
         const clean = input.trim();
         if (clean.length < 4) {
           pushToast('PIN must be at least 4 digits.', 'error');
           return;
         }
-        if (role === 'customer') {
-          updateCustomerPin(user.id, clean);
-          if (onUpdateCustomer) {
-            onUpdateCustomer({ ...(user as Customer), pin: clean });
-          }
-        } else {
-          updateResellerPin(user.id, clean);
-          if (onUpdateReseller) {
-            onUpdateReseller({ ...(user as Reseller), pin: clean });
-          }
+        const res = await apiAdminResetPassword(user.id, clean);
+        if (!res.ok) {
+          pushToast(res.error || `Could not update PIN for ${user.name}.`, 'error');
+          return;
         }
-        setUserListNotice(`نیا سیکیورٹی پن کامیابی سے محفوظ ہو گیا: ${clean}`);
-        pushToast(`Security PIN updated for ${user.name}.`, 'success');
+        if (role === 'customer' && onUpdateCustomer) {
+          onUpdateCustomer({ ...(user as Customer) });
+        } else if (role === 'reseller' && onUpdateReseller) {
+          onUpdateReseller({ ...(user as Reseller) });
+        }
+        onRefreshAllData();
+        setUserListNotice(`نیا سیکیورٹی پن برائے ${user.name} سرور پر محفوظ (Encrypted) ہو گیا۔`);
+        pushToast(`Security PIN updated securely for ${user.name}.`, 'success');
         setTimeout(() => setUserListNotice(null), 4000);
       },
     });
@@ -617,10 +666,6 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
   const handleRefreshAuditLogs = () => {
     setAuditLogs(getLoginAudits());
-  };
-
-  const toggleRevealPin = (id: string) => {
-    setRevealedPins((prev) => ({ ...prev, [id]: !prev[id] }));
   };
 
   // Filtered Audit Logs
@@ -662,39 +707,101 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     safeUserDirPage * USER_DIR_PAGE_SIZE
   );
 
+  const isProductionMode = serverHealth?.environment === 'production' || isServerProductionMode();
+
   // Backup & Restore Handlers
-  const handleExportBackup = () => {
-    const jsonStr = exportAllDataJSON();
-    const blob = new Blob([jsonStr], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = `100DAGAR_Pakistan_Backup_${new Date().toISOString().split('T')[0]}.json`;
-    link.click();
-    URL.revokeObjectURL(url);
+  const handleExportBackup = async () => {
+    setDownloadingLiveBackup(true);
+    try {
+      const serverRes = await apiDownloadLiveBackup();
+      if (serverRes.ok) {
+        pushToast('Live server database backup downloaded securely.', 'success');
+        return;
+      }
+      // Fallback to sanitized local snapshot if server export endpoint is temporarily unreachable
+      const jsonStr = exportAllDataJSON();
+      const blob = new Blob([jsonStr], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `100DAGAR_Backup_${new Date().toISOString().split('T')[0]}.json`;
+      link.click();
+      URL.revokeObjectURL(url);
+      pushToast(
+        serverRes.error
+          ? `Server export unavailable (${serverRes.error}); exported sanitized local cache instead.`
+          : 'Sanitized backup JSON downloaded.',
+        'info'
+      );
+    } finally {
+      setDownloadingLiveBackup(false);
+    }
   };
 
   const handleImportBackup = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
+    e.target.value = '';
     if (!file) return;
 
     const reader = new FileReader();
-    reader.onload = (event) => {
+    reader.onload = async (event) => {
       const content = event.target?.result as string;
-      if (content) {
+      if (!content) return;
+      let parsed: Record<string, unknown>;
+      try {
+        parsed = JSON.parse(content) as Record<string, unknown>;
+      } catch {
+        pushToast('Invalid JSON file. Please choose a valid 100DAGAR backup snapshot.', 'error');
+        return;
+      }
+
+      const dryRunRes = await apiRestoreServerBackup(parsed, true);
+      if (dryRunRes.ok && dryRunRes.summary) {
+        setPendingRestoreFile({
+          fileName: file.name,
+          payload: parsed,
+          preview: dryRunRes.summary,
+        });
+        return;
+      }
+
+      // If offline and not in production mode, allow local fallback import after warning
+      if (!isProductionMode && dryRunRes.error?.toLowerCase().includes('network')) {
         const success = importAllDataJSON(content);
         if (success) {
-          pushToast('Backup restored successfully!', 'success');
+          pushToast('Offline local cache restore applied.', 'info');
           onRefreshAllData();
-        } else {
-          pushToast('Failed to parse backup file. Please ensure it is a valid JSON backup.', 'error');
+          return;
         }
       }
+      pushToast(dryRunRes.error || 'Could not validate backup snapshot against server.', 'error');
     };
     reader.readAsText(file);
   };
 
+  const handleConfirmServerRestore = async () => {
+    if (!pendingRestoreFile) return;
+    setExecutingRestore(true);
+    try {
+      const res = await apiRestoreServerBackup(pendingRestoreFile.payload, false);
+      if (!res.ok) {
+        pushToast(res.error || 'Non-destructive restore failed.', 'error');
+        return;
+      }
+      setPendingRestoreFile(null);
+      onRefreshAllData();
+      await loadBackupStatus();
+      pushToast('Backup merged non-destructively! A pre-restore safety snapshot was saved automatically.', 'success');
+    } finally {
+      setExecutingRestore(false);
+    }
+  };
+
   const handleResetData = () => {
+    if (isProductionMode) {
+      pushToast('Destructive demo resets are locked in production mode to protect live business data.', 'error');
+      return;
+    }
     setConfirmDialog({
       title: 'Reset to Demo Dataset',
       message: 'Are you sure you want to reset all data back to the default 100DAGAR demo dataset with Pakistani channels and bilingual templates?',
@@ -709,6 +816,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   };
 
   const handleStartFromScratch = () => {
+    if (isProductionMode) {
+      pushToast('Destructive data clearing is locked in production mode to protect live business data.', 'error');
+      return;
+    }
     setConfirmDialog({
       title: 'Start From Scratch',
       message: 'کیا آپ تمام پرانے ٹرانزیکشنز، آرڈرز اور حاضری کا ڈیٹا صاف کر کے تازہ شروعات کرنا چاہتے ہیں؟\n\nThis will clear all transactions, COD orders, and attendance records (resetting balances to Rs. 0) while keeping your business profile, shipping partner settings, demo item, and reseller settings intact.',
@@ -2117,24 +2228,20 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     <th className="py-2.5 px-3 font-semibold">User / Name</th>
                     <th className="py-2.5 px-3 font-semibold">Mobile Number</th>
                     <th className="py-2.5 px-3 font-semibold">Role</th>
-                    <th className="py-2.5 px-3 font-semibold">Active PIN (فعال پن)</th>
-                    <th className="py-2.5 px-3 font-semibold">Default 6 Digits</th>
+                    <th className="py-2.5 px-3 font-semibold">PIN Protection (سیکیورٹی اسٹیٹس)</th>
                     <th className="py-2.5 px-3 font-semibold text-right">Actions</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
                   {paginatedUsers.length === 0 ? (
                     <tr>
-                      <td colSpan={6} className="py-6 text-center text-slate-400">
+                      <td colSpan={5} className="py-6 text-center text-slate-400">
                         No registered users found matching filter.
                       </td>
                     </tr>
                   ) : (
                     paginatedUsers.map((u) => {
-                      const defaultDigits = getDefaultPinForPhone(u.phone);
-                      const currentPin = u.pin || defaultDigits;
-                      const isRevealed = !!revealedPins[u.id];
-                      const isCustomized = !!u.pin && u.pin !== defaultDigits;
+                      const hasCustomOrHashedPin = Boolean(u.pin && u.pin.trim().length > 0);
 
                       return (
                         <tr key={u.id} className="hover:bg-slate-50/50 dark:hover:bg-slate-800/40">
@@ -2166,40 +2273,25 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                           </td>
 
                           <td className="py-2.5 px-3">
-                            <div className="flex items-center gap-1.5">
-                              <span className="font-mono font-bold tracking-widest text-slate-900 dark:text-white">
-                                {isRevealed ? currentPin : '••••••'}
+                            {hasCustomOrHashedPin ? (
+                              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-semibold bg-emerald-50 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800">
+                                <Lock className="w-3 h-3" />
+                                Protected · Custom Hash
                               </span>
-                              <button
-                                type="button"
-                                onClick={() => toggleRevealPin(u.id)}
-                                className="text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 cursor-pointer p-0.5"
-                                title={isRevealed ? 'Hide' : 'Reveal'}
-                              >
-                                {isRevealed ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
-                              </button>
-                              {isCustomized ? (
-                                <span className="text-[9px] font-semibold text-amber-600 bg-amber-50 dark:bg-amber-950 px-1.5 py-0.2 rounded">
-                                  Custom
-                                </span>
-                              ) : (
-                                <span className="text-[9px] text-slate-400 bg-slate-100 dark:bg-slate-800 px-1.5 py-0.2 rounded">
-                                  Default
-                                </span>
-                              )}
-                            </div>
-                          </td>
-
-                          <td className="py-2.5 px-3 font-mono text-slate-500">
-                            {defaultDigits}
+                            ) : (
+                              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-semibold bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300">
+                                <ShieldCheck className="w-3 h-3" />
+                                Protected · Default Active
+                              </span>
+                            )}
                           </td>
 
                           <td className="py-2.5 px-3 text-right">
                             <div className="inline-flex items-center gap-1">
                               <button
-                                onClick={() => handleResetUserPinToDefault(u, u.userType)}
+                                onClick={() => void handleResetUserPinToDefault(u, u.userType)}
                                 className="px-2 py-1 text-[11px] font-medium text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 rounded border border-slate-200 dark:border-slate-700 cursor-pointer flex items-center gap-1"
-                                title="Reset to last 6 digits of mobile number"
+                                title="Reset to hashed default (last 6 digits of mobile)"
                               >
                                 <RotateCcw className="w-3 h-3 text-slate-500" />
                                 <span>Reset to Default</span>
@@ -2208,7 +2300,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                               <button
                                 onClick={() => handleSetCustomUserPin(u, u.userType)}
                                 className="px-2 py-1 text-[11px] font-medium text-blue-600 dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-950/50 rounded border border-blue-200 dark:border-blue-800 cursor-pointer"
-                                title="Manually assign custom PIN"
+                                title="Assign custom hashed PIN"
                               >
                                 Set PIN
                               </button>
@@ -2345,7 +2437,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     <th className="py-2.5 px-3 font-semibold">User &amp; Mobile</th>
                     <th className="py-2.5 px-3 font-semibold">Role</th>
                     <th className="py-2.5 px-3 font-semibold">Status</th>
-                    <th className="py-2.5 px-3 font-semibold">Security PIN</th>
+                    <th className="py-2.5 px-3 font-semibold">Credential</th>
                     <th className="py-2.5 px-3 font-semibold">Device &amp; Details</th>
                   </tr>
                 </thead>
@@ -2412,8 +2504,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                             )}
                           </td>
 
-                          <td className="py-2.5 px-3 font-mono text-slate-500">
-                            {log.usedPin || '••••••'}
+                          <td className="py-2.5 px-3 text-[11px] font-medium text-slate-500 dark:text-slate-400">
+                            Protected Session
                           </td>
 
                           <td className="py-2.5 px-3 text-slate-600 dark:text-slate-400">
@@ -2439,67 +2531,312 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
       {/* TAB 4: DATA MANAGEMENT & BACKUP */}
       {activeTab === 'backup' && (
-        <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-6 shadow-xs space-y-6">
-          <div>
-            <h3 className="text-sm font-bold text-slate-900 dark:text-white mb-1">
-              Data Management &amp; Offline Backup
-            </h3>
-            <p className="text-xs text-slate-500 dark:text-slate-400">
-              Export full ledger backups including customer balances, Pakistani payment channels, WASAL shipping settings, login audit history, and user security PINs.
-            </p>
+        <div className="space-y-6">
+          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-6 shadow-xs space-y-5">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div>
+                <h3 className="text-sm font-bold text-slate-900 dark:text-white mb-1 flex items-center gap-2">
+                  <Database className="w-4 h-4 text-emerald-600" />
+                  Central Database Backups &amp; Non-Destructive Recovery
+                </h3>
+                <p className="text-xs text-slate-500 dark:text-slate-400">
+                  Automated 24-hour snapshots run on the server alongside manual JSON export and verified merge-only restore. Sensitive credentials and session secrets are automatically stripped or hashed in downloads.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => void loadBackupStatus()}
+                disabled={backupLoading}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-slate-700 dark:text-slate-200 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 rounded-lg cursor-pointer self-start shrink-0 disabled:opacity-60"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${backupLoading ? 'animate-spin' : ''}`} />
+                Refresh Status
+              </button>
+            </div>
+
+            {/* Live Health & Schedule Summary Cards */}
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+              <div className="rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-800/40 p-3.5">
+                <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+                  Database Engine
+                </div>
+                <div className="mt-1 flex items-center justify-between">
+                  <span className="text-sm font-bold text-slate-900 dark:text-white uppercase">
+                    {serverHealth?.database || 'Checking...'}
+                  </span>
+                  <span
+                    className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold ${
+                      serverHealth?.connected
+                        ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300'
+                        : 'bg-red-100 text-red-800 dark:bg-red-950 dark:text-red-300'
+                    }`}
+                  >
+                    {serverHealth?.connected ? 'Connected' : 'Offline'}
+                  </span>
+                </div>
+                <div className="mt-1 text-[11px] text-slate-500 dark:text-slate-400">
+                  Mode: <strong className="text-slate-700 dark:text-slate-200">{serverHealth?.environment || 'unknown'}</strong>
+                </div>
+              </div>
+
+              <div className="rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-800/40 p-3.5">
+                <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+                  Daily Automated Backup
+                </div>
+                <div className="mt-1 flex items-center justify-between">
+                  <span className="text-sm font-bold text-slate-900 dark:text-white">
+                    Every 24 Hours
+                  </span>
+                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-blue-100 text-blue-800 dark:bg-blue-950 dark:text-blue-300">
+                    Active
+                  </span>
+                </div>
+                <div className="mt-1 text-[11px] text-slate-500 dark:text-slate-400">
+                  Last run:{' '}
+                  <strong className="text-slate-700 dark:text-slate-200">
+                    {dailyBackupLastAt
+                      ? new Date(dailyBackupLastAt).toLocaleString('en-PK', {
+                          dateStyle: 'medium',
+                          timeStyle: 'short',
+                        })
+                      : 'Scheduled on next cycle'}
+                  </strong>
+                </div>
+              </div>
+
+              <div className="rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-800/40 p-3.5">
+                <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+                  Stored Server Snapshots
+                </div>
+                <div className="mt-1 text-sm font-bold text-slate-900 dark:text-white">
+                  {serverBackups.length} Verified {serverBackups.length === 1 ? 'Snapshot' : 'Snapshots'}
+                </div>
+                <div className="mt-1 text-[11px] text-slate-500 dark:text-slate-400">
+                  Retention: up to 30 daily + 20 manual backups
+                </div>
+              </div>
+            </div>
+
+            {/* Backup & Restore Actions */}
+            <div className="flex flex-wrap items-center gap-3 pt-1">
+              <button
+                type="button"
+                disabled={creatingBackup}
+                onClick={async () => {
+                  setCreatingBackup(true);
+                  try {
+                    const res = await apiCreateServerBackup('manual_settings');
+                    if (res.ok) {
+                      if (res.backups) setServerBackups(res.backups);
+                      else await loadBackupStatus();
+                      pushToast('Verified database backup snapshot saved on server.', 'success');
+                    } else {
+                      pushToast(res.error || 'Server backup failed.', 'error');
+                    }
+                  } finally {
+                    setCreatingBackup(false);
+                  }
+                }}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-emerald-700 dark:text-emerald-300 bg-emerald-50 dark:bg-emerald-950/60 hover:bg-emerald-100 dark:hover:bg-emerald-900/60 border border-emerald-200 dark:border-emerald-800 rounded-lg cursor-pointer shadow-xs disabled:opacity-60"
+              >
+                <Database className="w-3.5 h-3.5" />
+                {creatingBackup ? 'Creating Snapshot...' : 'Create Verified Server Backup'}
+              </button>
+
+              <button
+                type="button"
+                disabled={downloadingLiveBackup}
+                onClick={() => void handleExportBackup()}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-slate-700 dark:text-slate-200 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 rounded-lg cursor-pointer shadow-xs disabled:opacity-60"
+              >
+                <Download className="w-3.5 h-3.5" />
+                {downloadingLiveBackup ? 'Exporting Live JSON...' : 'Download Live JSON Backup'}
+              </button>
+
+              <label className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-blue-700 dark:text-blue-300 bg-blue-50 dark:bg-blue-950/50 hover:bg-blue-100 dark:hover:bg-blue-900/60 border border-blue-200 dark:border-blue-800 rounded-lg cursor-pointer shadow-xs">
+                <Upload className="w-3.5 h-3.5" />
+                Restore From JSON (Dry-Run Preview)
+                <input
+                  type="file"
+                  accept=".json"
+                  onChange={handleImportBackup}
+                  className="hidden"
+                />
+              </label>
+            </div>
+
+            {/* Production Protection Notice OR Non-Production Reset Controls */}
+            {isProductionMode ? (
+              <div className="rounded-lg border border-amber-200 dark:border-amber-800 bg-amber-50/80 dark:bg-amber-950/40 p-3.5 flex items-start gap-2.5 text-xs text-amber-900 dark:text-amber-200">
+                <ShieldCheck className="w-4 h-4 text-amber-600 dark:text-amber-400 shrink-0 mt-0.5" />
+                <div>
+                  <span className="font-bold block">Production Data Protection Active</span>
+                  <span>
+                    Destructive actions (&quot;Start From Scratch&quot; and &quot;Reset to Demo Data&quot;) are disabled in production to prevent accidental deletion of live orders, customers, inventory, and financial ledgers.
+                  </span>
+                </div>
+              </div>
+            ) : (
+              <div className="pt-3 border-t border-slate-200 dark:border-slate-800 flex flex-wrap items-center gap-3">
+                <button
+                  type="button"
+                  onClick={handleStartFromScratch}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-950/60 hover:bg-amber-100 dark:hover:bg-amber-900/60 border border-amber-200 dark:border-amber-800 rounded-lg cursor-pointer"
+                  title="Clear all transactions, orders and debt in development/sandbox mode"
+                >
+                  <Trash2 className="w-3.5 h-3.5 text-amber-600" />
+                  Start From Scratch (تازہ شروعات / ڈیٹا صاف)
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleResetData}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/60 border border-red-200 dark:border-red-900 rounded-lg cursor-pointer ml-auto"
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />
+                  Reset to Pakistan Demo Data
+                </button>
+              </div>
+            )}
           </div>
 
-          <div className="flex flex-wrap items-center gap-3">
-            <button
-              onClick={async () => {
-                const res = await apiCreateServerBackup('manual_settings');
-                if (res.ok) {
-                  pushToast('Verified SQLite server backup snapshot created in /data/backups.', 'success');
-                } else {
-                  pushToast(res.error || 'Server backup failed.', 'error');
-                }
-              }}
-              className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-emerald-700 dark:text-emerald-300 bg-emerald-50 dark:bg-emerald-950/60 hover:bg-emerald-100 dark:hover:bg-emerald-900/60 border border-emerald-200 dark:border-emerald-800 rounded-lg cursor-pointer shadow-xs"
-            >
-              <Database className="w-3.5 h-3.5" />
-              Create Verified Server SQLite Backup
-            </button>
+          {/* Server Snapshot History Table */}
+          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-6 shadow-xs">
+            <div className="flex items-center justify-between gap-2 pb-3 border-b border-slate-200 dark:border-slate-800">
+              <div>
+                <h4 className="text-sm font-bold text-slate-900 dark:text-white">
+                  Server Backup History ({serverBackups.length})
+                </h4>
+                <p className="text-xs text-slate-500 dark:text-slate-400">
+                  SHA-256 verified server snapshots stored safely in the live data volume.
+                </p>
+              </div>
+            </div>
 
-            <button
-              onClick={handleExportBackup}
-              className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-slate-700 dark:text-slate-200 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 rounded-lg cursor-pointer shadow-xs"
-            >
-              <Download className="w-3.5 h-3.5" />
-              Download Complete JSON Backup
-            </button>
+            <div className="mt-4 overflow-x-auto">
+              <table className="w-full text-left text-xs border-collapse">
+                <thead>
+                  <tr className="border-b border-slate-200 dark:border-slate-800 text-slate-500 dark:text-slate-400">
+                    <th className="py-2 px-3 font-semibold">Created</th>
+                    <th className="py-2 px-3 font-semibold">Reason</th>
+                    <th className="py-2 px-3 font-semibold">Records Summary</th>
+                    <th className="py-2 px-3 font-semibold">SHA-256 / Size</th>
+                    <th className="py-2 px-3 font-semibold text-right">Download</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
+                  {serverBackups.length === 0 ? (
+                    <tr>
+                      <td colSpan={5} className="py-6 text-center text-slate-400">
+                        {backupLoading ? 'Loading server backups...' : 'No server backup snapshots found yet.'}
+                      </td>
+                    </tr>
+                  ) : (
+                    serverBackups.slice(0, 20).map((b) => {
+                      const prodCount = b.counts?.products ?? 0;
+                      const custCount = b.counts?.customers ?? 0;
+                      const ordCount = b.counts?.cod_orders ?? 0;
+                      const txCount = b.counts?.transactions ?? 0;
+                      return (
+                        <tr key={b.file} className="hover:bg-slate-50/50 dark:hover:bg-slate-800/40">
+                          <td className="py-2.5 px-3 whitespace-nowrap font-mono text-[11px] text-slate-700 dark:text-slate-300">
+                            {new Date(b.createdAt).toLocaleString('en-PK', {
+                              dateStyle: 'medium',
+                              timeStyle: 'short',
+                            })}
+                          </td>
+                          <td className="py-2.5 px-3">
+                            <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-bold bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300">
+                              {b.reason || 'snapshot'}
+                            </span>
+                          </td>
+                          <td className="py-2.5 px-3 text-[11px] text-slate-600 dark:text-slate-300">
+                            {prodCount} products · {custCount} customers · {ordCount} orders · {txCount} ledger
+                          </td>
+                          <td className="py-2.5 px-3 font-mono text-[11px] text-slate-500">
+                            {b.sha256 ? `${b.sha256.slice(0, 10)}…` : 'verified'} · {Math.max(1, Math.round(b.sizeBytes / 1024))} KB
+                          </td>
+                          <td className="py-2.5 px-3 text-right">
+                            <button
+                              type="button"
+                              onClick={async () => {
+                                const dlRes = await apiDownloadBackupFile(b.file);
+                                if (!dlRes.ok) {
+                                  pushToast(dlRes.error || 'Could not download snapshot.', 'error');
+                                }
+                              }}
+                              className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 rounded border border-slate-200 dark:border-slate-700 cursor-pointer"
+                            >
+                              <Download className="w-3 h-3" />
+                              JSON
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      )}
 
-            <label className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-slate-700 dark:text-slate-200 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 rounded-lg cursor-pointer shadow-xs">
-              <Upload className="w-3.5 h-3.5" />
-              Restore From JSON File
-              <input
-                type="file"
-                accept=".json"
-                onChange={handleImportBackup}
-                className="hidden"
-              />
-            </label>
+      {/* Non-Destructive Restore Preview Modal */}
+      {pendingRestoreFile && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 p-4">
+          <div className="w-full max-w-lg rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 shadow-xl p-5 space-y-4">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h4 className="text-sm font-bold text-slate-900 dark:text-white flex items-center gap-2">
+                  <ShieldCheck className="w-4 h-4 text-emerald-600" />
+                  Non-Destructive Restore Preview
+                </h4>
+                <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                  File: <span className="font-mono">{pendingRestoreFile.fileName}</span> ({pendingRestoreFile.preview.sourceFormat})
+                </p>
+              </div>
+            </div>
 
-            <button
-              onClick={handleStartFromScratch}
-              className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-950/60 hover:bg-amber-100 dark:hover:bg-amber-900/60 border border-amber-200 dark:border-amber-800 rounded-lg cursor-pointer"
-              title="Clear all transactions, orders and debt to test from scratch (0 balance)"
-            >
-              <Trash2 className="w-3.5 h-3.5 text-amber-600" />
-              Start From Scratch (تازہ شروعات / ڈیٹا صاف)
-            </button>
+            <div className="rounded-lg bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 p-3 text-xs space-y-2">
+              <div className="font-semibold text-slate-800 dark:text-slate-200">
+                Records detected for safe merge ({pendingRestoreFile.preview.totalRecordsInFile} total):
+              </div>
+              <div className="grid grid-cols-2 gap-1.5 max-h-40 overflow-y-auto text-[11px] text-slate-600 dark:text-slate-300">
+                {Object.entries(pendingRestoreFile.preview.appliedCounts).map(([key, count]) => (
+                  <div key={key} className="flex items-center justify-between bg-white dark:bg-slate-900 px-2 py-1 rounded border border-slate-200/70 dark:border-slate-700">
+                    <span className="font-mono truncate">{key}</span>
+                    <span className="font-bold text-slate-900 dark:text-white">{count}</span>
+                  </div>
+                ))}
+              </div>
+              {pendingRestoreFile.preview.notes.length > 0 && (
+                <ul className="list-disc pl-4 text-[11px] text-slate-500 dark:text-slate-400 space-y-0.5">
+                  {pendingRestoreFile.preview.notes.map((n, idx) => (
+                    <li key={idx}>{n}</li>
+                  ))}
+                </ul>
+              )}
+            </div>
 
-            <button
-              onClick={handleResetData}
-              className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/60 border border-red-200 dark:border-red-900 rounded-lg cursor-pointer ml-auto"
-            >
-              <RefreshCw className="w-3.5 h-3.5" />
-              Reset to Pakistan Demo Data
-            </button>
+            <div className="flex items-center justify-end gap-2">
+              <button
+                type="button"
+                disabled={executingRestore}
+                onClick={() => setPendingRestoreFile(null)}
+                className="px-3.5 py-1.5 text-xs font-semibold text-slate-700 dark:text-slate-200 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 rounded-lg cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={executingRestore}
+                onClick={() => void handleConfirmServerRestore()}
+                className="px-4 py-1.5 text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg cursor-pointer disabled:opacity-60"
+              >
+                {executingRestore ? 'Merging Safely...' : 'Confirm Non-Destructive Merge'}
+              </button>
+            </div>
           </div>
         </div>
       )}

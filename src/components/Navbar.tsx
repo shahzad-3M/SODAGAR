@@ -33,8 +33,10 @@ import {
   Tag,
   HeartHandshake,
   LifeBuoy,
+  RefreshCw,
 } from 'lucide-react';
 import type { AppUser, BusinessProfile, CategoryRecord, ProductItem, UserRole } from '../types/index.ts';
+import { getSyncStatus, retrySyncNow, subscribeSyncStatus, type SyncStatusSnapshot } from '../utils/storage.ts';
 import { openWhatsAppDirect } from '../utils/whatsapp.ts';
 import {
   doesProductMatchCategoryFilter,
@@ -107,6 +109,11 @@ export const Navbar: React.FC<NavbarProps> = ({
 }) => {
   const [isMoreOpen, setIsMoreOpen] = React.useState(false);
   const moreRef = React.useRef<HTMLDivElement>(null);
+  const [syncStatus, setSyncStatus] = React.useState<SyncStatusSnapshot>(getSyncStatus);
+
+  React.useEffect(() => {
+    return subscribeSyncStatus(setSyncStatus);
+  }, []);
 
   React.useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
@@ -487,6 +494,54 @@ export const Navbar: React.FC<NavbarProps> = ({
                   {profile.currencySymbol}{cartTotal.toLocaleString('en-PK')}
                 </span>
               </button>
+
+              {/* Sync Status Indicator (shown for operational users or whenever sync is pending/offline/conflict) */}
+              {(isAuthenticated || syncStatus.state !== 'synced' || syncStatus.pendingCount > 0) && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    void retrySyncNow();
+                  }}
+                  title={
+                    syncStatus.lastError
+                      ? `${syncStatus.lastError} — Click to retry sync`
+                      : syncStatus.lastSyncedAt
+                      ? `Synced with ${syncStatus.database || 'server'} at ${new Date(syncStatus.lastSyncedAt).toLocaleTimeString('en-PK')}. Click to refresh.`
+                      : 'Click to sync with central database'
+                  }
+                  className={`hidden sm:inline-flex items-center gap-1.5 px-2 py-1 rounded-lg border text-[11px] font-semibold transition-colors cursor-pointer shrink-0 ${
+                    syncStatus.state === 'offline' || !syncStatus.connected
+                      ? 'border-red-300 dark:border-red-800 bg-red-50 dark:bg-red-950/60 text-red-700 dark:text-red-300 hover:bg-red-100'
+                      : syncStatus.state === 'conflict'
+                      ? 'border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-950/60 text-amber-800 dark:text-amber-300 hover:bg-amber-100'
+                      : syncStatus.state === 'saving' || syncStatus.pendingCount > 0
+                      ? 'border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-950/50 text-amber-700 dark:text-amber-300'
+                      : 'border-emerald-200 dark:border-emerald-800/80 bg-emerald-50/70 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300 hover:bg-emerald-100/70'
+                  }`}
+                >
+                  {syncStatus.state === 'saving' || syncStatus.pendingCount > 0 ? (
+                    <>
+                      <RefreshCw className="w-3 h-3 animate-spin" />
+                      <span>Saving{syncStatus.pendingCount > 0 ? ` (${syncStatus.pendingCount})` : '...'}</span>
+                    </>
+                  ) : syncStatus.state === 'offline' || !syncStatus.connected ? (
+                    <>
+                      <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
+                      <span>Offline · Retry</span>
+                    </>
+                  ) : syncStatus.state === 'conflict' ? (
+                    <>
+                      <RefreshCw className="w-3 h-3" />
+                      <span>Refreshed</span>
+                    </>
+                  ) : (
+                    <>
+                      <span className="w-2 h-2 rounded-full bg-emerald-500" />
+                      <span>Synced</span>
+                    </>
+                  )}
+                </button>
+              )}
 
               {/* Theme Toggle (Moved slightly left on mobile) */}
               <button

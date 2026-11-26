@@ -515,6 +515,7 @@ export interface Branch {
 
 export interface AppUser {
   id: string;
+  username?: string;
   name: string;
   urduName?: string;
   role: UserRole;

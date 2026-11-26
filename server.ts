@@ -58,6 +58,7 @@ import {
   type ActorContext,
   adjustCustomerLoyaltyPoints,
   auditAndRepairOrderHistory,
+  bumpCollectionVersion,
   checkDatabaseHealth,
   closeDb,
   createVerifiedBackup,
@@ -82,12 +83,16 @@ import {
   getAllProductsFromDb,
   getCachedServerSessionSecret,
   getCollectionValue,
+  getCollectionVersionInfo,
+  getCollectionVersions,
   getCrmLoyaltyConfig,
   getDb,
   getFullSyncState,
+  getLastDailyBackupTimestamp,
   getSyncVersion,
   hasCrmAutomationIdempotencyKey,
   hashServerSecret,
+  hashSingleSecretString,
   initDb,
   insertAdminAuditLog,
   insertCrmActivityEvent,
@@ -96,6 +101,9 @@ import {
   mergeCollectionArrayNonDestructively,
   mergeLocalSnapshotNonDestructively,
   replaceCitiesAndAreasFromList,
+  resolveBackupFilePath,
+  restoreBackupSnapshotNonDestructively,
+  runDailyBackupIfNeeded,
   sanitizeAndValidateCollectionItemDates,
   saveCollectionValue,
   saveCrmLoyaltyConfig,
@@ -185,9 +193,21 @@ function signSessionToken(claims: Omit<SessionClaims, 'exp'>): string {
 
 function verifySessionToken(token?: string | null): SessionClaims | null {
   if (!token || !token.includes('.')) return null;
-  const [encoded, sig] = token.split('.');
-  const expected = crypto.createHmac('sha256', getSessionSecret()).update(encoded).digest('base64url');
-  if (sig !== expected) return null;
+  const parts = token.split('.');
+  if (parts.length !== 2) return null;
+  const [encoded, sig] = parts;
+  if (!encoded || !sig) return null;
+  let expected: string;
+  try {
+    expected = crypto.createHmac('sha256', getSessionSecret()).update(encoded).digest('base64url');
+  } catch {
+    return null;
+  }
+  const sigBuf = Buffer.from(sig, 'utf8');
+  const expBuf = Buffer.from(expected, 'utf8');
+  if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+    return null;
+  }
   try {
     const parsed = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8')) as SessionClaims;
     if (!parsed.exp || Date.now() > parsed.exp) return null;
@@ -197,8 +217,111 @@ function verifySessionToken(token?: string | null): SessionClaims | null {
   }
 }
 
+const SESSION_COOKIE_NAME = 'mm_session';
+
+function parseCookieMap(cookieHeader?: string): Map<string, string> {
+  const map = new Map<string, string>();
+  if (!cookieHeader) return map;
+  for (const part of cookieHeader.split(';')) {
+    const idx = part.indexOf('=');
+    if (idx <= 0) continue;
+    const k = part.slice(0, idx).trim();
+    const v = part.slice(idx + 1).trim();
+    if (k) {
+      try {
+        map.set(k, decodeURIComponent(v));
+      } catch {
+        map.set(k, v);
+      }
+    }
+  }
+  return map;
+}
+
+function isHttpsRequest(req: Request): boolean {
+  const xfProto = req.header('x-forwarded-proto');
+  return Boolean(req.secure || (xfProto && xfProto.toLowerCase().includes('https')));
+}
+
+function setSessionCookie(req: Request, res: Response, token: string): void {
+  const secure = isHttpsRequest(req);
+  const attrs = [
+    `${SESSION_COOKIE_NAME}=${encodeURIComponent(token)}`,
+    'Path=/',
+    'HttpOnly',
+    `Max-Age=${60 * 60 * 24 * 7}`,
+    secure ? 'SameSite=None' : 'SameSite=Lax',
+  ];
+  if (secure) {
+    attrs.push('Secure', 'Partitioned');
+  }
+  res.append('Set-Cookie', attrs.join('; '));
+}
+
+function clearSessionCookie(req: Request, res: Response): void {
+  const secure = isHttpsRequest(req);
+  const attrs = [
+    `${SESSION_COOKIE_NAME}=`,
+    'Path=/',
+    'HttpOnly',
+    'Max-Age=0',
+    secure ? 'SameSite=None' : 'SameSite=Lax',
+  ];
+  if (secure) {
+    attrs.push('Secure', 'Partitioned');
+  }
+  res.append('Set-Cookie', attrs.join('; '));
+}
+
+// Sliding-window brute-force protection for authentication & credential routes
+const authAttemptsMap = new Map<string, { count: number; resetAt: number }>();
+const AUTH_WINDOW_MS = 15 * 60 * 1000;
+const AUTH_MAX_FAILURES = 10;
+
+function checkAuthRateLimit(key: string): { allowed: boolean; retryAfterSec: number } {
+  const now = Date.now();
+  const entry = authAttemptsMap.get(key);
+  if (!entry || now >= entry.resetAt) {
+    return { allowed: true, retryAfterSec: 0 };
+  }
+  if (entry.count >= AUTH_MAX_FAILURES) {
+    return { allowed: false, retryAfterSec: Math.max(1, Math.ceil((entry.resetAt - now) / 1000)) };
+  }
+  return { allowed: true, retryAfterSec: 0 };
+}
+
+function recordAuthFailure(key: string): void {
+  const now = Date.now();
+  const entry = authAttemptsMap.get(key);
+  if (!entry || now >= entry.resetAt) {
+    authAttemptsMap.set(key, { count: 1, resetAt: now + AUTH_WINDOW_MS });
+  } else {
+    entry.count += 1;
+  }
+}
+
+function clearAuthFailures(key: string): void {
+  authAttemptsMap.delete(key);
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of authAttemptsMap.entries()) {
+    if (now >= v.resetAt) authAttemptsMap.delete(k);
+  }
+}, 5 * 60 * 1000).unref();
+
 interface ResolvedActor extends ActorContext {
   account?: UserAccount;
+  username?: string;
+  urduName?: string;
+  whatsapp?: string;
+  whatsappSameAsPhone?: boolean;
+  email?: string;
+  branchName?: string;
+  managerAuthorities?: UserAccount['managerAuthorities'];
+  canAuthorizeCreditSale?: boolean;
+  mustChangePassword?: boolean;
   crmRole?: CRMRoleSpecialization;
   crmPermissions?: CRMPermissions;
 }
@@ -341,7 +464,8 @@ async function resolveActor(req: Request): Promise<ResolvedActor> {
   const db = await getDb();
   const authHeader = req.header('authorization');
   const bearer = authHeader?.startsWith('Bearer ') ? authHeader.slice(7).trim() : undefined;
-  const token = bearer || req.header('x-session-token');
+  const cookieToken = parseCookieMap(req.headers.cookie).get(SESSION_COOKIE_NAME);
+  const token = bearer || req.header('x-session-token') || cookieToken;
   const claims = verifySessionToken(token);
   if (!claims) {
     return { role: undefined };
@@ -349,7 +473,13 @@ async function resolveActor(req: Request): Promise<ResolvedActor> {
 
   const accounts = await getCollectionValue<UserAccount[]>(db, 'user_accounts', []);
   const account =
-    accounts.find((u) => u.id === claims.userId) ||
+    accounts.find(
+      (u) =>
+        u.id === claims.userId ||
+        (claims.role === 'customer' &&
+          (u.id === `usr_cust_${claims.userId}` || u.linkedCustomerId === claims.userId)) ||
+        (claims.role === 'reseller' && u.id === `usr_res_${claims.userId}`)
+    ) ||
     (claims.role === 'super_admin'
       ? accounts.find((u) => u.role === 'super_admin' && u.status === 'active')
       : undefined);
@@ -361,13 +491,25 @@ async function resolveActor(req: Request): Promise<ResolvedActor> {
     const basePerms = getDefaultCrmPermissionsForRole(role, account.crmRole);
     return {
       id: account.id,
+      username: account.username,
       role,
       name: account.fullName || claims.name,
+      urduName: account.urduName,
       customerId: account.linkedCustomerId,
       investorId: account.linkedInvestorId,
       resellerCode: account.linkedResellerCode,
       branchId: account.linkedBranchId,
+      branchName: account.linkedBranchName,
+      managerAuthorities: account.managerAuthorities,
       phone: account.phone,
+      whatsapp: account.whatsapp || account.phone,
+      whatsappSameAsPhone: account.whatsappSameAsPhone ?? true,
+      email: account.email,
+      canAuthorizeCreditSale:
+        role === 'super_admin' ||
+        role === 'admin' ||
+        Boolean(account.canAuthorizeCreditSale ?? account.managerAuthorities?.canAuthorizeCreditSale),
+      mustChangePassword: Boolean(account.mustChangePassword),
       account,
       crmRole: account.crmRole,
       crmPermissions: account.crmPermissions ? { ...basePerms, ...account.crmPermissions } : basePerms,
@@ -381,9 +523,13 @@ async function resolveActor(req: Request): Promise<ResolvedActor> {
   ) {
     return {
       id: 'usr_superadmin',
+      username: 'admin',
       role: 'super_admin',
       name: claims.name || 'Shahzad Malik',
+      urduName: 'شہزاد ملک (سپر ایڈمن)',
       phone: '03125256266',
+      email: 'admin@madinamarket.pk',
+      canAuthorizeCreditSale: true,
       crmRole: 'administrator',
       crmPermissions: getDefaultCrmPermissionsForRole('super_admin', 'administrator'),
     };
@@ -396,8 +542,13 @@ async function resolveActor(req: Request): Promise<ResolvedActor> {
       id: cust.id,
       role: 'customer',
       name: cust.name,
+      urduName: cust.urduName,
       customerId: cust.id,
       phone: cust.phone,
+      whatsapp: cust.whatsapp || cust.phone,
+      whatsappSameAsPhone: cust.whatsappSameAsPhone ?? true,
+      email: cust.email,
+      canAuthorizeCreditSale: false,
     };
   }
 
@@ -411,6 +562,7 @@ async function resolveActor(req: Request): Promise<ResolvedActor> {
       name: resAcc.name,
       resellerCode: resAcc.referralCode,
       phone: resAcc.phone,
+      canAuthorizeCreditSale: false,
     };
   }
 
@@ -452,11 +604,41 @@ function sendRouteError(res: Response, err: unknown, fallbackMessage: string) {
 }
 
 async function startServer() {
-  // Initialize active database driver (MySQL in production, fail-fast without SQLite fallback), verify schema, and warm session secret
-  const activeDb = await initDb();
-  console.log(
-    `[DB] Initialized driver=${activeDb.driver} env=${process.env.NODE_ENV || 'development'}`
-  );
+  // Resilient startup: initialize database when available, but NEVER crash-loop Hostinger Node if MySQL warms up slowly
+  let dbStartupError: string | null = null;
+  let dailyBackupSchedulerStarted = false;
+
+  const startDailyBackupScheduler = () => {
+    if (dailyBackupSchedulerStarted) return;
+    dailyBackupSchedulerStarted = true;
+    void runDailyBackupIfNeeded();
+    setInterval(() => {
+      void runDailyBackupIfNeeded();
+    }, 60 * 60 * 1000).unref();
+  };
+
+  try {
+    const activeDb = await initDb();
+    console.log(
+      `[DB] Initialized driver=${activeDb.driver} env=${process.env.NODE_ENV || 'development'}`
+    );
+    startDailyBackupScheduler();
+  } catch (initErr) {
+    dbStartupError = initErr instanceof Error ? initErr.message : 'Database startup initialization failed.';
+    console.error('[DB] Startup connection pending; HTTP server will stay online and retry:', dbStartupError);
+    const retryTimer = setInterval(async () => {
+      try {
+        const activeDb = await initDb();
+        dbStartupError = null;
+        console.log(`[DB] Reconnected driver=${activeDb.driver}`);
+        clearInterval(retryTimer);
+        startDailyBackupScheduler();
+      } catch (retryErr) {
+        dbStartupError = retryErr instanceof Error ? retryErr.message : dbStartupError;
+      }
+    }, 15000);
+    retryTimer.unref();
+  }
 
   const app = express();
   app.set('trust proxy', 1);
@@ -498,17 +680,49 @@ async function startServer() {
     const reqOrigin = req.header('origin');
     if (reqOrigin && isAllowedCorsOrigin(reqOrigin)) {
       res.setHeader('Access-Control-Allow-Origin', reqOrigin);
+      res.setHeader('Access-Control-Allow-Credentials', 'true');
       res.setHeader('Vary', 'Origin');
       res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
       res.setHeader(
         'Access-Control-Allow-Headers',
-        'Content-Type, Authorization, Accept, x-session-token, x-client-id'
+        'Content-Type, Authorization, Accept, x-session-token, x-client-id, x-requested-with'
       );
       if (req.method === 'OPTIONS') {
         res.status(204).end();
         return;
       }
     }
+
+    // CSRF mitigation for cookie-authenticated mutations
+    const isMutation = !['GET', 'HEAD', 'OPTIONS'].includes(req.method.toUpperCase());
+    if (isMutation) {
+      const hasCookieSession = parseCookieMap(req.headers.cookie).has(SESSION_COOKIE_NAME);
+      const hasCustomHeader = Boolean(
+        req.header('x-client-id') ||
+          req.header('x-requested-with') ||
+          req.header('authorization') ||
+          req.header('x-session-token')
+      );
+      if (hasCookieSession && !hasCustomHeader) {
+        const originToCheck = reqOrigin || req.header('referer');
+        let originAllowed = false;
+        if (originToCheck) {
+          try {
+            const parsedOrigin = new URL(originToCheck);
+            const host = (req.header('x-forwarded-host') || req.header('host') || '').toLowerCase();
+            originAllowed =
+              parsedOrigin.host.toLowerCase() === host || isAllowedCorsOrigin(parsedOrigin.origin);
+          } catch {
+            originAllowed = false;
+          }
+        }
+        if (!originAllowed) {
+          res.status(403).json({ error: 'Cross-site request rejected. Refresh the page and retry.' });
+          return;
+        }
+      }
+    }
+
     if (req.path.startsWith('/media/imported')) {
       next();
       return;
@@ -523,7 +737,7 @@ async function startServer() {
   app.get(
     '/api/health',
     asyncRoute(async (_req, res) => {
-      const health = await checkDatabaseHealth();
+      const health = await checkDatabaseHealth(dbStartupError);
       res.status(health.status === 'ok' ? 200 : 503).json(health);
     })
   );
@@ -536,7 +750,13 @@ async function startServer() {
         res.status(403).json({ error: 'Only administrators can inspect database backups.' });
         return;
       }
-      res.json({ backups: listBackups() });
+      res.json({
+        backups: listBackups(),
+        schedule: {
+          intervalHours: 24,
+          lastDailyBackupAt: getLastDailyBackupTimestamp(),
+        },
+      });
     })
   );
 
@@ -550,7 +770,79 @@ async function startServer() {
       }
       const reason = typeof req.body?.reason === 'string' ? req.body.reason : 'manual_admin';
       const meta = await createVerifiedBackup(reason);
-      res.json({ ok: true, backup: meta });
+      res.json({ ok: true, backup: { ...meta, file: meta.jsonFile }, backups: listBackups() });
+    })
+  );
+
+  app.get(
+    '/api/admin/backups/:file/download',
+    asyncRoute(async (req, res) => {
+      const actor = await resolveActor(req);
+      if (actor.role !== 'super_admin' && actor.role !== 'admin') {
+        res.status(403).json({ error: 'Only administrators can download server backups.' });
+        return;
+      }
+      const resolved = resolveBackupFilePath(req.params.file);
+      if (!resolved) {
+        res.status(404).json({ error: 'Requested backup file was not found.' });
+        return;
+      }
+      res.download(resolved, path.basename(resolved));
+    })
+  );
+
+  app.get(
+    '/api/admin/backup/export-live',
+    asyncRoute(async (req, res) => {
+      const actor = await resolveActor(req);
+      if (actor.role !== 'super_admin' && actor.role !== 'admin') {
+        res.status(403).json({ error: 'Only administrators can export live database backups.' });
+        return;
+      }
+      const meta = await createVerifiedBackup('manual_export');
+      const resolved = resolveBackupFilePath(meta.jsonFile);
+      if (!resolved) {
+        res.status(500).json({ error: 'Failed to prepare verified live export.' });
+        return;
+      }
+      res.download(resolved, `100DAGAR_Live_Backup_${new Date().toISOString().split('T')[0]}.json`);
+    })
+  );
+
+  app.post(
+    '/api/admin/backups/restore',
+    asyncRoute(async (req, res) => {
+      const actor = await resolveActor(req);
+      if (actor.role !== 'super_admin' && actor.role !== 'admin') {
+        res.status(403).json({ error: 'Only administrators can restore database backups.' });
+        return;
+      }
+      const { payload, dryRun = true } = (req.body || {}) as {
+        payload?: Record<string, unknown>;
+        dryRun?: boolean;
+      };
+      if (!payload || typeof payload !== 'object') {
+        res.status(400).json({ error: 'Backup JSON payload is required.' });
+        return;
+      }
+      if (!dryRun) {
+        await createVerifiedBackup('pre_manual_restore');
+      }
+      const summary = await restoreBackupSnapshotNonDestructively(payload, { dryRun: Boolean(dryRun) });
+      if (!dryRun) {
+        const db = await getDb();
+        await insertAdminAuditLog(db, {
+          action: 'restore_backup_non_destructive',
+          entityType: 'database',
+          entityId: 'snapshot_restore',
+          actorId: actor.id,
+          actorName: actor.name,
+          actorRole: actor.role,
+          details: summary.appliedCounts,
+        });
+        broadcastSyncEvent('all', req.header('x-client-id'));
+      }
+      res.json({ ok: true, summary, syncVersion: getSyncVersion() });
     })
   );
 
@@ -563,7 +855,7 @@ async function startServer() {
 
     sseClients.add(res);
     res.write(
-      `event: connected\ndata: ${JSON.stringify({ syncVersion: getSyncVersion() })}\n\n`
+      `event: connected\ndata: ${JSON.stringify({ syncVersion: getSyncVersion(), collectionVersions: getCollectionVersions() })}\n\n`
     );
 
     const keepAlive = setInterval(() => {
@@ -590,7 +882,28 @@ async function startServer() {
       res.json({
         ...state,
         authenticatedActor: actor.id
-          ? { id: actor.id, role: actor.role, name: actor.name }
+          ? {
+              id: actor.id,
+              username: actor.username,
+              role: actor.role,
+              name: actor.name,
+              urduName: actor.urduName,
+              phone: actor.phone,
+              whatsapp: actor.whatsapp,
+              whatsappSameAsPhone: actor.whatsappSameAsPhone,
+              email: actor.email,
+              customerId: actor.customerId,
+              investorId: actor.investorId,
+              resellerCode: actor.resellerCode,
+              branchId: actor.branchId,
+              branchName: actor.branchName,
+              managerAuthorities: actor.managerAuthorities,
+              crmRole: actor.crmRole,
+              crmPermissions: actor.crmPermissions,
+              canAuthorizeCreditSale: actor.canAuthorizeCreditSale,
+              mustChangePassword: actor.mustChangePassword,
+              isAuthenticated: true,
+            }
           : null,
       });
     })
@@ -663,6 +976,19 @@ async function startServer() {
         return;
       }
 
+      const rateKey = `login:${req.ip || 'unknown'}:${cleanIdLower || cleanId}`;
+      const rateIpKey = `login_ip:${req.ip || 'unknown'}`;
+      const rl = checkAuthRateLimit(rateKey);
+      const rlIp = checkAuthRateLimit(rateIpKey);
+      if (!rl.allowed || !rlIp.allowed) {
+        const retrySec = Math.max(rl.retryAfterSec, rlIp.retryAfterSec);
+        res.setHeader('Retry-After', String(retrySec));
+        res.status(429).json({
+          error: `Too many failed sign-in attempts. Please wait ${Math.ceil(retrySec / 60)} minute(s) and try again.`,
+        });
+        return;
+      }
+
       const db = await getDb();
       const accounts = await getCollectionValue<UserAccount[]>(db, 'user_accounts', []);
       const superAdminAcc = accounts.find((u) => u.id === 'usr_superadmin' || u.role === 'super_admin');
@@ -676,6 +1002,8 @@ async function startServer() {
           ? verifyServerSecret(cleanPin, superAdminAcc.passwordHash, superAdminAcc.passwordSalt)
           : false;
         if (matchesEnvMaster || matchesStoredSuper) {
+          clearAuthFailures(rateKey);
+          clearAuthFailures(rateIpKey);
           if (superAdminAcc && (!superAdminAcc.passwordHash?.startsWith('scrypt:') || matchesEnvMaster)) {
             const hashed = hashServerSecret(cleanPin);
             const nextAccounts = accounts.map((u) =>
@@ -713,6 +1041,7 @@ async function startServer() {
           const perms = getDefaultCrmPermissionsForRole('super_admin', 'administrator');
           const userObj = {
             id: superAdminAcc?.id || 'usr_superadmin',
+            username: superAdminAcc?.username || 'admin',
             name: superAdminAcc?.fullName || 'Shahzad Malik',
             urduName: superAdminAcc?.urduName || 'شہزاد ملک (سپر ایڈمن)',
             phone: superAdminAcc?.phone || '03125256266',
@@ -724,6 +1053,7 @@ async function startServer() {
             isAuthenticated: true,
           };
           const sessionToken = signSessionToken({ userId: userObj.id, role: 'super_admin', name: userObj.name });
+          setSessionCookie(req, res, sessionToken);
           await recordLoginAudit(db, {
             userId: userObj.id,
             userName: userObj.name,
@@ -762,6 +1092,8 @@ async function startServer() {
             res.status(403).json({ error: 'Account is suspended or inactive.' });
             return;
           }
+          clearAuthFailures(rateKey);
+          clearAuthFailures(rateIpKey);
           if (!acc.passwordHash?.startsWith('scrypt:')) {
             const hashed = hashServerSecret(cleanPin);
             const nextAccounts = accounts.map((u) =>
@@ -781,6 +1113,7 @@ async function startServer() {
             : getDefaultCrmPermissionsForRole(acc.role, acc.crmRole);
           const userObj = {
             id: acc.id,
+            username: acc.username,
             name: acc.fullName,
             urduName: acc.urduName,
             phone: acc.phone,
@@ -804,6 +1137,7 @@ async function startServer() {
             isAuthenticated: true,
           };
           const sessionToken = signSessionToken({ userId: acc.id, role: acc.role, name: acc.fullName });
+          setSessionCookie(req, res, sessionToken);
           await recordLoginAudit(db, {
             userId: acc.id,
             userName: acc.fullName,
@@ -825,12 +1159,21 @@ async function startServer() {
         const digits = matchedReseller.phone.replace(/\D/g, '');
         const fallbackPin = digits.length >= 6 ? digits.slice(-6) : '123456';
         const validPin = matchedReseller.pin
-          ? verifyServerSecret(cleanPin, matchedReseller.pin) || cleanPin === matchedReseller.pin
+          ? verifyServerSecret(cleanPin, matchedReseller.pin)
           : cleanPin === fallbackPin;
         if (validPin) {
           if (matchedReseller.status !== 'active') {
             res.status(403).json({ error: 'Reseller account is inactive.' });
             return;
+          }
+          clearAuthFailures(rateKey);
+          clearAuthFailures(rateIpKey);
+          if (!matchedReseller.pin?.startsWith('scrypt:')) {
+            const hashedPin = hashSingleSecretString(cleanPin);
+            const nextResellers = resellers.map((r) =>
+              r.id === matchedReseller.id ? { ...r, pin: hashedPin } : r
+            );
+            await saveCollectionValue(db, 'resellers', nextResellers);
           }
           const userObj = {
             id: matchedReseller.id,
@@ -846,6 +1189,7 @@ async function startServer() {
             role: 'reseller',
             name: matchedReseller.name,
           });
+          setSessionCookie(req, res, sessionToken);
           await recordLoginAudit(db, {
             userId: matchedReseller.id,
             userName: matchedReseller.name,
@@ -870,12 +1214,18 @@ async function startServer() {
         const digits = matchedCustomer.phone.replace(/\D/g, '');
         const fallbackPin = digits.length >= 6 ? digits.slice(-6) : '123456';
         const validPin = matchedCustomer.pin
-          ? verifyServerSecret(cleanPin, matchedCustomer.pin) || cleanPin === matchedCustomer.pin
+          ? verifyServerSecret(cleanPin, matchedCustomer.pin)
           : cleanPin === fallbackPin;
         if (validPin) {
           if (matchedCustomer.status === 'archived') {
             res.status(403).json({ error: 'Customer account is archived.' });
             return;
+          }
+          clearAuthFailures(rateKey);
+          clearAuthFailures(rateIpKey);
+          if (!matchedCustomer.pin?.startsWith('scrypt:')) {
+            const hashedPin = hashSingleSecretString(cleanPin);
+            await upsertCustomerRow(db, { ...matchedCustomer, pin: hashedPin });
           }
           const userObj = {
             id: matchedCustomer.id,
@@ -895,6 +1245,7 @@ async function startServer() {
             role: 'customer',
             name: matchedCustomer.name,
           });
+          setSessionCookie(req, res, sessionToken);
           await recordLoginAudit(db, {
             userId: matchedCustomer.id,
             userName: matchedCustomer.name,
@@ -908,6 +1259,8 @@ async function startServer() {
         }
       }
 
+      recordAuthFailure(rateKey);
+      recordAuthFailure(rateIpKey);
       await recordLoginAudit(db, {
         userId: 'unknown',
         userName: cleanId,
@@ -921,348 +1274,498 @@ async function startServer() {
   );
 
   app.post(
-    '/api/auth/register-customer',
+    '/api/auth/logout',
     asyncRoute(async (req, res) => {
-      const db = await getDb();
-      const bp = await getCollectionValue<BusinessProfile>(db, 'business_profile', defaultBusinessProfile);
-      if (bp.loginFormConfig?.allowSelfRegistration === false) {
-        res.status(403).json({ error: 'Self-registration is currently disabled. Please contact store admin.' });
-        return;
-      }
-
-      const {
-        name,
-        fullName,
-        phone,
-        email,
-        city,
-        address,
-        whatsappSameAsPhone,
-        whatsapp,
-        pin,
-        generateTempPassword,
-      } = (req.body || {}) as {
-        name?: string;
-        fullName?: string;
-        phone?: string;
-        email?: string;
-        city?: string;
-        address?: string;
-        whatsappSameAsPhone?: boolean;
-        whatsapp?: string;
-        pin?: string;
-        generateTempPassword?: boolean;
-      };
-
-      const cleanName = (name || fullName || '').trim();
-      const cleanPhone = (phone || '').trim();
-      const cleanEmail = (email || '').trim().toLowerCase();
-      const sameAsPhone = whatsappSameAsPhone !== false;
-      const cleanWhatsappInput = (whatsapp || '').trim();
-      const resolvedWhatsapp = sameAsPhone ? cleanPhone : cleanWhatsappInput;
-      const cleanPin = (pin || '').trim();
-
-      if (!cleanName || cleanName.length < 2) {
-        res.status(400).json({ error: 'Please enter your full name (at least 2 characters).' });
-        return;
-      }
-      if (cleanPhone.replace(/\D/g, '').length < 10) {
-        res.status(400).json({ error: 'Please enter a valid mobile number (at least 10 digits).' });
-        return;
-      }
-      if (!sameAsPhone && resolvedWhatsapp.replace(/\D/g, '').length < 10) {
-        res.status(400).json({
-          error: 'Please enter a valid WhatsApp number (at least 10 digits) for notifications.',
-        });
-        return;
-      }
-      if (cleanEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
-        res.status(400).json({ error: 'Please enter a valid email address.' });
-        return;
-      }
-
-      const shouldGenerateTemp = generateTempPassword !== false || !cleanPin;
-      if (!shouldGenerateTemp && cleanPin.length < 4) {
-        res.status(400).json({ error: 'Password must be at least 4 characters long.' });
-        return;
-      }
-
-      const normPhone = normalizePhoneDigits(cleanPhone);
-      const existingCustomers = await getAllCustomersFromDb(db);
-      const accounts = await getCollectionValue<UserAccount[]>(db, 'user_accounts', []);
-
-      const dupCust = existingCustomers.find((c) => normalizePhoneDigits(c.phone) === normPhone);
-      const dupAccPhone = accounts.find((u) => normalizePhoneDigits(u.phone) === normPhone);
-      if (dupCust || dupAccPhone) {
-        res.status(409).json({
-          error: 'An account with this mobile number already exists. Please sign in or contact support.',
-        });
-        return;
-      }
-
-      if (cleanEmail) {
-        const dupEmailCust = existingCustomers.find(
-          (c) => c.email && c.email.trim().toLowerCase() === cleanEmail
-        );
-        const dupEmailAcc = accounts.find((u) => u.email && u.email.trim().toLowerCase() === cleanEmail);
-        if (dupEmailCust || dupEmailAcc) {
-          res.status(409).json({
-            error: 'An account with this email address already exists. Please sign in or contact support.',
-          });
-          return;
-        }
-      }
-
-      const effectiveSecret = shouldGenerateTemp ? generateTemporaryPassword(8) : cleanPin;
-      const now = new Date().toISOString();
-      const custId = `cust_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-      const newCust: Customer = {
-        id: custId,
-        name: cleanName,
-        phone: cleanPhone,
-        whatsapp: resolvedWhatsapp,
-        whatsappSameAsPhone: sameAsPhone,
-        whatsappConsent: true,
-        email: cleanEmail || undefined,
-        city: (city || 'Muzaffarabad').trim(),
-        address: (address || city || 'Pakistan').trim(),
-        customerType: 'individual',
-        customerSource: 'Website',
-        balance: 0,
-        totalPurchases: 0,
-        creditLimit: 5000,
-        paymentTermsDays: 7,
-        status: 'active',
-        createdAt: now.split('T')[0],
-      };
-
-      const hashed = hashServerSecret(effectiveSecret);
-      const accId = `usr_cust_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`;
-      const newAccount: UserAccount = {
-        id: accId,
-        fullName: cleanName,
-        username: normPhone || cleanPhone,
-        phone: cleanPhone,
-        whatsapp: resolvedWhatsapp,
-        whatsappSameAsPhone: sameAsPhone,
-        email: cleanEmail || undefined,
-        role: 'customer',
-        status: 'active',
-        passwordHash: hashed.hash,
-        passwordSalt: hashed.salt,
-        mustChangePassword: shouldGenerateTemp,
-        isTemporaryPassword: shouldGenerateTemp,
-        linkedCustomerId: custId,
-        createdAt: now,
-        createdBy: 'self_registration',
-      };
-
-      await upsertCustomerRow(db, newCust);
-      await saveCollectionValue(db, 'user_accounts', [...accounts, newAccount]);
-      await insertCrmActivityEvent(db, {
-        customerId: custId,
-        phone: cleanPhone,
-        eventType: 'note_added',
-        notes: `Customer self-registered via portal. Notification WhatsApp: ${resolvedWhatsapp}${
-          cleanEmail ? ` | Email: ${cleanEmail}` : ''
-        }${shouldGenerateTemp ? ' (Temporary password issued)' : ''}`,
-      });
-
-      const userObj = {
-        id: accId,
-        name: cleanName,
-        phone: cleanPhone,
-        whatsapp: resolvedWhatsapp,
-        whatsappSameAsPhone: sameAsPhone,
-        email: cleanEmail || undefined,
-        role: 'customer',
-        customerId: custId,
-        canAuthorizeCreditSale: false,
-        mustChangePassword: shouldGenerateTemp,
-        isAuthenticated: true,
-      };
-      const sessionToken = signSessionToken({ userId: accId, role: 'customer', name: cleanName });
-      broadcastSyncEvent('customers', req.header('x-client-id'));
-      res.json({
-        ok: true,
-        user: userObj,
-        customer: newCust,
-        sessionToken,
-        temporaryPassword: shouldGenerateTemp ? effectiveSecret : undefined,
-        whatsappNumber: resolvedWhatsapp,
-        email: cleanEmail || undefined,
-      });
-    })
-  );
-
-  app.post(
-    '/api/auth/change-password',
-    asyncRoute(async (req, res) => {
-      const actor = await resolveActor(req);
-      if (!actor.id) {
-        res.status(401).json({ error: 'Authentication required.' });
-        return;
-      }
-      const { currentPin, newPin } = (req.body || {}) as { currentPin?: string; newPin?: string };
-      const cur = (currentPin || '').trim();
-      const next = (newPin || '').trim();
-      if (!cur || next.length < 4) {
-        res.status(400).json({ error: 'Current PIN and a new PIN (at least 4 characters) are required.' });
-        return;
-      }
-
-      const db = await getDb();
-      const accounts = await getCollectionValue<UserAccount[]>(db, 'user_accounts', []);
-      const acc = accounts.find((u) => u.id === actor.id);
-      if (acc) {
-        const envMasterPin = (process.env.ADMIN_MASTER_PIN || '').trim();
-        const verified =
-          verifyServerSecret(cur, acc.passwordHash, acc.passwordSalt) ||
-          (acc.role === 'super_admin' && Boolean(envMasterPin) && cur === envMasterPin);
-        if (!verified) {
-          res.status(403).json({ error: 'Current PIN / password is incorrect.' });
-          return;
-        }
-        const hashed = hashServerSecret(next);
-        const nextAccounts = accounts.map((u) =>
-          u.id === acc.id
-            ? {
-                ...u,
-                passwordHash: hashed.hash,
-                passwordSalt: hashed.salt,
-                isTemporaryPassword: false,
-                mustChangePassword: false,
-              }
-            : u
-        );
-        await saveCollectionValue(db, 'user_accounts', nextAccounts);
-        broadcastSyncEvent('user_accounts', req.header('x-client-id'));
-        res.json({ ok: true });
-        return;
-      }
-
-      if (actor.role === 'customer' && actor.customerId) {
-        const cust = (await getAllCustomersFromDb(db)).find((c) => c.id === actor.customerId);
-        if (!cust) {
-          res.status(404).json({ error: 'Customer profile not found.' });
-          return;
-        }
-        const digits = cust.phone.replace(/\D/g, '');
-        const fallback = digits.length >= 6 ? digits.slice(-6) : '123456';
-        const okCur = cust.pin
-          ? verifyServerSecret(cur, cust.pin) || cur === cust.pin
-          : cur === fallback;
-        if (!okCur) {
-          res.status(403).json({ error: 'Current PIN is incorrect.' });
-          return;
-        }
-        const hashed = hashServerSecret(next);
-        const newAcc: UserAccount = {
-          id: `usr_cust_${cust.id}`,
-          fullName: cust.name,
-          username: normalizePhoneDigits(cust.phone) || cust.id,
-          phone: cust.phone,
-          role: 'customer',
-          status: 'active',
-          passwordHash: hashed.hash,
-          passwordSalt: hashed.salt,
-          linkedCustomerId: cust.id,
-          createdAt: new Date().toISOString(),
-          createdBy: cust.id,
-        };
-        const cleanCust = { ...cust };
-        delete cleanCust.pin;
-        await upsertCustomerRow(db, cleanCust);
-        await saveCollectionValue(db, 'user_accounts', [...accounts, newAcc]);
-        res.json({ ok: true });
-        return;
-      }
-
-      res.status(404).json({ error: 'User account not found.' });
-    })
-  );
-
-  app.post(
-    '/api/auth/change-master-pin',
-    asyncRoute(async (req, res) => {
-      const actor = await resolveActor(req);
-      if (actor.role !== 'super_admin') {
-        res.status(403).json({ error: 'Only the Super Admin can update the Master PIN.' });
-        return;
-      }
-      const { currentPin, newPin } = (req.body || {}) as { currentPin?: string; newPin?: string };
-      const cur = (currentPin || '').trim();
-      const next = (newPin || '').trim();
-      if (!cur || next.length < 4) {
-        res.status(400).json({ error: 'Current Master PIN and new Master PIN (min 4 characters) are required.' });
-        return;
-      }
-
-      const db = await getDb();
-      const accounts = await getCollectionValue<UserAccount[]>(db, 'user_accounts', []);
-      const superAcc = accounts.find((u) => u.id === 'usr_superadmin' || u.role === 'super_admin');
-      const envMasterPin = (process.env.ADMIN_MASTER_PIN || '').trim();
-      const validCur =
-        (superAcc && verifyServerSecret(cur, superAcc.passwordHash, superAcc.passwordSalt)) ||
-        (Boolean(envMasterPin) && cur === envMasterPin);
-      if (!validCur) {
-        res.status(403).json({ error: 'Current Master PIN is incorrect.' });
-        return;
-      }
-
-      const hashed = hashServerSecret(next);
-      if (superAcc) {
-        const updated = accounts.map((u) =>
-          u.id === superAcc.id
-            ? {
-                ...u,
-                passwordHash: hashed.hash,
-                passwordSalt: hashed.salt,
-                isTemporaryPassword: false,
-                mustChangePassword: false,
-              }
-            : u
-        );
-        await saveCollectionValue(db, 'user_accounts', updated);
-      }
-      await insertAdminAuditLog(db, {
-        action: 'change_master_pin',
-        entityType: 'security',
-        entityId: 'usr_superadmin',
-        actorId: actor.id,
-        actorName: actor.name,
-        actorRole: actor.role,
-      });
-      broadcastSyncEvent('user_accounts', req.header('x-client-id'));
+      clearSessionCookie(req, res);
       res.json({ ok: true });
     })
   );
 
-  app.post(
-    '/api/admin/users/:id/reset-password',
-    asyncRoute(async (req, res) => {
-      const actor = await resolveActor(req);
-      if (actor.role !== 'super_admin' && actor.role !== 'admin') {
-        res.status(403).json({ error: 'Only administrators can reset user credentials.' });
+  const handleCustomerRegistration = async (req: Request, res: Response) => {
+    const regRlKey = `reg:${req.ip || 'unknown'}`;
+    const regRl = checkAuthRateLimit(regRlKey);
+    if (!regRl.allowed) {
+      res.setHeader('Retry-After', String(regRl.retryAfterSec));
+      res.status(429).json({
+        error: `Too many registration requests. Please try again in ${Math.ceil(regRl.retryAfterSec / 60)} minute(s).`,
+      });
+      return;
+    }
+
+    const db = await getDb();
+    const bp = await getCollectionValue<BusinessProfile>(db, 'business_profile', defaultBusinessProfile);
+    if (bp.loginFormConfig?.allowSelfRegistration === false) {
+      res.status(403).json({ error: 'Self-registration is currently disabled. Please contact store admin.' });
+      return;
+    }
+
+    const {
+      name,
+      fullName,
+      username,
+      phone,
+      email,
+      city,
+      address,
+      whatsappSameAsPhone,
+      whatsapp,
+      pin,
+      generateTempPassword,
+    } = (req.body || {}) as {
+      name?: string;
+      fullName?: string;
+      username?: string;
+      phone?: string;
+      email?: string;
+      city?: string;
+      address?: string;
+      whatsappSameAsPhone?: boolean;
+      whatsapp?: string;
+      pin?: string;
+      generateTempPassword?: boolean;
+    };
+
+    const cleanName = (name || fullName || '').trim();
+    const cleanUsernameInput = (username || '').trim().replace(/^@+/, '').toLowerCase();
+    const cleanPhone = (phone || '').trim();
+    const cleanEmail = (email || '').trim().toLowerCase();
+    const sameAsPhone = whatsappSameAsPhone !== false;
+    const cleanWhatsappInput = (whatsapp || '').trim();
+    const resolvedWhatsapp = sameAsPhone ? cleanPhone : cleanWhatsappInput;
+    const cleanPin = (pin || '').trim();
+
+    if (!cleanName || cleanName.length < 2) {
+      res.status(400).json({ error: 'Please enter your full name (at least 2 characters).' });
+      return;
+    }
+    if (cleanUsernameInput && !/^[a-z0-9_.-]{3,32}$/.test(cleanUsernameInput)) {
+      res.status(400).json({
+        error: 'Username must be 3 to 32 characters using only letters, numbers, underscores, dots, or hyphens.',
+      });
+      return;
+    }
+    if (cleanPhone.replace(/\D/g, '').length < 10) {
+      res.status(400).json({ error: 'Please enter a valid mobile number (at least 10 digits).' });
+      return;
+    }
+    if (!sameAsPhone && resolvedWhatsapp.replace(/\D/g, '').length < 10) {
+      res.status(400).json({
+        error: 'Please enter a valid WhatsApp number (at least 10 digits) for notifications.',
+      });
+      return;
+    }
+    if (cleanEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+      res.status(400).json({ error: 'Please enter a valid email address.' });
+      return;
+    }
+
+    const shouldGenerateTemp = generateTempPassword !== false || !cleanPin;
+    if (!shouldGenerateTemp && cleanPin.length < 4) {
+      res.status(400).json({ error: 'Password must be at least 4 characters long.' });
+      return;
+    }
+
+    const normPhone = normalizePhoneDigits(cleanPhone);
+    const existingCustomers = await getAllCustomersFromDb(db);
+    const accounts = await getCollectionValue<UserAccount[]>(db, 'user_accounts', []);
+
+    const dupCust = existingCustomers.find((c) => normalizePhoneDigits(c.phone) === normPhone);
+    const dupAccPhone = accounts.find((u) => normalizePhoneDigits(u.phone) === normPhone);
+    if (dupCust || dupAccPhone) {
+      res.status(409).json({
+        error: 'An account with this mobile number already exists. Please sign in or contact support.',
+      });
+      return;
+    }
+
+    if (cleanUsernameInput) {
+      const dupUsername = accounts.find((u) => u.username?.toLowerCase() === cleanUsernameInput);
+      if (dupUsername) {
+        res.status(409).json({
+          error: `Username "@${cleanUsernameInput}" is already taken. Please choose another username.`,
+        });
         return;
       }
-      const newPin = String(req.body?.newPin || '').trim();
-      if (newPin.length < 4) {
-        res.status(400).json({ error: 'New temporary PIN must be at least 4 characters.' });
+    }
+
+    if (cleanEmail) {
+      const dupEmailCust = existingCustomers.find(
+        (c) => c.email && c.email.trim().toLowerCase() === cleanEmail
+      );
+      const dupEmailAcc = accounts.find((u) => u.email && u.email.trim().toLowerCase() === cleanEmail);
+      if (dupEmailCust || dupEmailAcc) {
+        res.status(409).json({
+          error: 'An account with this email address already exists. Please sign in or contact support.',
+        });
         return;
       }
-      const db = await getDb();
-      const accounts = await getCollectionValue<UserAccount[]>(db, 'user_accounts', []);
-      const target = accounts.find((u) => u.id === req.params.id);
-      if (!target) {
-        res.status(404).json({ error: 'User account not found.' });
+    }
+
+    const resolvedUsername = cleanUsernameInput || normPhone || cleanPhone;
+    const effectiveSecret = shouldGenerateTemp ? generateTemporaryPassword(8) : cleanPin;
+    const now = new Date().toISOString();
+    const custId = `cust_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const newCust: Customer = {
+      id: custId,
+      name: cleanName,
+      phone: cleanPhone,
+      whatsapp: resolvedWhatsapp,
+      whatsappSameAsPhone: sameAsPhone,
+      whatsappConsent: true,
+      email: cleanEmail || undefined,
+      city: (city || 'Muzaffarabad').trim(),
+      address: (address || city || 'Pakistan').trim(),
+      customerType: 'individual',
+      customerSource: 'Website',
+      balance: 0,
+      totalPurchases: 0,
+      creditLimit: 5000,
+      paymentTermsDays: 7,
+      status: 'active',
+      createdAt: now.split('T')[0],
+    };
+
+    const hashed = hashServerSecret(effectiveSecret);
+    const accId = `usr_cust_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`;
+    const newAccount: UserAccount = {
+      id: accId,
+      fullName: cleanName,
+      username: resolvedUsername,
+      phone: cleanPhone,
+      whatsapp: resolvedWhatsapp,
+      whatsappSameAsPhone: sameAsPhone,
+      email: cleanEmail || undefined,
+      role: 'customer',
+      status: 'active',
+      passwordHash: hashed.hash,
+      passwordSalt: hashed.salt,
+      mustChangePassword: shouldGenerateTemp,
+      isTemporaryPassword: shouldGenerateTemp,
+      linkedCustomerId: custId,
+      createdAt: now,
+      createdBy: 'self_registration',
+    };
+
+    await upsertCustomerRow(db, newCust);
+    await saveCollectionValue(db, 'user_accounts', [...accounts, newAccount]);
+    await insertCrmActivityEvent(db, {
+      customerId: custId,
+      phone: cleanPhone,
+      eventType: 'note_added',
+      notes: `Customer self-registered via portal (@${resolvedUsername}). Notification WhatsApp: ${resolvedWhatsapp}${
+        cleanEmail ? ` | Email: ${cleanEmail}` : ''
+      }${shouldGenerateTemp ? ' (Temporary password issued)' : ''}`,
+    });
+
+    const userObj = {
+      id: accId,
+      username: resolvedUsername,
+      name: cleanName,
+      phone: cleanPhone,
+      whatsapp: resolvedWhatsapp,
+      whatsappSameAsPhone: sameAsPhone,
+      email: cleanEmail || undefined,
+      role: 'customer',
+      customerId: custId,
+      canAuthorizeCreditSale: false,
+      mustChangePassword: shouldGenerateTemp,
+      isAuthenticated: true,
+    };
+    const sessionToken = signSessionToken({ userId: accId, role: 'customer', name: cleanName });
+    setSessionCookie(req, res, sessionToken);
+    recordAuthFailure(`reg:${req.ip || 'unknown'}`);
+    broadcastSyncEvent('customers', req.header('x-client-id'));
+    res.json({
+      ok: true,
+      user: userObj,
+      customer: newCust,
+      username: resolvedUsername,
+      sessionToken,
+      temporaryPassword: shouldGenerateTemp ? effectiveSecret : undefined,
+      whatsappNumber: resolvedWhatsapp,
+      email: cleanEmail || undefined,
+    });
+  };
+
+  app.post('/api/auth/register-customer', asyncRoute(handleCustomerRegistration));
+  app.post('/api/account/register', asyncRoute(handleCustomerRegistration));
+
+  const validateAndNormalizeUsername = (raw: string): string | null => {
+    const clean = raw.trim().replace(/^@+/, '').toLowerCase();
+    if (!clean || !/^[a-z0-9_.-]{3,32}$/.test(clean)) return null;
+    return clean;
+  };
+
+  const handleChangeOwnPassword = async (req: Request, res: Response) => {
+    const actor = await resolveActor(req);
+    if (!actor.id) {
+      res.status(401).json({ error: 'Authentication required. Please sign in again.' });
+      return;
+    }
+    const body = (req.body || {}) as {
+      currentPin?: string;
+      newPin?: string;
+      currentCode?: string;
+      newCode?: string;
+      username?: string;
+    };
+    const cur = String(body.currentPin ?? body.currentCode ?? '').trim();
+    const next = String(body.newPin ?? body.newCode ?? '').trim();
+    const requestedUsernameRaw = typeof body.username === 'string' ? body.username.trim() : '';
+
+    if (!cur || next.length < 4) {
+      res.status(400).json({ error: 'Current password/PIN and a new password/PIN (at least 4 characters) are required.' });
+      return;
+    }
+
+    let nextUsername: string | undefined;
+    if (requestedUsernameRaw) {
+      const normalized = validateAndNormalizeUsername(requestedUsernameRaw);
+      if (!normalized) {
+        res.status(400).json({
+          error: 'Username must be 3 to 32 characters (letters, numbers, underscore, dot, or hyphen).',
+        });
         return;
       }
+      nextUsername = normalized;
+    }
+
+    const db = await getDb();
+    const accounts = await getCollectionValue<UserAccount[]>(db, 'user_accounts', []);
+    if (nextUsername) {
+      const conflictAcc = accounts.find(
+        (u) => u.id !== actor.id && u.username?.toLowerCase() === nextUsername
+      );
+      if (conflictAcc) {
+        res.status(409).json({ error: `Username "@${nextUsername}" is already in use.` });
+        return;
+      }
+    }
+
+    const acc = accounts.find(
+      (u) =>
+        u.id === actor.id ||
+        (actor.role === 'customer' &&
+          (u.id === `usr_cust_${actor.id}` ||
+            (actor.customerId && u.linkedCustomerId === actor.customerId))) ||
+        (actor.role === 'reseller' && u.id === `usr_res_${actor.id}`)
+    );
+    if (acc) {
+      const envMasterPin = (process.env.ADMIN_MASTER_PIN || '').trim();
+      const digits = (acc.phone || '').replace(/\D/g, '');
+      const defaultAccPin = digits.length >= 6 ? digits.slice(-6) : '123456';
+      const verified =
+        verifyServerSecret(cur, acc.passwordHash, acc.passwordSalt) ||
+        (!acc.passwordHash && cur === defaultAccPin) ||
+        (acc.role === 'super_admin' && Boolean(envMasterPin) && cur === envMasterPin);
+      if (!verified) {
+        res.status(403).json({ error: 'Current PIN / password is incorrect.' });
+        return;
+      }
+      const hashed = hashServerSecret(next);
+      const nextAccounts = accounts.map((u) =>
+        u.id === acc.id
+          ? {
+              ...u,
+              username: nextUsername || u.username,
+              passwordHash: hashed.hash,
+              passwordSalt: hashed.salt,
+              isTemporaryPassword: false,
+              mustChangePassword: false,
+            }
+          : u
+      );
+      await saveCollectionValue(db, 'user_accounts', nextAccounts);
+      broadcastSyncEvent('user_accounts', req.header('x-client-id'));
+      res.json({ ok: true, username: nextUsername || acc.username });
+      return;
+    }
+
+    if (actor.role === 'customer' && actor.customerId) {
+      const cust = (await getAllCustomersFromDb(db)).find((c) => c.id === actor.customerId);
+      if (!cust) {
+        res.status(404).json({ error: 'Customer profile not found.' });
+        return;
+      }
+      const digits = cust.phone.replace(/\D/g, '');
+      const fallback = digits.length >= 6 ? digits.slice(-6) : '123456';
+      const okCur = cust.pin ? verifyServerSecret(cur, cust.pin) || cur === cust.pin : cur === fallback;
+      if (!okCur) {
+        res.status(403).json({ error: 'Current PIN / password is incorrect.' });
+        return;
+      }
+      const hashed = hashServerSecret(next);
+      const resolvedUsername = nextUsername || normalizePhoneDigits(cust.phone) || cust.id;
+      const newAcc: UserAccount = {
+        id: `usr_cust_${cust.id}`,
+        fullName: cust.name,
+        username: resolvedUsername,
+        phone: cust.phone,
+        role: 'customer',
+        status: 'active',
+        passwordHash: hashed.hash,
+        passwordSalt: hashed.salt,
+        linkedCustomerId: cust.id,
+        createdAt: new Date().toISOString(),
+        createdBy: cust.id,
+      };
+      const cleanCust = { ...cust };
+      delete cleanCust.pin;
+      await upsertCustomerRow(db, cleanCust);
+      await saveCollectionValue(db, 'user_accounts', [...accounts, newAcc]);
+      broadcastSyncEvent('user_accounts', req.header('x-client-id'));
+      res.json({ ok: true, username: resolvedUsername });
+      return;
+    }
+
+    if (actor.role === 'reseller') {
+      const resellers = await getCollectionValue<Reseller[]>(db, 'resellers', []);
+      const resAcc = resellers.find((r) => r.id === actor.id);
+      if (!resAcc) {
+        res.status(404).json({ error: 'Reseller profile not found.' });
+        return;
+      }
+      const digits = resAcc.phone.replace(/\D/g, '');
+      const fallback = digits.length >= 6 ? digits.slice(-6) : '123456';
+      const okCur = resAcc.pin ? verifyServerSecret(cur, resAcc.pin) || cur === resAcc.pin : cur === fallback;
+      if (!okCur) {
+        res.status(403).json({ error: 'Current PIN / password is incorrect.' });
+        return;
+      }
+      const hashedSingle = hashSingleSecretString(next);
+      const updatedResellers = resellers.map((r) => (r.id === resAcc.id ? { ...r, pin: hashedSingle } : r));
+      await saveCollectionValue(db, 'resellers', updatedResellers);
+      if (nextUsername) {
+        const hashed = hashServerSecret(next);
+        const newAcc: UserAccount = {
+          id: `usr_res_${resAcc.id}`,
+          fullName: resAcc.name,
+          username: nextUsername,
+          phone: resAcc.phone,
+          role: 'reseller',
+          status: 'active',
+          passwordHash: hashed.hash,
+          passwordSalt: hashed.salt,
+          linkedResellerCode: resAcc.referralCode,
+          createdAt: new Date().toISOString(),
+          createdBy: resAcc.id,
+        };
+        await saveCollectionValue(db, 'user_accounts', [...accounts, newAcc]);
+      }
+      broadcastSyncEvent('resellers', req.header('x-client-id'));
+      res.json({ ok: true, username: nextUsername });
+      return;
+    }
+
+    res.status(404).json({ error: 'User account not found.' });
+  };
+
+  app.post('/api/auth/change-password', asyncRoute(handleChangeOwnPassword));
+  app.post('/api/account/pin-update', asyncRoute(handleChangeOwnPassword));
+
+  const handleChangeMasterPin = async (req: Request, res: Response) => {
+    const actor = await resolveActor(req);
+    if (actor.role !== 'super_admin') {
+      res.status(403).json({ error: 'Only the Super Admin can update the Master PIN.' });
+      return;
+    }
+    const body = (req.body || {}) as {
+      currentPin?: string;
+      newPin?: string;
+      currentCode?: string;
+      newCode?: string;
+    };
+    const cur = String(body.currentPin ?? body.currentCode ?? '').trim();
+    const next = String(body.newPin ?? body.newCode ?? '').trim();
+    if (!cur || next.length < 4) {
+      res.status(400).json({ error: 'Current Master PIN and new Master PIN (min 4 characters) are required.' });
+      return;
+    }
+
+    const db = await getDb();
+    const accounts = await getCollectionValue<UserAccount[]>(db, 'user_accounts', []);
+    const superAcc = accounts.find((u) => u.id === 'usr_superadmin' || u.role === 'super_admin');
+    const envMasterPin = (process.env.ADMIN_MASTER_PIN || '').trim();
+    const validCur =
+      (superAcc && verifyServerSecret(cur, superAcc.passwordHash, superAcc.passwordSalt)) ||
+      (Boolean(envMasterPin) && cur === envMasterPin);
+    if (!validCur) {
+      res.status(403).json({ error: 'Current Master PIN is incorrect.' });
+      return;
+    }
+
+    const hashed = hashServerSecret(next);
+    if (superAcc) {
+      const updated = accounts.map((u) =>
+        u.id === superAcc.id
+          ? {
+              ...u,
+              passwordHash: hashed.hash,
+              passwordSalt: hashed.salt,
+              isTemporaryPassword: false,
+              mustChangePassword: false,
+            }
+          : u
+      );
+      await saveCollectionValue(db, 'user_accounts', updated);
+    }
+    await insertAdminAuditLog(db, {
+      action: 'change_master_pin',
+      entityType: 'security',
+      entityId: 'usr_superadmin',
+      actorId: actor.id,
+      actorName: actor.name,
+      actorRole: actor.role,
+    });
+    broadcastSyncEvent('user_accounts', req.header('x-client-id'));
+    res.json({ ok: true });
+  };
+
+  app.post('/api/auth/change-master-pin', asyncRoute(handleChangeMasterPin));
+  app.post('/api/account/master-update', asyncRoute(handleChangeMasterPin));
+
+  const handleAdminResetPassword = async (req: Request, res: Response) => {
+    const actor = await resolveActor(req);
+    if (actor.role !== 'super_admin' && actor.role !== 'admin') {
+      res.status(403).json({ error: 'Only administrators can reset user credentials.' });
+      return;
+    }
+    const body = (req.body || {}) as {
+      targetId?: string;
+      id?: string;
+      username?: string;
+      newPin?: string;
+      tempPin?: string;
+      code?: string;
+    };
+    const lookupKey = String(req.params.id || body.targetId || body.id || body.username || '').trim();
+    const lookupLower = lookupKey.replace(/^@+/, '').toLowerCase();
+    const lookupNormPhone = normalizePhoneOrId(lookupKey);
+    const rawPin = String(body.newPin || body.tempPin || body.code || '').trim();
+    const effectivePin = rawPin || generateTemporaryPassword(8);
+    if (!lookupKey) {
+      res.status(400).json({ error: 'Target user ID or username is required.' });
+      return;
+    }
+    if (effectivePin.length < 4) {
+      res.status(400).json({ error: 'New temporary PIN must be at least 4 characters.' });
+      return;
+    }
+
+    const db = await getDb();
+    const accounts = await getCollectionValue<UserAccount[]>(db, 'user_accounts', []);
+    const target = accounts.find(
+      (u) =>
+        u.id === lookupKey ||
+        u.username?.toLowerCase() === lookupLower ||
+        normalizePhoneOrId(u.phone) === lookupNormPhone
+    );
+    if (target) {
       if (target.role === 'super_admin' && actor.role !== 'super_admin') {
         res.status(403).json({ error: 'Only Super Admin can reset the Super Admin PIN.' });
         return;
       }
-      const hashed = hashServerSecret(newPin);
+      const hashed = hashServerSecret(effectivePin);
       const updated = accounts.map((u) =>
         u.id === target.id
           ? {
@@ -1285,7 +1788,211 @@ async function startServer() {
         details: { targetUsername: target.username, targetRole: target.role },
       });
       broadcastSyncEvent('user_accounts', req.header('x-client-id'));
-      res.json({ ok: true });
+      res.json({ ok: true, tempPin: effectivePin, username: target.username });
+      return;
+    }
+
+    // Also allow resetting Customer or Reseller PINs securely as scrypt hashes
+    const customers = await getAllCustomersFromDb(db);
+    const cust = customers.find(
+      (c) => c.id === lookupKey || normalizePhoneOrId(c.phone) === lookupNormPhone
+    );
+    if (cust) {
+      const hashedSingle = hashSingleSecretString(effectivePin);
+      await upsertCustomerRow(db, { ...cust, pin: hashedSingle });
+      await insertAdminAuditLog(db, {
+        action: 'admin_reset_customer_pin',
+        entityType: 'customer',
+        entityId: cust.id,
+        actorId: actor.id,
+        actorName: actor.name,
+        actorRole: actor.role,
+      });
+      broadcastSyncEvent('customers', req.header('x-client-id'));
+      res.json({ ok: true, tempPin: effectivePin });
+      return;
+    }
+
+    const resellers = await getCollectionValue<Reseller[]>(db, 'resellers', []);
+    const resAcc = resellers.find(
+      (r) =>
+        r.id === lookupKey ||
+        r.referralCode.toLowerCase() === lookupLower ||
+        normalizePhoneOrId(r.phone) === lookupNormPhone
+    );
+    if (resAcc) {
+      const hashedSingle = hashSingleSecretString(effectivePin);
+      const updatedResellers = resellers.map((r) => (r.id === resAcc.id ? { ...r, pin: hashedSingle } : r));
+      await saveCollectionValue(db, 'resellers', updatedResellers);
+      await insertAdminAuditLog(db, {
+        action: 'admin_reset_reseller_pin',
+        entityType: 'reseller',
+        entityId: resAcc.id,
+        actorId: actor.id,
+        actorName: actor.name,
+        actorRole: actor.role,
+      });
+      broadcastSyncEvent('resellers', req.header('x-client-id'));
+      res.json({ ok: true, tempPin: effectivePin });
+      return;
+    }
+
+    res.status(404).json({ error: 'User account not found.' });
+  };
+
+  app.post('/api/admin/users/:id/reset-password', asyncRoute(handleAdminResetPassword));
+  app.post('/api/account/admin-pin-update', asyncRoute(handleAdminResetPassword));
+
+  app.post(
+    '/api/account/username-update',
+    asyncRoute(async (req, res) => {
+      const actor = await resolveActor(req);
+      if (!actor.id) {
+        res.status(401).json({ error: 'Authentication required.' });
+        return;
+      }
+      const nextUsername = validateAndNormalizeUsername(String(req.body?.username || ''));
+      if (!nextUsername) {
+        res.status(400).json({
+          error: 'Username must be 3 to 32 characters (letters, numbers, underscore, dot, or hyphen).',
+        });
+        return;
+      }
+
+      const db = await getDb();
+      const accounts = await getCollectionValue<UserAccount[]>(db, 'user_accounts', []);
+      const existingAcc = accounts.find(
+        (u) =>
+          u.id === actor.id ||
+          (actor.role === 'customer' &&
+            (u.id === `usr_cust_${actor.id}` ||
+              (actor.customerId && u.linkedCustomerId === actor.customerId))) ||
+          (actor.role === 'reseller' && u.id === `usr_res_${actor.id}`)
+      );
+      const conflict = accounts.find(
+        (u) => u.id !== (existingAcc?.id || actor.id) && u.username?.toLowerCase() === nextUsername
+      );
+      if (conflict) {
+        res.status(409).json({ error: `Username "@${nextUsername}" is already taken.` });
+        return;
+      }
+
+      if (existingAcc) {
+        const updated = accounts.map((u) =>
+          u.id === existingAcc.id ? { ...u, username: nextUsername } : u
+        );
+        await saveCollectionValue(db, 'user_accounts', updated);
+        broadcastSyncEvent('user_accounts', req.header('x-client-id'));
+        res.json({ ok: true, username: nextUsername });
+        return;
+      }
+
+      if (actor.role === 'customer' && actor.customerId) {
+        const cust = (await getAllCustomersFromDb(db)).find((c) => c.id === actor.customerId);
+        if (cust) {
+          const digits = cust.phone.replace(/\D/g, '');
+          const fallback = digits.length >= 6 ? digits.slice(-6) : '123456';
+          const newAcc: UserAccount = {
+            id: `usr_cust_${cust.id}`,
+            fullName: cust.name,
+            username: nextUsername,
+            phone: cust.phone,
+            email: cust.email,
+            role: 'customer',
+            status: 'active',
+            linkedCustomerId: cust.id,
+            createdAt: new Date().toISOString(),
+            createdBy: cust.id,
+            ...(cust.pin?.startsWith('scrypt:') ? {} : hashServerSecret(cust.pin || fallback)),
+          };
+          if (!newAcc.passwordHash) {
+            const h = hashServerSecret(fallback);
+            newAcc.passwordHash = h.hash;
+            newAcc.passwordSalt = h.salt;
+          }
+          await saveCollectionValue(db, 'user_accounts', [...accounts, newAcc]);
+          broadcastSyncEvent('user_accounts', req.header('x-client-id'));
+          res.json({ ok: true, username: nextUsername });
+          return;
+        }
+      }
+
+      if (actor.role === 'reseller') {
+        const resellers = await getCollectionValue<Reseller[]>(db, 'resellers', []);
+        const resAcc = resellers.find((r) => r.id === actor.id);
+        if (resAcc) {
+          const digits = resAcc.phone.replace(/\D/g, '');
+          const fallback = digits.length >= 6 ? digits.slice(-6) : '123456';
+          const h = hashServerSecret(fallback);
+          const newAcc: UserAccount = {
+            id: `usr_res_${resAcc.id}`,
+            fullName: resAcc.name,
+            username: nextUsername,
+            phone: resAcc.phone,
+            role: 'reseller',
+            status: 'active',
+            passwordHash: h.hash,
+            passwordSalt: h.salt,
+            linkedResellerCode: resAcc.referralCode,
+            createdAt: new Date().toISOString(),
+            createdBy: resAcc.id,
+          };
+          await saveCollectionValue(db, 'user_accounts', [...accounts, newAcc]);
+          broadcastSyncEvent('user_accounts', req.header('x-client-id'));
+          res.json({ ok: true, username: nextUsername });
+          return;
+        }
+      }
+
+      res.status(404).json({ error: 'Account record not found.' });
+    })
+  );
+
+  app.post(
+    '/api/account/recovery-request',
+    asyncRoute(async (req, res) => {
+      const identifier = String(req.body?.identifier || '').trim();
+      if (!identifier) {
+        res.status(400).json({ error: 'Please enter your mobile number, email, or username.' });
+        return;
+      }
+      const rlKey = `recover:${req.ip || 'unknown'}`;
+      const rl = checkAuthRateLimit(rlKey);
+      if (!rl.allowed) {
+        res.setHeader('Retry-After', String(rl.retryAfterSec));
+        res.status(429).json({
+          error: `Too many recovery requests. Please wait ${Math.ceil(rl.retryAfterSec / 60)} minute(s).`,
+        });
+        return;
+      }
+      recordAuthFailure(rlKey);
+
+      const db = await getDb();
+      const cleanNorm = normalizePhoneOrId(identifier);
+      const cleanLower = identifier.replace(/^@+/, '').toLowerCase();
+      const accounts = await getCollectionValue<UserAccount[]>(db, 'user_accounts', []);
+      const matchedAcc = accounts.find(
+        (u) =>
+          u.username?.toLowerCase() === cleanLower ||
+          normalizePhoneOrId(u.phone) === cleanNorm ||
+          (u.email && u.email.toLowerCase() === cleanLower)
+      );
+
+      await recordLoginAudit(db, {
+        userId: matchedAcc?.id || 'recovery_lookup',
+        userName: matchedAcc?.fullName || identifier,
+        role: matchedAcc?.role || 'customer',
+        identifier,
+        status: 'failed',
+        note: matchedAcc
+          ? `Password recovery requested for @${matchedAcc.username} (${matchedAcc.phone})`
+          : `Password recovery requested for "${identifier}"`,
+      });
+      res.json({
+        ok: true,
+        matched: Boolean(matchedAcc),
+        username: matchedAcc?.username,
+      });
     })
   );
 
@@ -3598,6 +4305,12 @@ async function startServer() {
       }
 
       const data = req.body?.data;
+      const expectedVersion =
+        typeof req.body?.expectedVersion === 'number' && Number.isFinite(req.body.expectedVersion)
+          ? req.body.expectedVersion
+          : undefined;
+      const sourceClientId = req.header('x-client-id') || undefined;
+
       if (data === undefined) {
         res.status(400).json({ error: 'Request body must contain { data }.' });
         return;
@@ -3605,8 +4318,34 @@ async function startServer() {
 
       // Guardrail: never allow an empty array sync/import payload to wipe out any existing collection.
       if (Array.isArray(data) && data.length === 0) {
-        res.json({ ok: true, skippedEmptyOverwrite: true, syncVersion: getSyncVersion() });
+        res.json({
+          ok: true,
+          skippedEmptyOverwrite: true,
+          syncVersion: getSyncVersion(),
+          collectionVersion: getCollectionVersionInfo(key).version,
+        });
         return;
+      }
+
+      if (expectedVersion !== undefined) {
+        const currentVerInfo = getCollectionVersionInfo(key);
+        if (
+          currentVerInfo.version > expectedVersion &&
+          currentVerInfo.clientId &&
+          sourceClientId &&
+          currentVerInfo.clientId !== sourceClientId
+        ) {
+          const fullState = await getFullSyncState(actor);
+          res.status(409).json({
+            conflict: true,
+            error: `Newer changes for "${key}" exist on the server from another device.`,
+            collectionKey: key,
+            latestVersion: currentVerInfo.version,
+            latestData: fullState[key],
+            syncVersion: getSyncVersion(),
+          });
+          return;
+        }
       }
 
       try {
@@ -3619,6 +4358,7 @@ async function startServer() {
                 await upsertProductRow(txDb, item);
               }
             }
+            bumpCollectionVersion('products', sourceClientId);
           } else if (key === 'categories' && Array.isArray(data)) {
             // Non-destructive upsert only: never delete existing categories omitted from sync/import payload
             const incoming = (data as CategoryRecord[]).map(normalizeUpcomingCategoryRecord);
@@ -3634,6 +4374,7 @@ async function startServer() {
                 await upsertCategoryRow(txDb, cat);
               }
             }
+            bumpCollectionVersion('categories', sourceClientId);
           } else if (key === 'customers' && Array.isArray(data)) {
             // Non-destructive upsert only: preserve existing PINs, createdAt, and omitted fields; never delete missing customers
             const incoming = data as Customer[];
@@ -3648,9 +4389,11 @@ async function startServer() {
                 });
               }
             }
+            bumpCollectionVersion('customers', sourceClientId);
           } else if (key === 'cities' && Array.isArray(data)) {
             await replaceCitiesAndAreasFromList(txDb, data as DeliveryCityConfig[]);
             await syncDeliveryCitiesIntoBusinessProfile(txDb);
+            bumpCollectionVersion('cities', sourceClientId);
           } else if (key === 'business_profile' && typeof data === 'object' && data !== null) {
             const incomingBp = data as BusinessProfile;
             const currentBp = await getCollectionValue<BusinessProfile>(txDb, 'business_profile', defaultBusinessProfile);
@@ -3667,10 +4410,15 @@ async function startServer() {
             if (Array.isArray(mergedBp.deliveryCities)) {
               await replaceCitiesAndAreasFromList(txDb, mergedBp.deliveryCities);
             }
-            await saveCollectionValue(txDb, 'business_profile', {
-              ...mergedBp,
-              deliveryCities: await getAllCitiesFromDb(txDb),
-            });
+            await saveCollectionValue(
+              txDb,
+              'business_profile',
+              {
+                ...mergedBp,
+                deliveryCities: await getAllCitiesFromDb(txDb),
+              },
+              sourceClientId
+            );
           } else if (key === 'user_accounts' && Array.isArray(data)) {
             const existingAccounts = await getCollectionValue<UserAccount[]>(txDb, 'user_accounts', []);
             const byId = new Map(existingAccounts.map((u) => [u.id, u]));
@@ -3706,7 +4454,7 @@ async function startServer() {
                 };
               }
             }
-            await saveCollectionValue(txDb, 'user_accounts', working);
+            await saveCollectionValue(txDb, 'user_accounts', working, sourceClientId);
           } else if (key === 'review_rewards' && Array.isArray(data) && !isAdmin && !isManager && !isStaff) {
             // Non-admin customers may only add their own pending review submissions non-destructively
             const currentReviews = await getCollectionValue<ReviewRewardSubmission[]>(txDb, 'review_rewards', []);
@@ -3726,11 +4474,13 @@ async function startServer() {
                 currentReviews.unshift(sanitized);
               }
             }
-            await saveCollectionValue(txDb, 'review_rewards', currentReviews);
+            await saveCollectionValue(txDb, 'review_rewards', currentReviews, sourceClientId);
           } else if (Array.isArray(data)) {
-            await mergeCollectionArrayNonDestructively(txDb, key, data as Array<Record<string, unknown>>);
+            await mergeCollectionArrayNonDestructively(txDb, key, data as Array<Record<string, unknown>>, {
+              sourceClientId,
+            });
           } else {
-            await saveCollectionValue(txDb, key, data);
+            await saveCollectionValue(txDb, key, data, sourceClientId);
           }
         });
       } catch (err) {
@@ -3738,8 +4488,12 @@ async function startServer() {
         return;
       }
 
-      broadcastSyncEvent(key, req.header('x-client-id'));
-      res.json({ ok: true, syncVersion: getSyncVersion() });
+      broadcastSyncEvent(key, sourceClientId);
+      res.json({
+        ok: true,
+        syncVersion: getSyncVersion(),
+        collectionVersion: getCollectionVersionInfo(key).version,
+      });
     })
   );
 
@@ -5341,30 +6095,16 @@ async function startServer() {
     path.resolve(process.cwd(), 'dist'),
     path.resolve(serverDir, 'dist'),
   ];
-  let distDir =
+  const distDir =
     distDirCandidates.find((dir) => fs.existsSync(path.join(dir, 'index.html'))) || distDirCandidates[0];
-  let hasBuiltDist = fs.existsSync(path.join(distDir, 'index.html'));
+  const hasBuiltDist = fs.existsSync(path.join(distDir, 'index.html'));
   const isProduction =
     process.env.NODE_ENV === 'production' ||
     Boolean(process.env.K_SERVICE) ||
     (process.env.NODE_ENV !== 'development' && hasBuiltDist);
 
-  // If deployed in production via Git without pre-built dist/, build Vite dist automatically once before serving
-  if (isProduction && !hasBuiltDist) {
-    try {
-      console.log('[Build] dist/index.html not found in production; building Vite bundle automatically...');
-      const { build: viteBuild } = await import('vite');
-      await viteBuild();
-      distDir =
-        distDirCandidates.find((dir) => fs.existsSync(path.join(dir, 'index.html'))) || distDirCandidates[0];
-      hasBuiltDist = fs.existsSync(path.join(distDir, 'index.html'));
-    } catch (buildErr) {
-      console.error('[Build] Automatic production Vite build failed:', buildErr);
-    }
-  }
-
-  // Frontend middleware / static dist serving
-  if (!isProduction || !hasBuiltDist) {
+  // Frontend middleware / static dist serving (production NEVER starts Vite dev middleware)
+  if (!isProduction) {
     const { createServer: createViteServer } = await import('vite');
     const vitePromise = createViteServer({
       server: {
@@ -5381,6 +6121,23 @@ async function startServer() {
       vitePromise
         .then((vite) => vite.middlewares(req, res, next))
         .catch(next);
+    });
+  } else if (!hasBuiltDist) {
+    app.get('*', (_req, res) => {
+      res.status(503);
+      res.setHeader('Retry-After', '10');
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+      res.type('text/html').send(`<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MadinaMarket — Build Updating</title></head>
+<body style="font-family:system-ui,sans-serif;background:#0f172a;color:#f8fafc;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;padding:24px;">
+  <div style="max-width:440px;background:#1e293b;border:1px solid #334155;border-radius:16px;padding:24px;text-align:center;">
+    <h1 style="margin:0 0 8px;font-size:20px;color:#ffd200;">MadinaMarket App Updating</h1>
+    <p style="margin:0 0 16px;font-size:14px;color:#cbd5e1;line-height:1.5;">The production frontend bundle is not built yet (<code>dist/index.html</code> missing). Run <code>npm run build</code> and refresh this page. All database records remain safe.</p>
+    <button onclick="location.reload()" style="background:#ffd200;color:#0f172a;border:0;border-radius:8px;padding:10px 18px;font-weight:700;cursor:pointer;">Reload Page</button>
+  </div>
+</body>
+</html>`);
     });
   } else {
     app.use(
@@ -5410,17 +6167,19 @@ async function startServer() {
     });
   }
 
+  const modeLabel = isProduction
+    ? hasBuiltDist
+      ? 'production-dist'
+      : 'production-build-missing'
+    : 'vite-dev';
+
   if (typeof PORT === 'string') {
     httpServer.listen(PORT, () => {
-      console.log(
-        `100DAGAR Full-Stack Server running on socket ${PORT} (${isProduction && hasBuiltDist ? 'production-dist' : 'vite-dev'})`
-      );
+      console.log(`100DAGAR Full-Stack Server running on socket ${PORT} (${modeLabel})`);
     });
   } else {
     httpServer.listen(PORT, HOST, () => {
-      console.log(
-        `100DAGAR Full-Stack Server running on http://${HOST}:${PORT} (${isProduction && hasBuiltDist ? 'production-dist' : 'vite-dev'})`
-      );
+      console.log(`100DAGAR Full-Stack Server running on http://${HOST}:${PORT} (${modeLabel})`);
     });
   }
 

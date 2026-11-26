@@ -78,6 +78,7 @@ import {
   addCategory,
   subscribeToServerSync,
   setSessionToken,
+  apiLogout,
   apiSubmitCheckoutOrder,
   apiUpdateCODOrderStatus,
   apiAuditAndRepairOrders,
@@ -1319,6 +1320,7 @@ export default function App() {
   };
 
   const handleLogout = () => {
+    void apiLogout();
     setSessionToken(null);
     setActiveRole('customer');
     saveActiveRole('customer');
@@ -1947,6 +1949,15 @@ export default function App() {
               saveCurrentUser(updatedUser);
               setCustomers(getCustomers());
               pushToast('Password changed successfully.', 'success');
+            }}
+            onUsernameChanged={(nextUsername) => {
+              const updatedUser: AppUser = {
+                ...currentUser,
+                username: nextUsername,
+              };
+              setCurrentUser(updatedUser);
+              saveCurrentUser(updatedUser);
+              pushToast(`Username updated to @${nextUsername}.`, 'success');
             }}
           />
         )}

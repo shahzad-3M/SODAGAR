@@ -42,9 +42,9 @@ import {
   apiChangeOwnPassword,
   apiFetchCrmTickets,
   apiSaveCrmTicket,
+  apiUpdateUsername,
   createUserAccount,
   getDefaultPinForPhone,
-  getSessionToken,
   getUserAccounts,
   updateCustomerPin,
   updateUserAccount,
@@ -78,6 +78,7 @@ interface CustomerPortalViewProps {
   onOpenCart?: () => void;
   onNavigateTab: (tab: string) => void;
   onPasswordChanged?: () => void;
+  onUsernameChanged?: (newUsername: string) => void;
   onUpdateCustomer?: (updated: Customer) => void;
 }
 
@@ -92,6 +93,7 @@ export const CustomerPortalView: React.FC<CustomerPortalViewProps> = ({
   onOpenCart,
   onNavigateTab,
   onPasswordChanged,
+  onUsernameChanged,
   onUpdateCustomer,
 }) => {
   const [activeTab, setActiveTab] = useState<CustomerPortalTab>(initialTab);
@@ -113,7 +115,7 @@ export const CustomerPortalView: React.FC<CustomerPortalViewProps> = ({
   const [whatsappNumber, setWhatsappNumber] = useState(customer?.whatsapp || customer?.phone || '');
   const [addrSavedMsg, setAddrSavedMsg] = useState('');
 
-  // Change Password State
+  // Change Password & Username State
   const [currentPasswordInput, setCurrentPasswordInput] = useState('');
   const [newPasswordInput, setNewPasswordInput] = useState('');
   const [confirmPasswordInput, setConfirmPasswordInput] = useState('');
@@ -121,6 +123,14 @@ export const CustomerPortalView: React.FC<CustomerPortalViewProps> = ({
   const [securityError, setSecurityError] = useState('');
   const [securitySuccess, setSecuritySuccess] = useState('');
   const [isUpdatingPassword, setIsUpdatingPassword] = useState(false);
+  const [usernameInput, setUsernameInput] = useState(currentUser.username || '');
+  const [isUpdatingUsername, setIsUpdatingUsername] = useState(false);
+  const [usernameError, setUsernameError] = useState('');
+  const [usernameSuccess, setUsernameSuccess] = useState('');
+
+  useEffect(() => {
+    setUsernameInput(currentUser.username || '');
+  }, [currentUser.username]);
 
   // Scoped customer data: strictly filter by customerId or phone
   const customerId = currentUser.customerId || customer?.id;
@@ -297,7 +307,7 @@ export const CustomerPortalView: React.FC<CustomerPortalViewProps> = ({
       return;
     }
 
-    if (getSessionToken()) {
+    if (currentUser.isAuthenticated) {
       const serverRes = await apiChangeOwnPassword(curPass, nextPass);
       if (!serverRes.ok) {
         setSecurityError(serverRes.error || 'Current password is incorrect. Please check and try again.');
@@ -395,7 +405,7 @@ export const CustomerPortalView: React.FC<CustomerPortalViewProps> = ({
                 </span>
               </div>
               <p className="text-xs font-mono text-slate-500 dark:text-slate-400 mt-0.5">
-                Phone: {customer?.phone || currentUser.phone} · Credit Limit: {profile.currencySymbol}{(customer?.creditLimit || 5000).toLocaleString('en-PK')}
+                {currentUser.username ? `@${currentUser.username} · ` : ''}Phone: {customer?.phone || currentUser.phone} · Credit Limit: {profile.currencySymbol}{(customer?.creditLimit || 5000).toLocaleString('en-PK')}
               </p>
             </div>
           </div>
@@ -1254,96 +1264,166 @@ export const CustomerPortalView: React.FC<CustomerPortalViewProps> = ({
         </div>
       )}
 
-      {/* 5. CHANGE PASSWORD / PIN TAB */}
+      {/* 5. CHANGE PASSWORD / PIN & USERNAME TAB */}
       {activeTab === 'security' && (
-        <form onSubmit={handleChangePassword} className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-5 sm:p-6 space-y-4 shadow-xs max-w-lg">
-          <div>
-            <h3 className="text-sm font-black text-slate-900 dark:text-white uppercase tracking-wider flex items-center gap-2">
-              <KeyRound className="w-4 h-4 text-amber-500" />
-              Change Security Password / PIN
-            </h3>
-            <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-              اپنے کھاتے کا سیکیورٹی پاس ورڈ یا پن کوڈ تبدیل کریں (محفوظ سالٹڈ اینکرپشن)
-            </p>
-          </div>
-
-          {securityError && (
-            <div className="p-3 bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-800 rounded-lg text-xs text-red-800 dark:text-red-300 flex items-center gap-2">
-              <AlertCircle className="w-4 h-4 shrink-0" />
-              <span>{securityError}</span>
+        <div className="space-y-5 max-w-lg">
+          <form
+            onSubmit={async (e) => {
+              e.preventDefault();
+              setUsernameError('');
+              setUsernameSuccess('');
+              const clean = usernameInput.trim().replace(/^@+/, '').toLowerCase();
+              if (!/^[a-z0-9_.-]{3,32}$/.test(clean)) {
+                setUsernameError('Username must be 3 to 32 characters (letters, numbers, _, ., or -).');
+                return;
+              }
+              setIsUpdatingUsername(true);
+              const res = await apiUpdateUsername(clean);
+              setIsUpdatingUsername(false);
+              if (!res.ok || !res.username) {
+                setUsernameError(res.error || 'Could not update username.');
+                return;
+              }
+              setUsernameInput(res.username);
+              setUsernameSuccess(`Username saved: @${res.username}`);
+              onUsernameChanged?.(res.username);
+            }}
+            className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-5 sm:p-6 space-y-3 shadow-xs"
+          >
+            <div>
+              <h3 className="text-sm font-black text-slate-900 dark:text-white uppercase tracking-wider flex items-center gap-2">
+                <User className="w-4 h-4 text-amber-500" />
+                Username / Login Handle (یوزرنیم)
+              </h3>
+              <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
+                Sign in with your custom username alongside your mobile number.
+              </p>
             </div>
-          )}
 
-          {securitySuccess && (
-            <div className="p-3 bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 rounded-lg text-xs text-emerald-800 dark:text-emerald-300 flex items-center gap-2">
-              <CheckCircle2 className="w-4 h-4 shrink-0" />
-              <span>{securitySuccess}</span>
+            {usernameError && (
+              <div className="p-2.5 bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-800 rounded-lg text-xs text-red-800 dark:text-red-300 flex items-center gap-2">
+                <AlertCircle className="w-4 h-4 shrink-0" />
+                <span>{usernameError}</span>
+              </div>
+            )}
+
+            {usernameSuccess && (
+              <div className="p-2.5 bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 rounded-lg text-xs text-emerald-800 dark:text-emerald-300 flex items-center gap-2">
+                <CheckCircle2 className="w-4 h-4 shrink-0" />
+                <span>{usernameSuccess}</span>
+              </div>
+            )}
+
+            <div className="flex items-center gap-2">
+              <div className="relative flex-1">
+                <span className="absolute left-3 top-2 text-xs font-mono font-bold text-slate-400">@</span>
+                <input
+                  type="text"
+                  value={usernameInput}
+                  onChange={(e) => setUsernameInput(e.target.value)}
+                  placeholder="your_username"
+                  className="w-full pl-7 pr-3 py-2 text-xs font-mono rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-amber-400 focus:outline-hidden"
+                />
+              </div>
+              <button
+                type="submit"
+                disabled={isUpdatingUsername}
+                className="px-4 py-2 bg-slate-900 hover:bg-slate-800 dark:bg-amber-500 dark:text-slate-950 dark:hover:bg-amber-400 text-white font-black text-xs rounded-xl shadow-xs transition-colors cursor-pointer shrink-0 disabled:opacity-60"
+              >
+                {isUpdatingUsername ? 'Saving...' : 'Save Username'}
+              </button>
             </div>
-          )}
+          </form>
 
-          <div>
-            <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1">
-              Current Password / PIN (موجودہ پن):
-            </label>
-            <input
-              type={showPassword ? 'text' : 'password'}
-              required
-              value={currentPasswordInput}
-              onChange={(e) => setCurrentPasswordInput(e.target.value)}
-              className="w-full px-3 py-2 text-xs font-mono rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-amber-400 focus:outline-hidden"
-              placeholder="••••••"
-            />
-          </div>
+          <form onSubmit={handleChangePassword} className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-5 sm:p-6 space-y-4 shadow-xs">
+            <div>
+              <h3 className="text-sm font-black text-slate-900 dark:text-white uppercase tracking-wider flex items-center gap-2">
+                <KeyRound className="w-4 h-4 text-amber-500" />
+                Change Security Password / PIN
+              </h3>
+              <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
+                اپنے کھاتے کا سیکیورٹی پاس ورڈ یا پن کوڈ تبدیل کریں (محفوظ سالٹڈ اینکرپشن)
+              </p>
+            </div>
 
-          <div>
-            <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1">
-              New Password / PIN (نیا پن):
-            </label>
-            <input
-              type={showPassword ? 'text' : 'password'}
-              required
-              minLength={4}
-              value={newPasswordInput}
-              onChange={(e) => setNewPasswordInput(e.target.value)}
-              className="w-full px-3 py-2 text-xs font-mono rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-amber-400 focus:outline-hidden"
-              placeholder="Min 4 to 6 digits"
-            />
-          </div>
+            {securityError && (
+              <div className="p-3 bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-800 rounded-lg text-xs text-red-800 dark:text-red-300 flex items-center gap-2">
+                <AlertCircle className="w-4 h-4 shrink-0" />
+                <span>{securityError}</span>
+              </div>
+            )}
 
-          <div>
-            <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1">
-              Confirm New Password (تصدیق نیا پن):
-            </label>
-            <input
-              type={showPassword ? 'text' : 'password'}
-              required
-              minLength={4}
-              value={confirmPasswordInput}
-              onChange={(e) => setConfirmPasswordInput(e.target.value)}
-              className="w-full px-3 py-2 text-xs font-mono rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-amber-400 focus:outline-hidden"
-              placeholder="Repeat new PIN"
-            />
-          </div>
+            {securitySuccess && (
+              <div className="p-3 bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 rounded-lg text-xs text-emerald-800 dark:text-emerald-300 flex items-center gap-2">
+                <CheckCircle2 className="w-4 h-4 shrink-0" />
+                <span>{securitySuccess}</span>
+              </div>
+            )}
 
-          <div className="flex items-center justify-between pt-2">
-            <button
-              type="button"
-              onClick={() => setShowPassword(!showPassword)}
-              className="text-xs text-slate-500 hover:text-slate-700 dark:hover:text-slate-300 flex items-center gap-1 cursor-pointer"
-            >
-              {showPassword ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
-              <span>{showPassword ? 'Hide password' : 'Show password'}</span>
-            </button>
+            <div>
+              <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1">
+                Current Password / PIN (موجودہ پن):
+              </label>
+              <input
+                type={showPassword ? 'text' : 'password'}
+                required
+                value={currentPasswordInput}
+                onChange={(e) => setCurrentPasswordInput(e.target.value)}
+                className="w-full px-3 py-2 text-xs font-mono rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-amber-400 focus:outline-hidden"
+                placeholder="••••••"
+              />
+            </div>
 
-            <button
-              type="submit"
-              disabled={isUpdatingPassword}
-              className="px-5 py-2 bg-slate-900 hover:bg-slate-800 dark:bg-amber-500 dark:text-slate-950 dark:hover:bg-amber-400 text-white font-black text-xs rounded-xl shadow-xs transition-colors cursor-pointer"
-            >
-              {isUpdatingPassword ? 'Updating...' : 'Update Password'}
-            </button>
-          </div>
-        </form>
+            <div>
+              <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1">
+                New Password / PIN (نیا پن):
+              </label>
+              <input
+                type={showPassword ? 'text' : 'password'}
+                required
+                minLength={4}
+                value={newPasswordInput}
+                onChange={(e) => setNewPasswordInput(e.target.value)}
+                className="w-full px-3 py-2 text-xs font-mono rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-amber-400 focus:outline-hidden"
+                placeholder="Min 4 to 6 digits"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1">
+                Confirm New Password (تصدیق نیا پن):
+              </label>
+              <input
+                type={showPassword ? 'text' : 'password'}
+                required
+                minLength={4}
+                value={confirmPasswordInput}
+                onChange={(e) => setConfirmPasswordInput(e.target.value)}
+                className="w-full px-3 py-2 text-xs font-mono rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-amber-400 focus:outline-hidden"
+                placeholder="Repeat new PIN"
+              />
+            </div>
+
+            <div className="flex items-center justify-between pt-2">
+              <button
+                type="button"
+                onClick={() => setShowPassword(!showPassword)}
+                className="text-xs text-slate-500 hover:text-slate-700 dark:hover:text-slate-300 flex items-center gap-1 cursor-pointer"
+              >
+                {showPassword ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                <span>{showPassword ? 'Hide password' : 'Show password'}</span>
+              </button>
+
+              <button
+                type="submit"
+                disabled={isUpdatingPassword}
+                className="px-5 py-2 bg-slate-900 hover:bg-slate-800 dark:bg-amber-500 dark:text-slate-950 dark:hover:bg-amber-400 text-white font-black text-xs rounded-xl shadow-xs transition-colors cursor-pointer"
+              >
+                {isUpdatingPassword ? 'Updating...' : 'Update Password'}
+              </button>
+            </div>
+          </form>
+        </div>
       )}
     </div>
   );

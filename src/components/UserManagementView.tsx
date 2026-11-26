@@ -30,7 +30,6 @@ import {
   getLoginAudits,
   getLoginFormConfig,
   getUserAccounts,
-  resetUserPasswordToDefault,
   saveLoginFormConfig,
   updateUserAccount,
   apiAdminResetPassword,
@@ -191,7 +190,7 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
     setIsResetSuccessModalOpen(true);
   };
 
-  // Handle Admin Reset Password to Default Mobile PIN
+  // Handle Admin Reset Password via authoritative server endpoint
   const handleResetPassword = async (user: UserAccount) => {
     if (user.role === 'super_admin') {
       showNotification(
@@ -200,11 +199,21 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
       );
       return;
     }
-    const serverReset = await apiAdminResetPassword(user.id);
-    const result = resetUserPasswordToDefault(user.id);
+    const serverReset = await apiAdminResetPassword(user.id, undefined, user.username);
+    if (!serverReset.ok || !serverReset.tempPin) {
+      showNotification('error', serverReset.error || 'Could not reset password on server.');
+      return;
+    }
     refreshData();
-    const resolvedTempPin = serverReset.ok && serverReset.tempPin ? serverReset.tempPin : result.tempPin;
-    setResetModalData({ user: result.account || user, tempPin: resolvedTempPin });
+    setResetModalData({
+      user: {
+        ...user,
+        username: serverReset.username || user.username,
+        mustChangePassword: true,
+        isTemporaryPassword: true,
+      },
+      tempPin: serverReset.tempPin,
+    });
     setIsResetSuccessModalOpen(true);
   };
 
@@ -1032,12 +1041,20 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
                 <span className="text-slate-500">Account:</span>
                 <span className="font-bold text-slate-900 dark:text-white">{resetModalData.user.fullName}</span>
               </div>
+              {resetModalData.user.username && (
+                <div className="flex justify-between text-xs">
+                  <span className="text-slate-500">Username:</span>
+                  <span className="font-mono font-bold text-amber-700 dark:text-amber-300">
+                    @{resetModalData.user.username}
+                  </span>
+                </div>
+              )}
               <div className="flex justify-between text-xs">
                 <span className="text-slate-500">Mobile Phone:</span>
                 <span className="font-mono text-slate-900 dark:text-white">{resetModalData.user.phone}</span>
               </div>
               <div className="flex justify-between text-xs items-center pt-2 border-t border-slate-200 dark:border-slate-700">
-                <span className="font-bold text-amber-600 dark:text-amber-400">Temporary PIN (Last 6 Digits):</span>
+                <span className="font-bold text-amber-600 dark:text-amber-400">Temporary Password / PIN:</span>
                 <span className="font-mono text-base font-black tracking-widest text-slate-900 dark:text-white bg-[#FFD200]/30 px-2 py-0.5 rounded">
                   {resetModalData.tempPin}
                 </span>

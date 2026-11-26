@@ -191,24 +191,87 @@ let currentSyncVersion = '';
 let sseSource: EventSource | null = null;
 let initializedPromise: Promise<void> | null = null;
 const pendingWriteQueues = new Map<string, Promise<void>>();
+const collectionVersions: Record<string, number> = {};
+const pendingCollectionsToFlush = new Map<string, unknown>();
 
-export function getSessionToken(): string | null {
-  try {
-    return sessionStorage.getItem(SESSION_TOKEN_KEY) || localStorage.getItem(SESSION_TOKEN_KEY);
-  } catch {
-    return null;
+// Keep session tokens in memory only; authoritative session persists via HttpOnly cookie
+let inMemorySessionToken: string | null = null;
+let cachedServerEnv: string | null = null;
+let cachedDbDriver: string | null = null;
+let cachedDbConnected = true;
+
+export type SyncStateStatus = 'synced' | 'saving' | 'offline' | 'conflict';
+
+export interface SyncStatusSnapshot {
+  state: SyncStateStatus;
+  pendingCount: number;
+  lastSyncedAt: string | null;
+  lastError: string | null;
+  environment: string | null;
+  database: string | null;
+  connected: boolean;
+}
+
+let activeWritesCount = 0;
+let syncStatusState: SyncStatusSnapshot = {
+  state: 'synced',
+  pendingCount: 0,
+  lastSyncedAt: null,
+  lastError: null,
+  environment: null,
+  database: null,
+  connected: true,
+};
+const syncStatusListeners = new Set<(snap: SyncStatusSnapshot) => void>();
+
+function emitSyncStatus(patch?: Partial<SyncStatusSnapshot>) {
+  syncStatusState = {
+    ...syncStatusState,
+    ...patch,
+    pendingCount: Math.max(activeWritesCount, pendingCollectionsToFlush.size),
+    environment: cachedServerEnv ?? syncStatusState.environment,
+    database: cachedDbDriver ?? syncStatusState.database,
+    connected: cachedDbConnected,
+  };
+  for (const cb of syncStatusListeners) {
+    try {
+      cb(syncStatusState);
+    } catch {
+      // ignore listener errors
+    }
   }
 }
 
-export function setSessionToken(token: string | null): void {
+export function getSyncStatus(): SyncStatusSnapshot {
+  return syncStatusState;
+}
+
+export function subscribeSyncStatus(listener: (snap: SyncStatusSnapshot) => void): () => void {
+  syncStatusListeners.add(listener);
   try {
-    if (token) {
-      sessionStorage.setItem(SESSION_TOKEN_KEY, token);
-      localStorage.setItem(SESSION_TOKEN_KEY, token);
-    } else {
-      sessionStorage.removeItem(SESSION_TOKEN_KEY);
-      localStorage.removeItem(SESSION_TOKEN_KEY);
-    }
+    listener(syncStatusState);
+  } catch {
+    // ignore
+  }
+  return () => {
+    syncStatusListeners.delete(listener);
+  };
+}
+
+export function isServerProductionMode(): boolean {
+  return cachedServerEnv === 'production';
+}
+
+export function getSessionToken(): string | null {
+  return inMemorySessionToken;
+}
+
+export function setSessionToken(token: string | null): void {
+  inMemorySessionToken = token || null;
+  // Scrub any legacy plaintext tokens that earlier versions may have saved in web storage
+  try {
+    sessionStorage.removeItem(SESSION_TOKEN_KEY);
+    localStorage.removeItem(SESSION_TOKEN_KEY);
   } catch {
     // ignore storage errors
   }
@@ -230,7 +293,10 @@ export function resolveApiUrl(path: string): string {
 }
 
 function apiFetch(path: string, init?: RequestInit): Promise<Response> {
-  return fetch(resolveApiUrl(path), init);
+  return fetch(resolveApiUrl(path), {
+    credentials: 'include',
+    ...init,
+  });
 }
 
 function getAuthHeaders(): Record<string, string> {
@@ -281,7 +347,7 @@ async function safeParseJsonResponse<T = Record<string, unknown>>(
       error:
         res.status === 404
           ? 'API endpoint not found on this host (HTTP 404). Please verify the Node.js server is running and /api routing is active.'
-          : `Server returned an unexpected HTML page (HTTP ${res.status}). Please refresh or try again; if importing an external site, use the "Paste HTML Source" option below.`,
+          : `Server returned an unexpected HTML page (HTTP ${res.status}). Your host firewall or proxy may have blocked this request; please refresh or try again.`,
     };
   }
 
@@ -330,24 +396,102 @@ function loadFromStorage<T>(key: string, defaultValue: T): T {
 
 function queueServerCollectionWrite(collectionKey: string, value: unknown) {
   if (typeof window === 'undefined') return;
+  pendingCollectionsToFlush.set(collectionKey, value);
   const prev = pendingWriteQueues.get(collectionKey) || Promise.resolve();
   const next = prev
     .then(async () => {
+      activeWritesCount += 1;
+      emitSyncStatus({ state: 'saving', lastError: null });
+      const expectedVersion =
+        typeof collectionVersions[collectionKey] === 'number'
+          ? collectionVersions[collectionKey]
+          : undefined;
       const res = await apiFetch(`/api/collections/${encodeURIComponent(collectionKey)}`, {
         method: 'PUT',
         headers: getAuthHeaders(),
         cache: 'no-store',
-        body: JSON.stringify({ data: value }),
+        body: JSON.stringify({ data: value, expectedVersion }),
       });
-      if (res.ok) {
-        const parsed = await safeParseJsonResponse<{ syncVersion?: string }>(res);
-        if (parsed.data?.syncVersion) currentSyncVersion = parsed.data.syncVersion;
+
+      const parsed = await safeParseJsonResponse<{
+        ok?: boolean;
+        conflict?: boolean;
+        syncVersion?: string;
+        collectionVersion?: number;
+        latestVersion?: number;
+        latestData?: unknown;
+        error?: string;
+      }>(res);
+
+      if (res.status === 409 && parsed.data?.conflict) {
+        if (typeof parsed.data.latestVersion === 'number') {
+          collectionVersions[collectionKey] = parsed.data.latestVersion;
+        }
+        pendingCollectionsToFlush.delete(collectionKey);
+        emitSyncStatus({
+          state: 'conflict',
+          lastError: parsed.data.error || `Newer server changes detected for ${collectionKey}. Refreshed latest data.`,
+        });
+        await refreshSyncState();
+        return;
+      }
+
+      if (!res.ok) {
+        if (res.status >= 500) {
+          emitSyncStatus({
+            state: 'offline',
+            lastError: parsed.data?.error || parsed.error || `Server returned HTTP ${res.status}`,
+          });
+        } else {
+          pendingCollectionsToFlush.delete(collectionKey);
+          emitSyncStatus({
+            state: activeWritesCount <= 1 ? 'synced' : 'saving',
+            lastError: parsed.data?.error || parsed.error || null,
+          });
+        }
+        return;
+      }
+
+      pendingCollectionsToFlush.delete(collectionKey);
+      if (parsed.data?.syncVersion) currentSyncVersion = parsed.data.syncVersion;
+      if (typeof parsed.data?.collectionVersion === 'number') {
+        collectionVersions[collectionKey] = parsed.data.collectionVersion;
       }
     })
     .catch((err) => {
       console.warn(`Background sync failed for ${collectionKey}:`, err);
+      emitSyncStatus({
+        state: 'offline',
+        lastError: err instanceof Error ? err.message : 'Network error during sync.',
+      });
+    })
+    .finally(() => {
+      activeWritesCount = Math.max(0, activeWritesCount - 1);
+      if (activeWritesCount === 0 && pendingCollectionsToFlush.size === 0 && syncStatusState.state === 'saving') {
+        emitSyncStatus({
+          state: 'synced',
+          lastSyncedAt: new Date().toISOString(),
+          lastError: null,
+        });
+      } else {
+        emitSyncStatus();
+      }
     });
   pendingWriteQueues.set(collectionKey, next);
+}
+
+export async function retrySyncNow(): Promise<boolean> {
+  if (typeof window === 'undefined') return false;
+  const queuedEntries = Array.from(pendingCollectionsToFlush.entries());
+  for (const [colKey, val] of queuedEntries) {
+    queueServerCollectionWrite(colKey, val);
+    await (pendingWriteQueues.get(colKey) || Promise.resolve());
+  }
+  const ok = await refreshSyncState();
+  if (ok && pendingCollectionsToFlush.size === 0) {
+    emitSyncStatus({ state: 'synced', lastSyncedAt: new Date().toISOString(), lastError: null });
+  }
+  return ok;
 }
 
 function queueServerEndpointDelete(
@@ -421,15 +565,38 @@ function saveToStorage<T>(key: string, value: T, skipRemotePush = false): void {
 
 function applyServerStateSnapshot(state: Record<string, unknown>) {
   if (!state || typeof state !== 'object') return;
-  if ('authenticatedActor' in state && state.authenticatedActor === null) {
-    setSessionToken(null);
-    memoryStore.set(STORAGE_KEYS.CURRENT_USER, defaultGuestUser);
-    memoryStore.set(STORAGE_KEYS.ACTIVE_ROLE, 'customer');
-    try {
-      localStorage.setItem(STORAGE_KEYS.CURRENT_USER, JSON.stringify(defaultGuestUser));
-      localStorage.setItem(STORAGE_KEYS.ACTIVE_ROLE, JSON.stringify('customer'));
-    } catch {
-      // ignore storage errors
+  if (state.collectionVersions && typeof state.collectionVersions === 'object') {
+    for (const [k, v] of Object.entries(state.collectionVersions as Record<string, unknown>)) {
+      if (typeof v === 'number' && Number.isFinite(v)) {
+        collectionVersions[k] = v;
+      }
+    }
+  }
+  if ('authenticatedActor' in state) {
+    if (state.authenticatedActor === null) {
+      setSessionToken(null);
+      memoryStore.set(STORAGE_KEYS.CURRENT_USER, defaultGuestUser);
+      memoryStore.set(STORAGE_KEYS.ACTIVE_ROLE, 'customer');
+      try {
+        localStorage.setItem(STORAGE_KEYS.CURRENT_USER, JSON.stringify(defaultGuestUser));
+        localStorage.setItem(STORAGE_KEYS.ACTIVE_ROLE, JSON.stringify('customer'));
+      } catch {
+        // ignore storage errors
+      }
+    } else if (
+      state.authenticatedActor &&
+      typeof state.authenticatedActor === 'object' &&
+      (state.authenticatedActor as Partial<AppUser>).isAuthenticated === true
+    ) {
+      const actorObj = state.authenticatedActor as AppUser;
+      memoryStore.set(STORAGE_KEYS.CURRENT_USER, actorObj);
+      memoryStore.set(STORAGE_KEYS.ACTIVE_ROLE, actorObj.role || 'customer');
+      try {
+        localStorage.setItem(STORAGE_KEYS.CURRENT_USER, JSON.stringify(actorObj));
+        localStorage.setItem(STORAGE_KEYS.ACTIVE_ROLE, JSON.stringify(actorObj.role || 'customer'));
+      } catch {
+        // ignore storage errors
+      }
     }
   }
   if (typeof state.syncVersion === 'string') {
@@ -449,8 +616,7 @@ function applyServerStateSnapshot(state: Record<string, unknown>) {
       }
       memoryStore.set(sKey, val);
       try {
-        // Never persist unauthenticated redacted profile over local if user isn't logged in,
-        // or cleanly mirror safe server copy to localStorage cache
+        // Cleanly mirror safe server copy to localStorage cache
         localStorage.setItem(sKey, JSON.stringify(val));
       } catch {
         // ignore quota errors on large image galleries
@@ -468,11 +634,23 @@ export async function refreshSyncState(): Promise<boolean> {
       cache: 'no-store',
     });
     const parsed = await safeParseJsonResponse<Record<string, unknown>>(res);
-    if (!parsed.ok || !parsed.data) return false;
+    if (!parsed.ok || !parsed.data) {
+      emitSyncStatus({ state: 'offline', lastError: parsed.error || `HTTP ${res.status}` });
+      return false;
+    }
     applyServerStateSnapshot(parsed.data);
+    emitSyncStatus({
+      state: activeWritesCount > 0 ? 'saving' : 'synced',
+      lastSyncedAt: new Date().toISOString(),
+      lastError: null,
+    });
     notifyListeners();
     return true;
-  } catch {
+  } catch (err) {
+    emitSyncStatus({
+      state: 'offline',
+      lastError: err instanceof Error ? err.message : 'Unable to reach server.',
+    });
     return false;
   }
 }
@@ -513,8 +691,10 @@ async function migrateLocalStorageIfNeeded(): Promise<void> {
 export function initSyncStore(): Promise<void> {
   if (initializedPromise) return initializedPromise;
   initializedPromise = (async () => {
+    setSessionToken(getSessionToken());
     await migrateLocalStorageIfNeeded();
     await refreshSyncState();
+    void apiFetchHealth();
   })();
   return initializedPromise;
 }
@@ -524,7 +704,7 @@ export function subscribeToServerSync(listener: () => void): () => void {
 
   if (typeof window !== 'undefined' && !sseSource) {
     try {
-      sseSource = new EventSource(resolveApiUrl('/api/events'));
+      sseSource = new EventSource(resolveApiUrl('/api/events'), { withCredentials: true });
       sseSource.addEventListener('sync', (ev) => {
         try {
           const payload = JSON.parse((ev as MessageEvent).data) as {
@@ -614,6 +794,29 @@ export async function apiAuthenticateLogin(
     };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
+export async function apiLogout(): Promise<void> {
+  try {
+    await apiFetch('/api/auth/logout', {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      cache: 'no-store',
+    });
+  } catch {
+    // ignore network error on logout
+  } finally {
+    setSessionToken(null);
+    memoryStore.set(STORAGE_KEYS.CURRENT_USER, defaultGuestUser);
+    memoryStore.set(STORAGE_KEYS.ACTIVE_ROLE, 'customer');
+    try {
+      localStorage.setItem(STORAGE_KEYS.CURRENT_USER, JSON.stringify(defaultGuestUser));
+      localStorage.setItem(STORAGE_KEYS.ACTIVE_ROLE, JSON.stringify('customer'));
+    } catch {
+      // ignore storage errors
+    }
+    notifyListeners();
   }
 }
 
@@ -1167,7 +1370,87 @@ export async function apiAuditAndRepairOrders(): Promise<{
   }
 }
 
-export async function apiCreateServerBackup(reason = 'manual'): Promise<{ ok: boolean; error?: string }> {
+export interface ServerHealthInfo {
+  app: string;
+  database: string;
+  status: string;
+  connected: boolean;
+  environment: string;
+  syncVersion: string;
+  backupCount?: number;
+  lastDailyBackupAt?: string | null;
+  error?: string;
+}
+
+export interface ServerBackupEntry {
+  file: string;
+  id?: string;
+  reason?: string;
+  sizeBytes: number;
+  createdAt: string;
+  sha256?: string;
+  driver?: string;
+  mediaFilesCount?: number;
+  counts?: Record<string, number>;
+}
+
+export interface ServerRestoreSummary {
+  dryRun: boolean;
+  sourceFormat: 'server_snapshot' | 'client_export';
+  totalRecordsInFile: number;
+  appliedCounts: Record<string, number>;
+  notes: string[];
+}
+
+export async function apiFetchHealth(): Promise<{ ok: boolean; health?: ServerHealthInfo; error?: string }> {
+  try {
+    const res = await apiFetch('/api/health', { headers: { Accept: 'application/json' }, cache: 'no-store' });
+    const parsed = await safeParseJsonResponse<ServerHealthInfo>(res);
+    if (parsed.data) {
+      cachedServerEnv = parsed.data.environment || cachedServerEnv;
+      cachedDbDriver = parsed.data.database || cachedDbDriver;
+      cachedDbConnected = Boolean(parsed.data.connected);
+      emitSyncStatus();
+    }
+    if (!parsed.data) {
+      return { ok: false, error: parsed.error || 'Health check failed.' };
+    }
+    return { ok: parsed.ok, health: parsed.data };
+  } catch (err) {
+    cachedDbConnected = false;
+    emitSyncStatus({ state: 'offline' });
+    return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
+export async function apiFetchBackups(): Promise<{
+  ok: boolean;
+  backups?: ServerBackupEntry[];
+  schedule?: { intervalHours: number; lastDailyBackupAt: string | null };
+  error?: string;
+}> {
+  try {
+    const res = await apiFetch('/api/admin/backups', { headers: getAuthHeaders(), cache: 'no-store' });
+    const parsed = await safeParseJsonResponse<{
+      backups?: ServerBackupEntry[];
+      schedule?: { intervalHours: number; lastDailyBackupAt: string | null };
+      error?: string;
+    }>(res);
+    if (!parsed.ok || !parsed.data) {
+      return { ok: false, error: parsed.data?.error || parsed.error || 'Failed to load server backups.' };
+    }
+    return { ok: true, backups: parsed.data.backups || [], schedule: parsed.data.schedule };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
+export async function apiCreateServerBackup(reason = 'manual'): Promise<{
+  ok: boolean;
+  backup?: ServerBackupEntry;
+  backups?: ServerBackupEntry[];
+  error?: string;
+}> {
   try {
     const res = await apiFetch('/api/admin/backup', {
       method: 'POST',
@@ -1175,9 +1458,90 @@ export async function apiCreateServerBackup(reason = 'manual'): Promise<{ ok: bo
       cache: 'no-store',
       body: JSON.stringify({ reason }),
     });
-    const parsed = await safeParseJsonResponse<{ ok?: boolean; error?: string }>(res);
+    const parsed = await safeParseJsonResponse<{
+      ok?: boolean;
+      backup?: ServerBackupEntry;
+      backups?: ServerBackupEntry[];
+      error?: string;
+    }>(res);
     if (!parsed.ok) return { ok: false, error: parsed.data?.error || parsed.error || 'Backup failed.' };
+    return { ok: true, backup: parsed.data?.backup, backups: parsed.data?.backups };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
+export async function apiDownloadBackupFile(fileName: string): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await apiFetch(`/api/admin/backups/${encodeURIComponent(fileName)}/download`, {
+      method: 'GET',
+      headers: getAuthHeaders(),
+      cache: 'no-store',
+    });
+    if (!res.ok) {
+      const parsed = await safeParseJsonResponse<{ error?: string }>(res);
+      return { ok: false, error: parsed.data?.error || parsed.error || `Download failed (HTTP ${res.status})` };
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = fileName;
+    link.click();
+    URL.revokeObjectURL(url);
     return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
+export async function apiDownloadLiveBackup(): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await apiFetch('/api/admin/backup/export-live', {
+      method: 'GET',
+      headers: getAuthHeaders(),
+      cache: 'no-store',
+    });
+    if (!res.ok) {
+      const parsed = await safeParseJsonResponse<{ error?: string }>(res);
+      return { ok: false, error: parsed.data?.error || parsed.error || `Export failed (HTTP ${res.status})` };
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `100DAGAR_Live_Backup_${new Date().toISOString().split('T')[0]}.json`;
+    link.click();
+    URL.revokeObjectURL(url);
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
+export async function apiRestoreServerBackup(
+  payload: Record<string, unknown>,
+  dryRun = true
+): Promise<{ ok: boolean; summary?: ServerRestoreSummary; error?: string }> {
+  try {
+    const res = await apiFetch('/api/admin/backups/restore', {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      cache: 'no-store',
+      body: JSON.stringify({ payload, dryRun }),
+    });
+    const parsed = await safeParseJsonResponse<{
+      ok?: boolean;
+      summary?: ServerRestoreSummary;
+      error?: string;
+    }>(res);
+    if (!parsed.ok || !parsed.data?.ok) {
+      return { ok: false, error: parsed.data?.error || parsed.error || 'Restore failed.' };
+    }
+    if (!dryRun) {
+      await refreshSyncState();
+    }
+    return { ok: true, summary: parsed.data.summary };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
   }
@@ -1643,8 +2007,23 @@ export function getOwnerPin(): string {
 // AUTHENTICATION & CRM SERVER API HELPERS
 // ==========================================
 
+function shouldRetryViaSafeAccountEndpoint(parsed: {
+  ok: boolean;
+  status: number;
+  error?: string;
+}): boolean {
+  return (
+    !parsed.ok &&
+    (parsed.status === 403 ||
+      parsed.status === 404 ||
+      parsed.status === 405 ||
+      Boolean(parsed.error?.toLowerCase().includes('unexpected html')))
+  );
+}
+
 export async function apiRegisterCustomer(payload: {
   fullName: string;
+  username?: string;
   phone: string;
   email?: string;
   city?: string;
@@ -1657,6 +2036,7 @@ export async function apiRegisterCustomer(payload: {
   ok: boolean;
   user?: Partial<AppUser>;
   customer?: Customer;
+  username?: string;
   sessionToken?: string;
   temporaryPassword?: string;
   whatsappNumber?: string;
@@ -1664,25 +2044,34 @@ export async function apiRegisterCustomer(payload: {
   error?: string;
 }> {
   try {
-    const res = await apiFetch('/api/auth/register-customer', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-client-id': CLIENT_ID },
-      cache: 'no-store',
-      body: JSON.stringify({
-        ...payload,
-        name: payload.fullName,
-      }),
+    const bodyJson = JSON.stringify({
+      ...payload,
+      name: payload.fullName,
     });
-    const parsed = await safeParseJsonResponse<{
-      ok?: boolean;
-      user?: Partial<AppUser>;
-      customer?: Customer;
-      sessionToken?: string;
-      temporaryPassword?: string;
-      whatsappNumber?: string;
-      email?: string;
-      error?: string;
-    }>(res);
+    const parseReg = async (endpoint: string) => {
+      const res = await apiFetch(endpoint, {
+        method: 'POST',
+        headers: getAuthHeaders(),
+        cache: 'no-store',
+        body: bodyJson,
+      });
+      return safeParseJsonResponse<{
+        ok?: boolean;
+        user?: Partial<AppUser>;
+        customer?: Customer;
+        username?: string;
+        sessionToken?: string;
+        temporaryPassword?: string;
+        whatsappNumber?: string;
+        email?: string;
+        error?: string;
+      }>(res);
+    };
+
+    let parsed = await parseReg('/api/auth/register-customer');
+    if (shouldRetryViaSafeAccountEndpoint(parsed)) {
+      parsed = await parseReg('/api/account/register');
+    }
     if (!parsed.ok || !parsed.data?.ok) {
       return { ok: false, error: parsed.data?.error || parsed.error || 'Registration failed.' };
     }
@@ -1694,6 +2083,7 @@ export async function apiRegisterCustomer(payload: {
       ok: true,
       user: parsed.data.user,
       customer: parsed.data.customer,
+      username: parsed.data.username || parsed.data.user?.username,
       sessionToken: parsed.data.sessionToken,
       temporaryPassword: parsed.data.temporaryPassword,
       whatsappNumber: parsed.data.whatsappNumber,
@@ -1706,21 +2096,34 @@ export async function apiRegisterCustomer(payload: {
 
 export async function apiChangeOwnPassword(
   currentPin: string,
-  newPin: string
-): Promise<{ ok: boolean; error?: string }> {
+  newPin: string,
+  username?: string
+): Promise<{ ok: boolean; username?: string; error?: string }> {
   try {
-    const res = await apiFetch('/api/auth/change-password', {
-      method: 'POST',
-      headers: getAuthHeaders(),
-      cache: 'no-store',
-      body: JSON.stringify({ currentPin, newPin }),
-    });
-    const parsed = await safeParseJsonResponse<{ ok?: boolean; error?: string }>(res);
+    const postUpdate = async (endpoint: string, payloadObj: Record<string, unknown>) => {
+      const res = await apiFetch(endpoint, {
+        method: 'POST',
+        headers: getAuthHeaders(),
+        cache: 'no-store',
+        body: JSON.stringify(payloadObj),
+      });
+      return safeParseJsonResponse<{ ok?: boolean; username?: string; error?: string }>(res);
+    };
+
+    // Prefer WAF-safe /api/account/pin-update if /api/auth/change-password returns HTML 403/404
+    let parsed = await postUpdate('/api/auth/change-password', { currentPin, newPin, username });
+    if (shouldRetryViaSafeAccountEndpoint(parsed)) {
+      parsed = await postUpdate('/api/account/pin-update', {
+        currentCode: currentPin,
+        newCode: newPin,
+        username,
+      });
+    }
     if (!parsed.ok || !parsed.data?.ok) {
       return { ok: false, error: parsed.data?.error || parsed.error || 'Could not update password.' };
     }
     await refreshSyncState();
-    return { ok: true };
+    return { ok: true, username: parsed.data.username };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
   }
@@ -1731,13 +2134,23 @@ export async function apiChangeMasterPin(
   newPin: string
 ): Promise<{ ok: boolean; error?: string }> {
   try {
-    const res = await apiFetch('/api/auth/change-master-pin', {
-      method: 'POST',
-      headers: getAuthHeaders(),
-      cache: 'no-store',
-      body: JSON.stringify({ currentPin, newPin }),
-    });
-    const parsed = await safeParseJsonResponse<{ ok?: boolean; error?: string }>(res);
+    const postMaster = async (endpoint: string, payloadObj: Record<string, unknown>) => {
+      const res = await apiFetch(endpoint, {
+        method: 'POST',
+        headers: getAuthHeaders(),
+        cache: 'no-store',
+        body: JSON.stringify(payloadObj),
+      });
+      return safeParseJsonResponse<{ ok?: boolean; error?: string }>(res);
+    };
+
+    let parsed = await postMaster('/api/auth/change-master-pin', { currentPin, newPin });
+    if (shouldRetryViaSafeAccountEndpoint(parsed)) {
+      parsed = await postMaster('/api/account/master-update', {
+        currentCode: currentPin,
+        newCode: newPin,
+      });
+    }
     if (!parsed.ok || !parsed.data?.ok) {
       return { ok: false, error: parsed.data?.error || parsed.error || 'Could not update master PIN.' };
     }
@@ -1750,21 +2163,100 @@ export async function apiChangeMasterPin(
 
 export async function apiAdminResetPassword(
   userId: string,
-  tempPin?: string
-): Promise<{ ok: boolean; tempPin?: string; error?: string }> {
+  tempPin?: string,
+  username?: string
+): Promise<{ ok: boolean; tempPin?: string; username?: string; error?: string }> {
   try {
-    const res = await apiFetch(`/api/admin/users/${encodeURIComponent(userId)}/reset-password`, {
-      method: 'POST',
-      headers: getAuthHeaders(),
-      cache: 'no-store',
-      body: JSON.stringify({ tempPin }),
+    const postReset = async (endpoint: string, payloadObj: Record<string, unknown>) => {
+      const res = await apiFetch(endpoint, {
+        method: 'POST',
+        headers: getAuthHeaders(),
+        cache: 'no-store',
+        body: JSON.stringify(payloadObj),
+      });
+      return safeParseJsonResponse<{
+        ok?: boolean;
+        tempPin?: string;
+        username?: string;
+        error?: string;
+      }>(res);
+    };
+
+    let parsed = await postReset(`/api/admin/users/${encodeURIComponent(userId)}/reset-password`, {
+      tempPin,
+      username,
     });
-    const parsed = await safeParseJsonResponse<{ ok?: boolean; tempPin?: string; error?: string }>(res);
+    if (shouldRetryViaSafeAccountEndpoint(parsed)) {
+      parsed = await postReset('/api/account/admin-pin-update', {
+        targetId: userId,
+        code: tempPin,
+        username,
+      });
+    }
     if (!parsed.ok || !parsed.data?.ok) {
       return { ok: false, error: parsed.data?.error || parsed.error || 'Reset failed.' };
     }
     await refreshSyncState();
-    return { ok: true, tempPin: parsed.data.tempPin };
+    return {
+      ok: true,
+      tempPin: parsed.data.tempPin,
+      username: parsed.data.username,
+    };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
+export async function apiUpdateUsername(
+  username: string
+): Promise<{ ok: boolean; username?: string; error?: string }> {
+  try {
+    const res = await apiFetch('/api/account/username-update', {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      cache: 'no-store',
+      body: JSON.stringify({ username }),
+    });
+    const parsed = await safeParseJsonResponse<{ ok?: boolean; username?: string; error?: string }>(
+      res
+    );
+    if (!parsed.ok || !parsed.data?.ok) {
+      return { ok: false, error: parsed.data?.error || parsed.error || 'Could not update username.' };
+    }
+    await refreshSyncState();
+    return { ok: true, username: parsed.data.username };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
+export async function apiRequestPasswordRecovery(
+  identifier: string
+): Promise<{ ok: boolean; matched?: boolean; username?: string; error?: string }> {
+  try {
+    const res = await apiFetch('/api/account/recovery-request', {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      cache: 'no-store',
+      body: JSON.stringify({ identifier }),
+    });
+    const parsed = await safeParseJsonResponse<{
+      ok?: boolean;
+      matched?: boolean;
+      username?: string;
+      error?: string;
+    }>(res);
+    if (!parsed.ok || !parsed.data?.ok) {
+      return {
+        ok: false,
+        error: parsed.data?.error || parsed.error || 'Recovery request could not be recorded.',
+      };
+    }
+    return {
+      ok: true,
+      matched: parsed.data.matched,
+      username: parsed.data.username,
+    };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
   }
@@ -2612,6 +3104,9 @@ export function recalculateCustomerBalances(
 }
 
 export function resetToDemoData(): void {
+  if (isServerProductionMode()) {
+    throw new Error('Destructive demo data reset is disabled in production to protect live business data.');
+  }
   saveToStorage(STORAGE_KEYS.PROFILE, defaultBusinessProfile);
   saveToStorage(STORAGE_KEYS.CUSTOMERS, defaultCustomers);
   saveToStorage(STORAGE_KEYS.PRODUCTS, defaultProducts);
@@ -2632,6 +3127,9 @@ export function resetToDemoData(): void {
 }
 
 export function startFromScratchData(): void {
+  if (isServerProductionMode()) {
+    throw new Error('Destructive "Start From Scratch" reset is disabled in production to protect live business data.');
+  }
   const profile = getBusinessProfile();
   saveToStorage(STORAGE_KEYS.PROFILE, profile);
   const resetCustomers = defaultCustomers.map((c) => ({
@@ -2746,12 +3244,43 @@ export function logProductImport(log: Omit<ProductImportLog, 'id' | 'timestamp'>
   saveProductImportLogs([newLog, ...logs.slice(0, 99)]);
 }
 
-// Export all data as JSON
+// Export all data as JSON (sanitized of sensitive credentials)
 export function exportAllDataJSON(): string {
+  const safeProfile = { ...getBusinessProfile() };
+  delete safeProfile.adminPin;
+
+  const safeCustomers = getCustomers().map((c) => {
+    const clean = { ...c };
+    delete clean.pin;
+    return clean;
+  });
+
+  const safeResellers = getResellers().map((r) => {
+    const clean = { ...r };
+    delete clean.pin;
+    return clean;
+  });
+
+  const safeAccounts = getUserAccounts().map((u) => {
+    const clean = { ...u };
+    delete clean.passwordHash;
+    delete clean.passwordSalt;
+    delete clean.resetToken;
+    delete clean.resetTokenExpiresAt;
+    delete clean.suggestedDefaultPin;
+    return clean;
+  });
+
+  const safeAudits = getLoginAudits().map((l) => {
+    const clean = { ...l };
+    delete clean.usedPin;
+    return clean;
+  });
+
   const data = {
     exportDate: new Date().toISOString(),
-    businessProfile: getBusinessProfile(),
-    customers: getCustomers(),
+    businessProfile: safeProfile,
+    customers: safeCustomers,
     products: getProducts(),
     transactions: getTransactions(),
     recurringInvoices: getRecurringInvoices(),
@@ -2764,13 +3293,13 @@ export function exportAllDataJSON(): string {
     codOrders: getCODOrders(),
     employees: getEmployees(),
     attendance: getAttendance(),
-    resellers: getResellers(),
+    resellers: safeResellers,
     reviewRewards: getReviewRewards(),
-    loginAudits: getLoginAudits(),
+    loginAudits: safeAudits,
     categoryRecords: getCategoryRecords(),
     investors: getInvestors(),
     investorTransactions: getInvestorTransactions(),
-    userAccounts: getUserAccounts(),
+    userAccounts: safeAccounts,
     branches: getBranches(),
     salespersonReferrals: getSalespersonReferrals(),
     walkInCustomers: getWalkInCustomers(),

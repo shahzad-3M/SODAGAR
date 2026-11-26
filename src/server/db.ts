@@ -145,6 +145,9 @@ export interface BackupMetadata {
   sqliteFile: string | null;
   jsonFile: string;
   sha256: string;
+  sizeBytes?: number;
+  driver?: DbDriver;
+  mediaFilesCount?: number;
   counts: Record<string, number>;
 }
 
@@ -182,6 +185,40 @@ const DEFAULT_COLLECTION_MAP: Record<string, unknown> = {
 let dbAdapterInstance: DbAdapter | null = null;
 let dbInitPromise: Promise<DbAdapter> | null = null;
 let lastSyncVersion = new Date().toISOString();
+
+const collectionVersionMap = new Map<string, { version: number; updatedAt: string; clientId?: string }>();
+
+export function bumpCollectionVersion(key: string, clientId?: string): number {
+  const prev = collectionVersionMap.get(key);
+  const nextVersion = (prev?.version || 1) + 1;
+  collectionVersionMap.set(key, {
+    version: nextVersion,
+    updatedAt: new Date().toISOString(),
+    clientId: clientId || prev?.clientId,
+  });
+  return nextVersion;
+}
+
+export function getCollectionVersionInfo(key: string): { version: number; updatedAt: string; clientId?: string } {
+  return collectionVersionMap.get(key) || { version: 1, updatedAt: lastSyncVersion };
+}
+
+export function getCollectionVersions(): Record<string, number> {
+  const out: Record<string, number> = {
+    products: collectionVersionMap.get('products')?.version || 1,
+    categories: collectionVersionMap.get('categories')?.version || 1,
+    customers: collectionVersionMap.get('customers')?.version || 1,
+    cities: collectionVersionMap.get('cities')?.version || 1,
+    admin_audit_logs: collectionVersionMap.get('admin_audit_logs')?.version || 1,
+  };
+  for (const key of Object.keys(DEFAULT_COLLECTION_MAP)) {
+    out[key] = collectionVersionMap.get(key)?.version || 1;
+  }
+  for (const [k, v] of collectionVersionMap.entries()) {
+    out[k] = v.version;
+  }
+  return out;
+}
 
 export function getSyncVersion(): string {
   return lastSyncVersion;
@@ -334,9 +371,138 @@ export function getCachedServerSessionSecret(): string {
   return cachedFallbackSessionSecret;
 }
 
+const BACKUP_MANIFEST_PATH = path.join(BACKUP_DIR, 'manifest.json');
+
+function countImportedMediaFiles(): number {
+  const mediaDir = path.join(DATA_DIR, 'imported-media');
+  try {
+    if (!fs.existsSync(mediaDir)) return 0;
+    return fs.readdirSync(mediaDir).filter((f) => !f.startsWith('.')).length;
+  } catch {
+    return 0;
+  }
+}
+
+function readBackupManifest(): BackupMetadata[] {
+  try {
+    if (!fs.existsSync(BACKUP_MANIFEST_PATH)) return [];
+    const parsed = JSON.parse(fs.readFileSync(BACKUP_MANIFEST_PATH, 'utf8'));
+    return Array.isArray(parsed) ? (parsed as BackupMetadata[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeBackupManifest(entries: BackupMetadata[]): void {
+  try {
+    ensureDirectories();
+    fs.writeFileSync(BACKUP_MANIFEST_PATH, JSON.stringify(entries.slice(0, 100), null, 2), 'utf8');
+  } catch {
+    // ignore manifest write failure
+  }
+}
+
+function sanitizeBackupRow(table: string, row: Record<string, unknown>): Record<string, unknown> | null {
+  if (table === 'app_collections') {
+    const colKey = String(row.collection_key || '');
+    if (colKey === 'server_session_secret') return null;
+
+    if (colKey === 'user_accounts' && row.data_json) {
+      const list = parseJsonSafe<Array<Record<string, unknown>>>(row.data_json, []);
+      if (Array.isArray(list)) {
+        const cleaned = list.map((u) => {
+          const copy = { ...u };
+          delete copy.resetToken;
+          delete copy.resetTokenExpiresAt;
+          delete copy.suggestedDefaultPin;
+          return copy;
+        });
+        return { ...row, data_json: JSON.stringify(cleaned) };
+      }
+    }
+
+    if (colKey === 'resellers' && row.data_json) {
+      const list = parseJsonSafe<Array<Record<string, unknown>>>(row.data_json, []);
+      if (Array.isArray(list)) {
+        const cleaned = list.map((r) => {
+          if (typeof r.pin === 'string' && r.pin && !r.pin.startsWith('scrypt:')) {
+            return { ...r, pin: hashSingleSecretString(r.pin) };
+          }
+          return r;
+        });
+        return { ...row, data_json: JSON.stringify(cleaned) };
+      }
+    }
+
+    if (colKey === 'business_profile' && row.data_json) {
+      const bp = parseJsonSafe<Record<string, unknown>>(row.data_json, {});
+      if (bp && typeof bp === 'object') {
+        const copy = { ...bp };
+        delete copy.adminPin;
+        return { ...row, data_json: JSON.stringify(copy) };
+      }
+    }
+
+    if (colKey === 'login_audits' && row.data_json) {
+      const list = parseJsonSafe<Array<Record<string, unknown>>>(row.data_json, []);
+      if (Array.isArray(list)) {
+        const cleaned = list.map((l) => {
+          const copy = { ...l };
+          delete copy.usedPin;
+          return copy;
+        });
+        return { ...row, data_json: JSON.stringify(cleaned) };
+      }
+    }
+  }
+
+  if (table === 'customers' && row.data_json) {
+    const c = parseJsonSafe<Record<string, unknown>>(row.data_json, {});
+    if (c && typeof c === 'object' && typeof c.pin === 'string' && c.pin && !c.pin.startsWith('scrypt:')) {
+      return { ...row, data_json: JSON.stringify({ ...c, pin: hashSingleSecretString(c.pin) }) };
+    }
+  }
+
+  return row;
+}
+
+function pruneOldBackups(): void {
+  try {
+    const files = fs
+      .readdirSync(BACKUP_DIR)
+      .filter((f) => (f.endsWith('.json') || f.endsWith('.db')) && f !== 'manifest.json')
+      .map((f) => {
+        const full = path.join(BACKUP_DIR, f);
+        return { file: f, full, mtimeMs: fs.statSync(full).mtimeMs };
+      })
+      .sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+    const dailyJson = files.filter((f) => f.file.endsWith('.json') && f.file.includes('_scheduled_daily'));
+    const otherJson = files.filter((f) => f.file.endsWith('.json') && !f.file.includes('_scheduled_daily'));
+    const keepIds = new Set<string>();
+    dailyJson.slice(0, 30).forEach((f) => keepIds.add(f.file.replace(/\.json$/, '')));
+    otherJson.slice(0, 20).forEach((f) => keepIds.add(f.file.replace(/\.json$/, '')));
+
+    for (const f of files) {
+      const base = f.file.replace(/\.(json|db)$/, '');
+      if (!keepIds.has(base)) {
+        try {
+          fs.unlinkSync(f.full);
+        } catch {
+          // ignore unlink errors
+        }
+      }
+    }
+  } catch {
+    // ignore retention pruning errors
+  }
+}
+
 export async function createVerifiedBackup(reason: string): Promise<BackupMetadata> {
   ensureDirectories();
-  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const db = await getDb();
+  const createdAt = new Date().toISOString();
+  const timestamp = createdAt.replace(/[:.]/g, '-');
   const safeReason = reason.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 40) || 'manual';
   const id = `bak_${timestamp}_${safeReason}`;
   const sqliteBackupPath = path.join(BACKUP_DIR, `${id}.db`);
@@ -344,11 +510,16 @@ export async function createVerifiedBackup(reason: string): Promise<BackupMetada
 
   let sqliteFile: string | null = null;
   const activeSqlitePath = resolveSqliteDbPath();
-  if (dbAdapterInstance?.driver === 'sqlite' && fs.existsSync(activeSqlitePath) && fs.statSync(activeSqlitePath).size > 0) {
+  if (
+    process.env.NODE_ENV !== 'production' &&
+    db.driver === 'sqlite' &&
+    fs.existsSync(activeSqlitePath) &&
+    fs.statSync(activeSqlitePath).size > 0
+  ) {
     try {
-      if (dbAdapterInstance instanceof SqliteDbAdapter) {
+      if (db instanceof SqliteDbAdapter) {
         const escaped = sqliteBackupPath.replace(/'/g, "''");
-        dbAdapterInstance.rawDb.exec(`VACUUM INTO '${escaped}';`);
+        db.rawDb.exec(`VACUUM INTO '${escaped}';`);
       } else {
         fs.copyFileSync(activeSqlitePath, sqliteBackupPath);
       }
@@ -362,59 +533,143 @@ export async function createVerifiedBackup(reason: string): Promise<BackupMetada
   const snapshot: Record<string, unknown> = {};
   const counts: Record<string, number> = {};
 
-  if (dbAdapterInstance) {
-    const tables = ['categories', 'cities', 'city_areas', 'products', 'customers', 'app_collections', 'admin_audit_logs'];
-    for (const tbl of tables) {
-      try {
-        const rows = await dbAdapterInstance.all(`SELECT * FROM ${tbl}`);
-        snapshot[tbl] = rows;
-        counts[tbl] = rows.length;
-      } catch {
-        counts[tbl] = 0;
+  for (const tbl of EXPECTED_MYSQL_TABLES) {
+    try {
+      const rawRows = await db.all<Record<string, unknown>>(`SELECT * FROM ${tbl}`);
+      const safeRows: Record<string, unknown>[] = [];
+      for (const r of rawRows) {
+        const sanitized = sanitizeBackupRow(tbl, r);
+        if (sanitized) safeRows.push(sanitized);
       }
+      snapshot[tbl] = safeRows;
+      counts[tbl] = safeRows.length;
+    } catch {
+      counts[tbl] = 0;
     }
   }
 
-  const serialized = JSON.stringify(
-    {
-      backupId: id,
-      reason,
-      createdAt: new Date().toISOString(),
-      counts,
-      snapshot,
-    },
-    null,
-    2
-  );
+  const mediaFilesCount = countImportedMediaFiles();
+  const payload = {
+    backupId: id,
+    reason: safeReason,
+    driver: db.driver,
+    createdAt,
+    mediaFilesCount,
+    counts,
+    snapshot,
+  };
+  const serialized = JSON.stringify(payload, null, 2);
   fs.writeFileSync(jsonBackupPath, serialized, 'utf8');
-  const sha256 = crypto.createHash('sha256').update(serialized).digest('hex');
 
-  return {
+  // Integrity verification: ensure written file is readable and parses cleanly
+  const readBack = fs.readFileSync(jsonBackupPath, 'utf8');
+  const verifiedParsed = JSON.parse(readBack) as { backupId?: string };
+  if (verifiedParsed?.backupId !== id) {
+    throw new Error('Backup integrity verification failed.');
+  }
+
+  const sha256 = crypto.createHash('sha256').update(readBack).digest('hex');
+  const sizeBytes = Buffer.byteLength(readBack, 'utf8');
+  const meta: BackupMetadata = {
     id,
-    reason,
-    createdAt: new Date().toISOString(),
+    reason: safeReason,
+    createdAt,
     sqliteFile,
     jsonFile: path.basename(jsonBackupPath),
     sha256,
+    sizeBytes,
+    driver: db.driver,
+    mediaFilesCount,
     counts,
   };
+
+  const prevManifest = readBackupManifest().filter((m) => m.id !== id);
+  writeBackupManifest([meta, ...prevManifest]);
+  pruneOldBackups();
+
+  return meta;
 }
 
-export function listBackups(): Array<{ file: string; sizeBytes: number; createdAt: string }> {
+export function listBackups(): Array<{
+  file: string;
+  id?: string;
+  reason?: string;
+  sizeBytes: number;
+  createdAt: string;
+  sha256?: string;
+  driver?: DbDriver;
+  mediaFilesCount?: number;
+  counts?: Record<string, number>;
+}> {
   ensureDirectories();
+  const manifestByFile = new Map<string, BackupMetadata>();
+  for (const m of readBackupManifest()) {
+    if (m.jsonFile) manifestByFile.set(m.jsonFile, m);
+    if (m.sqliteFile) manifestByFile.set(m.sqliteFile, m);
+  }
+
   return fs
     .readdirSync(BACKUP_DIR)
-    .filter((f) => f.endsWith('.json') || f.endsWith('.db'))
+    .filter((f) => (f.endsWith('.json') || f.endsWith('.db')) && f !== 'manifest.json')
     .map((f) => {
       const stat = fs.statSync(path.join(BACKUP_DIR, f));
+      const meta = manifestByFile.get(f);
       return {
         file: f,
+        id: meta?.id,
+        reason: meta?.reason || (f.includes('_scheduled_daily') ? 'scheduled_daily' : 'manual'),
         sizeBytes: stat.size,
-        createdAt: stat.mtime.toISOString(),
+        createdAt: meta?.createdAt || stat.mtime.toISOString(),
+        sha256: meta?.sha256,
+        driver: meta?.driver,
+        mediaFilesCount: meta?.mediaFilesCount,
+        counts: meta?.counts,
       };
     })
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
-    .slice(0, 30);
+    .slice(0, 50);
+}
+
+export function resolveBackupFilePath(fileName: string): string | null {
+  if (!fileName || typeof fileName !== 'string') return null;
+  if (fileName === 'manifest.json' || fileName.includes('/') || fileName.includes('\\')) return null;
+  const base = path.basename(fileName);
+  if (base !== fileName || (!base.endsWith('.json') && !base.endsWith('.db'))) return null;
+  const resolved = path.resolve(BACKUP_DIR, base);
+  if (!resolved.startsWith(BACKUP_DIR + path.sep)) return null;
+  if (!fs.existsSync(resolved)) return null;
+  return resolved;
+}
+
+export function getLastDailyBackupTimestamp(): string | null {
+  const daily = listBackups().find(
+    (b) => b.file.endsWith('.json') && (b.reason === 'scheduled_daily' || b.file.includes('_scheduled_daily'))
+  );
+  return daily?.createdAt || null;
+}
+
+let dailyBackupPromise: Promise<BackupMetadata | null> | null = null;
+
+export async function runDailyBackupIfNeeded(maxAgeMs = 24 * 60 * 60 * 1000): Promise<BackupMetadata | null> {
+  if (dailyBackupPromise) return dailyBackupPromise;
+  dailyBackupPromise = (async () => {
+    try {
+      const lastIso = getLastDailyBackupTimestamp();
+      if (lastIso) {
+        const lastMs = Date.parse(lastIso);
+        if (Number.isFinite(lastMs) && Date.now() - lastMs < maxAgeMs) {
+          return null;
+        }
+      }
+      return await createVerifiedBackup('scheduled_daily');
+    } catch (err) {
+      console.warn('[Backup] Scheduled daily backup skipped:', err instanceof Error ? err.message : err);
+      return null;
+    } finally {
+      dailyBackupPromise = null;
+    }
+  })();
+  return dailyBackupPromise;
 }
 
 async function ensureMysqlSchemaAndMigrations(db: MysqlDbAdapter): Promise<void> {
@@ -1637,6 +1892,7 @@ export async function upsertCategoryRow(db: DbExecutor, cat: CategoryRecord): Pr
     db.formatTimestamp(preservedCreatedAt),
     db.formatTimestamp(resolvedUpdatedAt),
   ]);
+  bumpCollectionVersion('categories');
 
   return { ...normalized, level, createdAt: preservedCreatedAt, updatedAt: resolvedUpdatedAt };
 }
@@ -1774,6 +2030,7 @@ export async function replaceCitiesAndAreasFromList(db: DbExecutor, incomingCiti
       }
     }
   }
+  bumpCollectionVersion('cities');
 }
 
 export async function getAllProductsFromDb(dbArg?: DbExecutor): Promise<ProductItem[]> {
@@ -2066,6 +2323,7 @@ export async function upsertProductRow(db: DbExecutor, product: ProductItem): Pr
     db.formatTimestamp(resolvedUpdatedAt),
     JSON.stringify(normalizedProduct),
   ]);
+  bumpCollectionVersion('products');
 
   return normalizedProduct;
 }
@@ -2244,6 +2502,7 @@ export async function upsertCustomerRow(db: DbExecutor, customer: Customer): Pro
     db.formatTimestamp(resolvedUpdatedAt),
     JSON.stringify(normalized),
   ]);
+  bumpCollectionVersion('customers');
   return normalized;
 }
 
@@ -2260,7 +2519,12 @@ export async function getCollectionValue<T>(db: DbExecutor, key: string, fallbac
   }
 }
 
-export async function saveCollectionValue(db: DbExecutor, key: string, value: unknown): Promise<void> {
+export async function saveCollectionValue(
+  db: DbExecutor,
+  key: string,
+  value: unknown,
+  sourceClientId?: string
+): Promise<void> {
   const nowSql = db.formatTimestamp();
   const sql = buildUpsertSql({
     driver: db.driver,
@@ -2270,6 +2534,7 @@ export async function saveCollectionValue(db: DbExecutor, key: string, value: un
     updateAssignments: [{ column: 'data_json' }, { column: 'updated_at' }],
   });
   await db.run(sql, [key, JSON.stringify(value), nowSql]);
+  bumpCollectionVersion(key, sourceClientId);
 }
 
 export async function insertAdminAuditLog(
@@ -2338,6 +2603,12 @@ export function hashServerSecret(plainText: string): { hash: string; salt: strin
   };
 }
 
+export function hashSingleSecretString(plainText: string): string {
+  const saltBytes = crypto.randomBytes(16).toString('hex');
+  const derived = crypto.scryptSync(plainText.trim(), saltBytes, 64).toString('hex');
+  return `scrypt:${saltBytes}:${derived}`;
+}
+
 export function verifyServerSecret(
   plainText: string,
   storedHash?: string | null,
@@ -2353,6 +2624,17 @@ export function verifyServerSecret(
     const expected = Buffer.from(expectedHex, 'hex');
     if (derived.length !== expected.length) return false;
     return crypto.timingSafeEqual(derived, expected);
+  }
+
+  if (!storedSalt && storedHash.startsWith('scrypt:')) {
+    const parts = storedHash.split(':');
+    if (parts.length === 3) {
+      const [, rawSalt, expectedHex] = parts;
+      const derived = crypto.scryptSync(trimmed, rawSalt, 64);
+      const expected = Buffer.from(expectedHex, 'hex');
+      if (derived.length !== expected.length) return false;
+      return crypto.timingSafeEqual(derived, expected);
+    }
   }
 
   if (storedSalt && !storedSalt.startsWith('scrypt:')) {
@@ -3604,6 +3886,7 @@ export async function getFullSyncState(actorOrRole?: ActorContext | string): Pro
 
   const state: Record<string, unknown> = {
     syncVersion: lastSyncVersion,
+    collectionVersions: getCollectionVersions(),
     products,
     categories,
     cities: profileWithCities.deliveryCities,
@@ -3704,11 +3987,17 @@ export async function mergeCollectionArrayNonDestructively<T extends Record<stri
   db: DbExecutor,
   key: string,
   incomingArr: T[],
-  options?: { idField?: string }
-): Promise<{ items: T[]; changed: boolean; insertedCount: number; updatedCount: number }> {
+  options?: { idField?: string; sourceClientId?: string }
+): Promise<{
+  items: T[];
+  changed: boolean;
+  insertedCount: number;
+  updatedCount: number;
+  conflictSkippedCount: number;
+}> {
   const currentArr = await getCollectionValue<T[]>(db, key, []);
   if (!Array.isArray(incomingArr) || incomingArr.length === 0) {
-    return { items: currentArr, changed: false, insertedCount: 0, updatedCount: 0 };
+    return { items: currentArr, changed: false, insertedCount: 0, updatedCount: 0, conflictSkippedCount: 0 };
   }
 
   const idField = options?.idField || 'id';
@@ -3723,12 +4012,23 @@ export async function mergeCollectionArrayNonDestructively<T extends Record<stri
 
   let insertedCount = 0;
   let updatedCount = 0;
+  let conflictSkippedCount = 0;
 
   for (const rawItem of incomingArr) {
     if (!rawItem || typeof rawItem !== 'object') continue;
     const itemId = rawItem[idField] ? String(rawItem[idField]) : '';
     const existingIdx = itemId ? byId.get(itemId) : undefined;
     const existing = existingIdx !== undefined ? working[existingIdx] : undefined;
+
+    if (existing && typeof existing.updatedAt === 'string' && typeof rawItem.updatedAt === 'string') {
+      const existingMs = Date.parse(existing.updatedAt);
+      const incomingMs = Date.parse(rawItem.updatedAt);
+      if (Number.isFinite(existingMs) && Number.isFinite(incomingMs) && existingMs > incomingMs) {
+        conflictSkippedCount++;
+        continue;
+      }
+    }
+
     const sanitized = sanitizeAndValidateCollectionItemDates(rawItem, existing, nowIso) as T;
 
     if (existingIdx !== undefined) {
@@ -3745,9 +4045,9 @@ export async function mergeCollectionArrayNonDestructively<T extends Record<stri
 
   const changed = insertedCount > 0 || updatedCount > 0;
   if (changed) {
-    await saveCollectionValue(db, key, working);
+    await saveCollectionValue(db, key, working, options?.sourceClientId);
   }
-  return { items: working, changed, insertedCount, updatedCount };
+  return { items: working, changed, insertedCount, updatedCount, conflictSkippedCount };
 }
 
 export async function mergeLocalSnapshotNonDestructively(localCollections: Record<string, unknown>): Promise<{
@@ -4185,6 +4485,282 @@ export async function auditAndRepairOrderHistory(dbArg?: DbExecutor): Promise<Or
   return result;
 }
 
+export interface RestorePreviewSummary {
+  dryRun: boolean;
+  sourceFormat: 'server_snapshot' | 'client_export';
+  totalRecordsInFile: number;
+  appliedCounts: Record<string, number>;
+  notes: string[];
+}
+
+export async function restoreBackupSnapshotNonDestructively(
+  payload: Record<string, unknown>,
+  options?: { dryRun?: boolean }
+): Promise<RestorePreviewSummary> {
+  const dryRun = options?.dryRun !== false;
+  const appliedCounts: Record<string, number> = {};
+  const notes: string[] = [];
+
+  if (!payload || typeof payload !== 'object') {
+    throw new Error('Backup JSON payload must be an object.');
+  }
+
+  // Normalize either { snapshot: { ...tables } } or legacy client export { businessProfile, customers, products, ... }
+  const isServerSnapshot = Boolean(payload.snapshot && typeof payload.snapshot === 'object');
+  const snapshotObj = (isServerSnapshot ? payload.snapshot : {}) as Record<string, unknown>;
+
+  const normalizedCollections: Record<string, unknown> = {};
+  if (isServerSnapshot) {
+    if (Array.isArray(snapshotObj.categories)) {
+      normalizedCollections.categories = (snapshotObj.categories as Array<Record<string, unknown>>).map((r) => ({
+        id: r.id,
+        name: r.name,
+        urduName: r.urdu_name ?? r.urduName,
+        parentCategoryId: r.parent_category_id ?? r.parentCategoryId,
+        level: r.level,
+        description: r.description,
+        isUpcoming: Boolean(r.is_upcoming ?? r.isUpcoming),
+        isActive: r.is_active === undefined ? true : Boolean(r.is_active),
+        displayOrder: r.display_order ?? r.displayOrder ?? 0,
+        createdAt: r.created_at ?? r.createdAt,
+        updatedAt: r.updated_at ?? r.updatedAt,
+      }));
+    }
+    if (Array.isArray(snapshotObj.products)) {
+      normalizedCollections.products = (snapshotObj.products as Array<Record<string, unknown>>).map((r) =>
+        r.data_json ? parseJsonSafe(r.data_json, r) : r
+      );
+    }
+    if (Array.isArray(snapshotObj.customers)) {
+      normalizedCollections.customers = (snapshotObj.customers as Array<Record<string, unknown>>).map((r) =>
+        r.data_json ? parseJsonSafe(r.data_json, r) : r
+      );
+    }
+    if (Array.isArray(snapshotObj.cities)) {
+      const areaRows = Array.isArray(snapshotObj.city_areas)
+        ? (snapshotObj.city_areas as Array<Record<string, unknown>>)
+        : [];
+      const areasByCity = new Map<string, DeliveryAreaConfig[]>();
+      for (const ar of areaRows) {
+        const cid = String(ar.city_id || '');
+        if (!cid) continue;
+        const list = areasByCity.get(cid) || [];
+        list.push({
+          id: String(ar.id),
+          name: String(ar.name),
+          allowed: Boolean(ar.allowed),
+          deliveryCharge: ar.delivery_charge != null ? Number(ar.delivery_charge) : undefined,
+          areaType: ar.area_type ? (String(ar.area_type) as DeliveryAreaConfig['areaType']) : undefined,
+        });
+        areasByCity.set(cid, list);
+      }
+      normalizedCollections.cities = (snapshotObj.cities as Array<Record<string, unknown>>).map((cr) => ({
+        id: String(cr.id),
+        name: String(cr.name),
+        province: cr.province ? String(cr.province) : undefined,
+        allowed: Boolean(cr.allowed),
+        deliveryCharge: cr.delivery_charge != null ? Number(cr.delivery_charge) : undefined,
+        areas: areasByCity.get(String(cr.id)) || [],
+      }));
+    }
+    if (Array.isArray(snapshotObj.app_collections)) {
+      for (const row of snapshotObj.app_collections as Array<Record<string, unknown>>) {
+        const cKey = String(row.collection_key || '');
+        if (!cKey || cKey === 'server_session_secret') continue;
+        if (row.data_json !== undefined) {
+          normalizedCollections[cKey] = parseJsonSafe(row.data_json, null);
+        }
+      }
+    }
+  } else {
+    const legacyKeyMap: Record<string, string> = {
+      businessProfile: 'business_profile',
+      customers: 'customers',
+      products: 'products',
+      transactions: 'transactions',
+      recurringInvoices: 'recurring_invoices',
+      whatsAppNotifications: 'notifications',
+      reminderTemplates: 'templates',
+      productBroadcasts: 'product_broadcasts',
+      luckyDraws: 'lucky_draws',
+      broadcastContacts: 'broadcast_contacts',
+      savedBroadcasts: 'saved_broadcasts',
+      codOrders: 'cod_orders',
+      employees: 'employees',
+      attendance: 'attendance',
+      resellers: 'resellers',
+      reviewRewards: 'review_rewards',
+      loginAudits: 'login_audits',
+      categoryRecords: 'categories',
+      investors: 'investors',
+      investorTransactions: 'investor_transactions',
+      userAccounts: 'user_accounts',
+      branches: 'branches',
+      salespersonReferrals: 'salesperson_referrals',
+      walkInCustomers: 'walkin_customers',
+      walkInSales: 'walkin_sales',
+      commissionRecords: 'commission_records',
+      importLogs: 'import_logs',
+      wasalSettlements: 'wasal_settlements',
+      monthlyExpenses: 'monthly_expenses',
+      investorOfferings: 'investor_offerings',
+      investorRequests: 'investor_requests',
+    };
+    for (const [legacyKey, targetKey] of Object.entries(legacyKeyMap)) {
+      if (payload[legacyKey] !== undefined) {
+        normalizedCollections[targetKey] = payload[legacyKey];
+      }
+    }
+  }
+
+  let totalRecordsInFile = 0;
+  for (const [k, v] of Object.entries(normalizedCollections)) {
+    if (Array.isArray(v)) {
+      totalRecordsInFile += v.length;
+      if (dryRun) {
+        appliedCounts[k] = v.length;
+      }
+    } else if (v && typeof v === 'object') {
+      totalRecordsInFile += 1;
+      if (dryRun) {
+        appliedCounts[k] = 1;
+      }
+    }
+  }
+
+  if (dryRun) {
+    notes.push('Non-destructive merge preview: existing live database records will be preserved and updated/appended safely.');
+    return {
+      dryRun: true,
+      sourceFormat: isServerSnapshot ? 'server_snapshot' : 'client_export',
+      totalRecordsInFile,
+      appliedCounts,
+      notes,
+    };
+  }
+
+  await withDbTransaction(async (txDb) => {
+    if (Array.isArray(normalizedCollections.categories)) {
+      let count = 0;
+      for (const rawCat of normalizedCollections.categories as CategoryRecord[]) {
+        if (rawCat?.id && rawCat?.name) {
+          await upsertCategoryRow(txDb, normalizeUpcomingCategoryRecord(rawCat));
+          count++;
+        }
+      }
+      if (count > 0) appliedCounts.categories = count;
+    }
+
+    if (Array.isArray(normalizedCollections.cities)) {
+      const citiesList = normalizedCollections.cities as DeliveryCityConfig[];
+      if (citiesList.length > 0) {
+        await replaceCitiesAndAreasFromList(txDb, citiesList);
+        appliedCounts.cities = citiesList.length;
+      }
+    }
+
+    if (Array.isArray(normalizedCollections.products)) {
+      let count = 0;
+      for (const p of normalizedCollections.products as ProductItem[]) {
+        if (p?.id && p?.name) {
+          await upsertProductRow(txDb, p);
+          count++;
+        }
+      }
+      if (count > 0) appliedCounts.products = count;
+    }
+
+    if (Array.isArray(normalizedCollections.customers)) {
+      let count = 0;
+      for (const c of normalizedCollections.customers as Customer[]) {
+        if (c?.id && c?.name) {
+          await upsertCustomerRow(txDb, c);
+          count++;
+        }
+      }
+      if (count > 0) appliedCounts.customers = count;
+    }
+
+    if (normalizedCollections.business_profile && typeof normalizedCollections.business_profile === 'object') {
+      const currentBp = await getCollectionValue<BusinessProfile>(txDb, 'business_profile', defaultBusinessProfile);
+      const incomingBp = normalizedCollections.business_profile as BusinessProfile;
+      const mergedBp = mergePreservingOmittedFields(
+        currentBp as unknown as Record<string, unknown>,
+        incomingBp as unknown as Partial<Record<string, unknown>>
+      ) as unknown as BusinessProfile;
+      delete mergedBp.adminPin;
+      mergedBp.shippingPartner = {
+        ...(currentBp.shippingPartner || {}),
+        ...(incomingBp.shippingPartner || {}),
+        apiKey: incomingBp.shippingPartner?.apiKey || currentBp.shippingPartner?.apiKey || '',
+      } as BusinessProfile['shippingPartner'];
+      await saveCollectionValue(txDb, 'business_profile', mergedBp);
+      appliedCounts.business_profile = 1;
+    }
+
+    for (const key of Object.keys(DEFAULT_COLLECTION_MAP)) {
+      if (key === 'business_profile') continue;
+      const incomingArr = normalizedCollections[key];
+      if (!Array.isArray(incomingArr) || incomingArr.length === 0) continue;
+      const mergedRes = await mergeCollectionArrayNonDestructively(
+        txDb,
+        key,
+        incomingArr as Array<Record<string, unknown>>
+      );
+      if (mergedRes.insertedCount + mergedRes.updatedCount > 0) {
+        appliedCounts[key] = mergedRes.insertedCount + mergedRes.updatedCount;
+      }
+    }
+
+    if (isServerSnapshot && Array.isArray(snapshotObj.crm_loyalty_accounts)) {
+      const sql = buildUpsertSql({
+        driver: txDb.driver,
+        table: 'crm_loyalty_accounts',
+        insertColumns: [
+          'customer_id',
+          'points_balance',
+          'lifetime_points_earned',
+          'lifetime_points_redeemed',
+          'tier',
+          'updated_at',
+        ],
+        conflictColumn: 'customer_id',
+        updateAssignments: [
+          { column: 'points_balance' },
+          { column: 'lifetime_points_earned' },
+          { column: 'lifetime_points_redeemed' },
+          { column: 'tier' },
+          { column: 'updated_at' },
+        ],
+      });
+      let loyaltyCount = 0;
+      for (const acc of snapshotObj.crm_loyalty_accounts as Array<Record<string, unknown>>) {
+        if (!acc?.customer_id) continue;
+        await txDb.run(sql, [
+          String(acc.customer_id),
+          Number(acc.points_balance || 0),
+          Number(acc.lifetime_points_earned || 0),
+          Number(acc.lifetime_points_redeemed || 0),
+          String(acc.tier || 'Bronze'),
+          txDb.formatTimestamp(String(acc.updated_at || new Date().toISOString())),
+        ]);
+        loyaltyCount++;
+      }
+      if (loyaltyCount > 0) appliedCounts.crm_loyalty_accounts = loyaltyCount;
+    }
+  });
+
+  touchSyncVersion();
+  notes.push('Snapshot merged non-destructively into active database.');
+  return {
+    dryRun: false,
+    sourceFormat: isServerSnapshot ? 'server_snapshot' : 'client_export',
+    totalRecordsInFile,
+    appliedCounts,
+    notes,
+  };
+}
+
 export interface HealthCheckResponse {
   app: 'ok';
   database: DbDriver;
@@ -4197,9 +4773,13 @@ export interface HealthCheckResponse {
     schema_migrations: boolean;
   };
   syncVersion: string;
+  collectionVersions: Record<string, number>;
+  backupCount: number;
+  lastDailyBackupAt: string | null;
+  error?: string;
 }
 
-export async function checkDatabaseHealth(): Promise<HealthCheckResponse> {
+export async function checkDatabaseHealth(startupError?: string | null): Promise<HealthCheckResponse> {
   const environment = process.env.NODE_ENV || 'development';
   let driver: DbDriver = 'mysql';
   try {
@@ -4207,6 +4787,9 @@ export async function checkDatabaseHealth(): Promise<HealthCheckResponse> {
   } catch {
     driver = process.env.NODE_ENV === 'production' ? 'mysql' : 'sqlite';
   }
+  const backups = listBackups();
+  const lastDailyBackupAt = getLastDailyBackupTimestamp();
+
   try {
     const db = await getDb();
     await db.ping();
@@ -4228,8 +4811,13 @@ export async function checkDatabaseHealth(): Promise<HealthCheckResponse> {
         schema_migrations: schemaMigrations,
       },
       syncVersion: lastSyncVersion,
+      collectionVersions: getCollectionVersions(),
+      backupCount: backups.length,
+      lastDailyBackupAt,
     };
-  } catch {
+  } catch (err) {
+    const rawMsg = startupError || (err instanceof Error ? err.message : 'Database connection unavailable.');
+    const safeMsg = rawMsg.replace(/mysql:\/\/[^\s]+/gi, 'mysql://***').slice(0, 220);
     return {
       app: 'ok',
       database: driver,
@@ -4242,6 +4830,10 @@ export async function checkDatabaseHealth(): Promise<HealthCheckResponse> {
         schema_migrations: false,
       },
       syncVersion: lastSyncVersion,
+      collectionVersions: getCollectionVersions(),
+      backupCount: backups.length,
+      lastDailyBackupAt,
+      error: safeMsg,
     };
   }
 }

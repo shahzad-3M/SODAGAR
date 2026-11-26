@@ -29,6 +29,8 @@ import {
   apiRegisterCustomer,
   apiChangeOwnPassword,
   apiChangeMasterPin,
+  apiUpdateUsername,
+  apiRequestPasswordRecovery,
 } from '../utils/storage.ts';
 import { getCurrentOrigin, openWhatsAppDirect } from '../utils/whatsapp.ts';
 
@@ -53,6 +55,7 @@ type ModalMode =
 
 interface RegistrationConfirmationState {
   fullName: string;
+  username?: string;
   phone: string;
   whatsappNumber: string;
   email?: string;
@@ -93,6 +96,7 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
 
   // Customer Self-Registration Inputs
   const [regName, setRegName] = useState('');
+  const [regUsername, setRegUsername] = useState('');
   const [regPhone, setRegPhone] = useState('');
   const [regWhatsappSameAsPhone, setRegWhatsappSameAsPhone] = useState(true);
   const [regWhatsapp, setRegWhatsapp] = useState('');
@@ -120,12 +124,16 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
   const [forgotError, setForgotError] = useState('');
   const [forgotSuccess, setForgotSuccess] = useState('');
 
-  // Change Password inside Account Portal
+  // Change Password / Username inside Account Portal
   const [currentPinInput, setCurrentPinInput] = useState('');
   const [newPinInput, setNewPinInput] = useState('');
   const [confirmPinInput, setConfirmPinInput] = useState('');
   const [changePinError, setChangePinError] = useState('');
   const [changePinSuccess, setChangePinSuccess] = useState('');
+  const [isUpdatingPin, setIsUpdatingPin] = useState(false);
+  const [accountUsernameInput, setAccountUsernameInput] = useState(currentUser?.username || '');
+  const [isUpdatingUsername, setIsUpdatingUsername] = useState(false);
+  const [usernameStatusMsg, setUsernameStatusMsg] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
 
   useEffect(() => {
     if (isOpen) {
@@ -140,6 +148,8 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
       setCurrentPinInput('');
       setNewPinInput('');
       setConfirmPinInput('');
+      setUsernameStatusMsg(null);
+      setAccountUsernameInput(currentUser?.username || '');
       setCopiedTempPass(false);
       setWhatsappSentDone(false);
       setEmailOpenedDone(false);
@@ -151,7 +161,7 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
         setModalMode('login');
       }
     }
-  }, [isOpen, currentUser?.isAuthenticated]);
+  }, [isOpen, currentUser?.isAuthenticated, currentUser?.username]);
 
   if (!isOpen) return null;
 
@@ -238,6 +248,7 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
     setRegError('');
 
     const cleanName = regName.trim();
+    const cleanUsername = regUsername.trim().replace(/^@+/, '').toLowerCase();
     const cleanPhone = regPhone.trim();
     const cleanWhatsapp = regWhatsappSameAsPhone ? cleanPhone : regWhatsapp.trim();
     const cleanEmail = regEmail.trim();
@@ -245,6 +256,11 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
 
     if (cleanName.length < 2) {
       setRegError('Please enter your full name (at least 2 characters).');
+      return;
+    }
+
+    if (cleanUsername && !/^[a-z0-9_.-]{3,32}$/.test(cleanUsername)) {
+      setRegError('Username must be 3 to 32 characters (letters, numbers, _, ., or -).');
       return;
     }
 
@@ -266,6 +282,7 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
     setIsRegistering(true);
     const regRes = await apiRegisterCustomer({
       fullName: cleanName,
+      username: cleanUsername || undefined,
       phone: cleanPhone,
       email: cleanEmail || undefined,
       city: cleanCity,
@@ -282,8 +299,10 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
 
     const tempPassword = regRes.temporaryPassword || '';
     const resolvedWhatsapp = regRes.whatsappNumber || cleanWhatsapp;
+    const resolvedUsername = regRes.username || regRes.user.username || cleanUsername || undefined;
     const confirmedUser: Partial<AppUser> & { role: UserRole } = {
       ...regRes.user,
+      username: resolvedUsername,
       role: 'customer',
       whatsapp: resolvedWhatsapp,
       whatsappSameAsPhone: regWhatsappSameAsPhone,
@@ -297,6 +316,7 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
 
     setRegConfirmation({
       fullName: cleanName,
+      username: resolvedUsername,
       phone: cleanPhone,
       whatsappNumber: resolvedWhatsapp,
       email: regRes.email || cleanEmail || undefined,
@@ -315,6 +335,7 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
       `Assalam-o-Alaikum ${conf.fullName}!`,
       `Your 100DAGAR customer account is registered and confirmed.`,
       ``,
+      ...(conf.username ? [`Username: @${conf.username}`] : []),
       `Login Mobile: ${conf.phone}`,
       `Notification WhatsApp: ${conf.whatsappNumber}`,
       ...(conf.email ? [`Email: ${conf.email}`] : []),
@@ -377,7 +398,7 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
   };
 
   // FORGOT PASSWORD HELPLINE HANDLER (Admin-verified reset only; no client-side token printing)
-  const handleRequestAdminReset = (e: React.FormEvent) => {
+  const handleRequestAdminReset = async (e: React.FormEvent) => {
     e.preventDefault();
     setForgotError('');
     setForgotSuccess('');
@@ -386,8 +407,13 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
       setForgotError('Please enter your registered mobile number, email, or username.');
       return;
     }
+    const recRes = await apiRequestPasswordRecovery(clean);
+    if (!recRes.ok && recRes.error?.toLowerCase().includes('too many')) {
+      setForgotError(recRes.error);
+      return;
+    }
     logUserLogin({
-      userName: clean,
+      userName: recRes.username ? `@${recRes.username}` : clean,
       phone: clean,
       role: 'customer',
       status: 'failed',
@@ -400,7 +426,7 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
       `Assalam-o-Alaikum! I need an administrator-verified temporary password reset for my 100DAGAR account (${clean}) on ${getCurrentOrigin() || 'the portal'}. Please send a temporary password to my registered WhatsApp / Email.`
     );
     setForgotSuccess(
-      `Recovery request opened for "${clean}". Store support (${supportNumber}) will verify your identity and send a temporary password to your registered WhatsApp / Email.`
+      `Recovery request recorded for "${clean}". Store support (${supportNumber}) will verify your identity and send a temporary password to your registered WhatsApp / Email.`
     );
   };
 
@@ -428,10 +454,12 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
     const curPin = currentPinInput.trim();
     const nextPin = newPinInput.trim();
 
+    setIsUpdatingPin(true);
     const res =
       currentUser.role === 'super_admin'
         ? await apiChangeMasterPin(curPin, nextPin)
         : await apiChangeOwnPassword(curPin, nextPin);
+    setIsUpdatingPin(false);
 
     if (!res.ok) {
       setChangePinError(res.error || 'Could not update password / PIN.');
@@ -447,6 +475,38 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
     setCurrentPinInput('');
     setNewPinInput('');
     setConfirmPinInput('');
+  };
+
+  const handleSaveAccountUsername = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setUsernameStatusMsg(null);
+    const clean = accountUsernameInput.trim().replace(/^@+/, '').toLowerCase();
+    if (!/^[a-z0-9_.-]{3,32}$/.test(clean)) {
+      setUsernameStatusMsg({
+        type: 'err',
+        text: 'Username must be 3 to 32 characters (letters, numbers, _, ., or -).',
+      });
+      return;
+    }
+    setIsUpdatingUsername(true);
+    const res = await apiUpdateUsername(clean);
+    setIsUpdatingUsername(false);
+    if (!res.ok || !res.username) {
+      setUsernameStatusMsg({
+        type: 'err',
+        text: res.error || 'Could not update username.',
+      });
+      return;
+    }
+    setAccountUsernameInput(res.username);
+    onSelectRole(currentUser.role, {
+      ...currentUser,
+      username: res.username,
+    });
+    setUsernameStatusMsg({
+      type: 'ok',
+      text: `Username updated to @${res.username}`,
+    });
   };
 
   const renderSupportFooter = (hintText = 'Need help signing in or registering?') => (
@@ -706,20 +766,38 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
                 </div>
               </div>
 
-              <div>
-                <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1">
-                  Mobile Number (موبائل نمبر) *
-                </label>
-                <div className="relative">
-                  <Phone className="w-4 h-4 absolute left-3 top-2.5 text-slate-400" />
-                  <input
-                    type="tel"
-                    required
-                    placeholder="0300 1234567"
-                    value={regPhone}
-                    onChange={(e) => setRegPhone(e.target.value)}
-                    className="w-full pl-9 pr-3 py-2 text-xs font-mono rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-amber-400 focus:outline-hidden"
-                  />
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                <div>
+                  <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1">
+                    Username (یوزرنیم - اختیاری)
+                  </label>
+                  <div className="relative">
+                    <span className="absolute left-3 top-2 text-xs font-mono font-bold text-slate-400">@</span>
+                    <input
+                      type="text"
+                      placeholder="tariq_123"
+                      value={regUsername}
+                      onChange={(e) => setRegUsername(e.target.value)}
+                      className="w-full pl-7 pr-3 py-2 text-xs font-mono rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-amber-400 focus:outline-hidden"
+                    />
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1">
+                    Mobile Number (موبائل نمبر) *
+                  </label>
+                  <div className="relative">
+                    <Phone className="w-4 h-4 absolute left-3 top-2.5 text-slate-400" />
+                    <input
+                      type="tel"
+                      required
+                      placeholder="0300 1234567"
+                      value={regPhone}
+                      onChange={(e) => setRegPhone(e.target.value)}
+                      className="w-full pl-9 pr-3 py-2 text-xs font-mono rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-amber-400 focus:outline-hidden"
+                    />
+                  </div>
                 </div>
               </div>
 
@@ -835,6 +913,14 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
             </div>
 
             <div className="p-3.5 rounded-xl bg-slate-50 dark:bg-slate-800/70 border border-slate-200 dark:border-slate-700 space-y-2 text-xs">
+              {regConfirmation.username && (
+                <div className="flex items-center justify-between">
+                  <span className="text-slate-500 dark:text-slate-400">Username Login ID:</span>
+                  <span className="font-mono font-bold text-amber-700 dark:text-amber-300">
+                    @{regConfirmation.username}
+                  </span>
+                </div>
+              )}
               <div className="flex items-center justify-between">
                 <span className="text-slate-500 dark:text-slate-400">Mobile Login ID:</span>
                 <span className="font-mono font-bold text-slate-900 dark:text-white">
@@ -1087,7 +1173,7 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
                 <input
                   type="text"
                   required
-                  placeholder="0300 1234567 or email"
+                  placeholder="0300 1234567, email, or username"
                   value={forgotIdentifier}
                   onChange={(e) => setForgotIdentifier(e.target.value)}
                   className="w-full px-3 py-2 text-xs font-mono rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-amber-400 focus:outline-hidden"
@@ -1119,6 +1205,11 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
                       {currentUser.role.replace('_', ' ')}
                     </span>
                   </h3>
+                  {currentUser.username && (
+                    <span className="text-xs font-mono font-semibold text-amber-700 dark:text-amber-300 block mt-0.5">
+                      Username: @{currentUser.username}
+                    </span>
+                  )}
                   {currentUser.phone && (
                     <span className="text-xs font-mono text-slate-500 dark:text-slate-400 block mt-0.5">
                       Mobile: {currentUser.phone}
@@ -1155,6 +1246,52 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
                 </button>
               </div>
             </div>
+
+            {/* Username / Login ID Update */}
+            <form onSubmit={handleSaveAccountUsername} className="border-t border-slate-200 dark:border-slate-800 pt-3.5 space-y-2 text-xs">
+              <div className="flex items-center justify-between gap-2">
+                <label className="font-bold text-slate-900 dark:text-white flex items-center gap-1.5">
+                  <User className="w-3.5 h-3.5 text-amber-600" />
+                  <span>Username / Login Handle (یوزرنیم)</span>
+                </label>
+                <span className="text-[11px] text-slate-400">Optional sign-in ID</span>
+              </div>
+              {usernameStatusMsg && (
+                <div
+                  className={`p-2 rounded-lg text-xs flex items-center gap-1.5 ${
+                    usernameStatusMsg.type === 'ok'
+                      ? 'bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300'
+                      : 'bg-red-50 dark:bg-red-950/40 text-red-700 dark:text-red-300'
+                  }`}
+                >
+                  {usernameStatusMsg.type === 'ok' ? (
+                    <Check className="w-3.5 h-3.5 shrink-0" />
+                  ) : (
+                    <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                  )}
+                  <span>{usernameStatusMsg.text}</span>
+                </div>
+              )}
+              <div className="flex items-center gap-2">
+                <div className="relative flex-1">
+                  <span className="absolute left-2.5 top-1.5 font-mono font-bold text-slate-400">@</span>
+                  <input
+                    type="text"
+                    value={accountUsernameInput}
+                    onChange={(e) => setAccountUsernameInput(e.target.value)}
+                    placeholder="choose_username"
+                    className="w-full pl-7 pr-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white font-mono text-xs"
+                  />
+                </div>
+                <button
+                  type="submit"
+                  disabled={isUpdatingUsername}
+                  className="px-3 py-1.5 bg-slate-200 hover:bg-slate-300 dark:bg-slate-700 dark:hover:bg-slate-600 text-slate-900 dark:text-white font-bold rounded-lg cursor-pointer shrink-0 disabled:opacity-60"
+                >
+                  {isUpdatingUsername ? 'Saving...' : 'Save Username'}
+                </button>
+              </div>
+            </form>
 
             {/* In-Portal Change Password Form */}
             <div className="border-t border-slate-200 dark:border-slate-800 pt-4 space-y-3">
@@ -1223,9 +1360,10 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
 
                 <button
                   type="submit"
-                  className="w-full py-2 bg-slate-900 hover:bg-slate-800 dark:bg-amber-500 dark:text-slate-950 dark:hover:bg-amber-400 text-white font-bold rounded-lg cursor-pointer transition-colors"
+                  disabled={isUpdatingPin}
+                  className="w-full py-2 bg-slate-900 hover:bg-slate-800 dark:bg-amber-500 dark:text-slate-950 dark:hover:bg-amber-400 text-white font-bold rounded-lg cursor-pointer transition-colors disabled:opacity-60"
                 >
-                  Update &amp; Save New Password
+                  {isUpdatingPin ? 'Updating Password...' : 'Update & Save New Password'}
                 </button>
               </form>
             </div>
