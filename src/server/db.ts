@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type {
   AdminAuditLog,
+  BackupVerificationSummary,
   BusinessProfile,
   CategoryRecord,
   CODOrder,
@@ -20,6 +21,7 @@ import type {
   CRMLoyaltyTier,
   CRMSupportTicket,
   Customer,
+  DatabaseIntegrityCheckResult,
   DeliveryAreaConfig,
   DeliveryCityConfig,
   Investor,
@@ -30,6 +32,7 @@ import type {
   ProductItem,
   Reseller,
   ReviewRewardSubmission,
+  StorageAndDiskTelemetry,
   Transaction,
   UserAccount,
 } from '../types/index.ts';
@@ -105,8 +108,18 @@ export { buildUpsertSql, insertIgnoreKeyword, parseJsonSafe };
 export type { DbAdapter, DbDriver, DbExecutor };
 
 const DATA_DIR = path.resolve(process.cwd(), 'data');
-const BACKUP_DIR = path.join(DATA_DIR, 'backups');
+const DEFAULT_BACKUP_DIR = path.join(DATA_DIR, 'backups');
 const DEFAULT_SQLITE_PATH = path.join(DATA_DIR, 'madinamarket.db');
+
+export const INTERNAL_SERVER_COLLECTION_KEYS = new Set([
+  'server_session_secret',
+  'active_sessions',
+  'system_governance_meta',
+]);
+
+export function isInternalServerCollectionKey(key: string): boolean {
+  return INTERNAL_SERVER_COLLECTION_KEYS.has(key);
+}
 
 function resolveSqliteDbPath(): string {
   const custom = process.env.SQLITE_DB_PATH?.trim();
@@ -114,6 +127,14 @@ function resolveSqliteDbPath(): string {
     return path.resolve(custom);
   }
   return DEFAULT_SQLITE_PATH;
+}
+
+function resolveBackupDir(): string {
+  const custom = process.env.BACKUP_DIR?.trim();
+  if (custom && process.env.NODE_ENV !== 'production') {
+    return path.resolve(custom);
+  }
+  return DEFAULT_BACKUP_DIR;
 }
 
 export const EXPECTED_MYSQL_TABLES = [
@@ -134,6 +155,7 @@ export const EXPECTED_MYSQL_TABLES = [
   'crm_loyalty_ledger',
   'crm_support_tickets',
   'customers',
+  'idempotency_records',
   'products',
   'schema_migrations',
 ] as const;
@@ -231,7 +253,7 @@ export function touchSyncVersion(): string {
 
 function ensureDirectories(sqlitePath?: string) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
-  fs.mkdirSync(BACKUP_DIR, { recursive: true });
+  fs.mkdirSync(resolveBackupDir(), { recursive: true });
   if (sqlitePath) {
     fs.mkdirSync(path.dirname(sqlitePath), { recursive: true });
   }
@@ -371,7 +393,9 @@ export function getCachedServerSessionSecret(): string {
   return cachedFallbackSessionSecret;
 }
 
-const BACKUP_MANIFEST_PATH = path.join(BACKUP_DIR, 'manifest.json');
+function getBackupManifestPath(): string {
+  return path.join(resolveBackupDir(), 'manifest.json');
+}
 
 function countImportedMediaFiles(): number {
   const mediaDir = path.join(DATA_DIR, 'imported-media');
@@ -385,8 +409,9 @@ function countImportedMediaFiles(): number {
 
 function readBackupManifest(): BackupMetadata[] {
   try {
-    if (!fs.existsSync(BACKUP_MANIFEST_PATH)) return [];
-    const parsed = JSON.parse(fs.readFileSync(BACKUP_MANIFEST_PATH, 'utf8'));
+    const manifestPath = getBackupManifestPath();
+    if (!fs.existsSync(manifestPath)) return [];
+    const parsed = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
     return Array.isArray(parsed) ? (parsed as BackupMetadata[]) : [];
   } catch {
     return [];
@@ -396,7 +421,7 @@ function readBackupManifest(): BackupMetadata[] {
 function writeBackupManifest(entries: BackupMetadata[]): void {
   try {
     ensureDirectories();
-    fs.writeFileSync(BACKUP_MANIFEST_PATH, JSON.stringify(entries.slice(0, 100), null, 2), 'utf8');
+    fs.writeFileSync(getBackupManifestPath(), JSON.stringify(entries.slice(0, 100), null, 2), 'utf8');
   } catch {
     // ignore manifest write failure
   }
@@ -405,7 +430,7 @@ function writeBackupManifest(entries: BackupMetadata[]): void {
 function sanitizeBackupRow(table: string, row: Record<string, unknown>): Record<string, unknown> | null {
   if (table === 'app_collections') {
     const colKey = String(row.collection_key || '');
-    if (colKey === 'server_session_secret') return null;
+    if (INTERNAL_SERVER_COLLECTION_KEYS.has(colKey)) return null;
 
     if (colKey === 'user_accounts' && row.data_json) {
       const list = parseJsonSafe<Array<Record<string, unknown>>>(row.data_json, []);
@@ -468,11 +493,12 @@ function sanitizeBackupRow(table: string, row: Record<string, unknown>): Record<
 
 function pruneOldBackups(): void {
   try {
+    const backupDir = resolveBackupDir();
     const files = fs
-      .readdirSync(BACKUP_DIR)
+      .readdirSync(backupDir)
       .filter((f) => (f.endsWith('.json') || f.endsWith('.db')) && f !== 'manifest.json')
       .map((f) => {
-        const full = path.join(BACKUP_DIR, f);
+        const full = path.join(backupDir, f);
         return { file: f, full, mtimeMs: fs.statSync(full).mtimeMs };
       })
       .sort((a, b) => b.mtimeMs - a.mtimeMs);
@@ -504,9 +530,10 @@ export async function createVerifiedBackup(reason: string): Promise<BackupMetada
   const createdAt = new Date().toISOString();
   const timestamp = createdAt.replace(/[:.]/g, '-');
   const safeReason = reason.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 40) || 'manual';
+  const backupDir = resolveBackupDir();
   const id = `bak_${timestamp}_${safeReason}`;
-  const sqliteBackupPath = path.join(BACKUP_DIR, `${id}.db`);
-  const jsonBackupPath = path.join(BACKUP_DIR, `${id}.json`);
+  const sqliteBackupPath = path.join(backupDir, `${id}.db`);
+  const jsonBackupPath = path.join(backupDir, `${id}.json`);
 
   let sqliteFile: string | null = null;
   const activeSqlitePath = resolveSqliteDbPath();
@@ -608,11 +635,12 @@ export function listBackups(): Array<{
     if (m.sqliteFile) manifestByFile.set(m.sqliteFile, m);
   }
 
+  const backupDir = resolveBackupDir();
   return fs
-    .readdirSync(BACKUP_DIR)
+    .readdirSync(backupDir)
     .filter((f) => (f.endsWith('.json') || f.endsWith('.db')) && f !== 'manifest.json')
     .map((f) => {
-      const stat = fs.statSync(path.join(BACKUP_DIR, f));
+      const stat = fs.statSync(path.join(backupDir, f));
       const meta = manifestByFile.get(f);
       return {
         file: f,
@@ -635,8 +663,9 @@ export function resolveBackupFilePath(fileName: string): string | null {
   if (fileName === 'manifest.json' || fileName.includes('/') || fileName.includes('\\')) return null;
   const base = path.basename(fileName);
   if (base !== fileName || (!base.endsWith('.json') && !base.endsWith('.db'))) return null;
-  const resolved = path.resolve(BACKUP_DIR, base);
-  if (!resolved.startsWith(BACKUP_DIR + path.sep)) return null;
+  const backupDir = resolveBackupDir();
+  const resolved = path.resolve(backupDir, base);
+  if (!resolved.startsWith(backupDir + path.sep)) return null;
   if (!fs.existsSync(resolved)) return null;
   return resolved;
 }
@@ -893,6 +922,15 @@ async function ensureMysqlSchemaAndMigrations(db: MysqlDbAdapter): Promise<void>
       data_json LONGTEXT NOT NULL,
       INDEX idx_crm_activity_cust (customer_id(128), created_at)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+    `CREATE TABLE IF NOT EXISTS idempotency_records (
+      id VARCHAR(255) PRIMARY KEY,
+      scope VARCHAR(128) NOT NULL,
+      status_code INT NOT NULL DEFAULT 200,
+      response_json LONGTEXT NOT NULL,
+      created_at VARCHAR(40) NOT NULL,
+      expires_at VARCHAR(40) NOT NULL,
+      INDEX idx_idempotency_expires (expires_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
   ];
 
   for (const ddl of mysqlTableStatements) {
@@ -963,7 +1001,9 @@ async function runSqliteMigrations(db: SqliteDbAdapter, hadExistingDb: boolean) 
     !(await hasMigration('006_product_delivery_fees_and_templates')) ||
     !(await hasMigration('007_fix_broadcast_templates_key')) ||
     !(await hasMigration('008_audit_clean_order_history_and_links')) ||
-    !(await hasMigration('009_crm_schema_and_security_hardening'));
+    !(await hasMigration('009_crm_schema_and_security_hardening')) ||
+    !(await hasMigration('010_expand_wholesale_categories_hierarchy')) ||
+    !(await hasMigration('011_idempotency_and_governance'));
 
   if (hadExistingDb && pendingMigrations) {
     await createVerifiedBackup('pre_migration');
@@ -1768,6 +1808,25 @@ async function runSqliteMigrations(db: SqliteDbAdapter, hadExistingDb: boolean) 
     await recordMigration(
       '010_expand_wholesale_categories_hierarchy',
       'Non-destructively inserted expanded 3-level main categories, subcategories, and major child categories'
+    );
+  }
+
+  // MIGRATION 011: Idempotency records & governance foundation
+  if (!(await hasMigration('011_idempotency_and_governance'))) {
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS idempotency_records (
+        id TEXT PRIMARY KEY,
+        scope TEXT NOT NULL,
+        status_code INTEGER NOT NULL DEFAULT 200,
+        response_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_idempotency_expires ON idempotency_records (expires_at);
+    `);
+    await recordMigration(
+      '011_idempotency_and_governance',
+      'Added idempotency_records table for duplicate payment/order prevention'
     );
   }
 }
@@ -4566,7 +4625,7 @@ export async function restoreBackupSnapshotNonDestructively(
     if (Array.isArray(snapshotObj.app_collections)) {
       for (const row of snapshotObj.app_collections as Array<Record<string, unknown>>) {
         const cKey = String(row.collection_key || '');
-        if (!cKey || cKey === 'server_session_secret') continue;
+        if (!cKey || INTERNAL_SERVER_COLLECTION_KEYS.has(cKey)) continue;
         if (row.data_json !== undefined) {
           normalizedCollections[cKey] = parseJsonSafe(row.data_json, null);
         }
@@ -4837,3 +4896,335 @@ export async function checkDatabaseHealth(startupError?: string | null): Promise
     };
   }
 }
+
+export async function getIdempotencyRecord(
+  dbArg: DbExecutor,
+  rawKey: string,
+  scope: string
+): Promise<{ statusCode: number; response: Record<string, unknown> } | null> {
+  const cleanKey = rawKey.trim().slice(0, 180);
+  const cleanScope = scope.trim().slice(0, 80);
+  if (!cleanKey || !cleanScope) return null;
+  const compositeId = `${cleanScope}::${cleanKey}`;
+  try {
+    const row = await dbArg.get<{
+      status_code: number;
+      response_json: unknown;
+      expires_at: string;
+    }>('SELECT status_code, response_json, expires_at FROM idempotency_records WHERE id = ?', [compositeId]);
+    if (!row) return null;
+    if (row.expires_at && Date.parse(row.expires_at) <= Date.now()) {
+      await dbArg.run('DELETE FROM idempotency_records WHERE id = ?', [compositeId]).catch(() => {});
+      return null;
+    }
+    const parsed = parseJsonSafe<Record<string, unknown>>(row.response_json, {});
+    return {
+      statusCode: Number(row.status_code || 200),
+      response: parsed,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export async function saveIdempotencyRecord(
+  dbArg: DbExecutor,
+  rawKey: string,
+  scope: string,
+  statusCode: number,
+  responseObj: Record<string, unknown>,
+  ttlMs = 1000 * 60 * 60 * 48
+): Promise<void> {
+  const cleanKey = rawKey.trim().slice(0, 180);
+  const cleanScope = scope.trim().slice(0, 80);
+  if (!cleanKey || !cleanScope) return;
+  const compositeId = `${cleanScope}::${cleanKey}`;
+  const nowIso = dbArg.formatTimestamp();
+  const expiresIso = new Date(Date.now() + ttlMs).toISOString();
+  const sql = buildUpsertSql({
+    driver: dbArg.driver,
+    table: 'idempotency_records',
+    insertColumns: ['id', 'scope', 'status_code', 'response_json', 'created_at', 'expires_at'],
+    conflictColumn: 'id',
+    updateAssignments: [
+      { column: 'status_code' },
+      { column: 'response_json' },
+      { column: 'expires_at' },
+    ],
+  });
+  await dbArg.run(sql, [
+    compositeId,
+    cleanScope,
+    statusCode,
+    JSON.stringify(responseObj),
+    nowIso,
+    expiresIso,
+  ]);
+  await dbArg
+    .run('DELETE FROM idempotency_records WHERE expires_at < ?', [new Date().toISOString()])
+    .catch(() => {});
+}
+
+export function getDatabaseIdentityLabel(): string {
+  try {
+    const driver = resolveDbDriver();
+    if (driver === 'mysql') {
+      const cfg = getMysqlConfigFromEnv();
+      return `MySQL · ${cfg.host}:${cfg.port}/${cfg.database}`;
+    }
+  } catch {
+    // fallback to sqlite label below
+  }
+  const sqliteFile = path.basename(resolveSqliteDbPath());
+  return `SQLite · ${sqliteFile}`;
+}
+
+export async function getSchemaMigrationsList(
+  dbArg?: DbExecutor
+): Promise<Array<{ id: string; appliedAt: string; notes?: string }>> {
+  const db = dbArg || (await getDb());
+  try {
+    const rows = await db.all<Record<string, unknown>>(
+      'SELECT id, applied_at, notes FROM schema_migrations ORDER BY applied_at DESC'
+    );
+    return rows.map((r) => ({
+      id: String(r.id),
+      appliedAt: String(r.applied_at || ''),
+      notes: r.notes ? String(r.notes) : undefined,
+    }));
+  } catch {
+    return [];
+  }
+}
+
+export async function runDatabaseIntegrityCheck(
+  dbArg?: DbAdapter
+): Promise<DatabaseIntegrityCheckResult> {
+  const checkedAt = new Date().toISOString();
+  try {
+    const db = dbArg || (await getDb());
+    const missingTables: string[] = [];
+    for (const tbl of EXPECTED_MYSQL_TABLES) {
+      if (!(await db.tableExists(tbl))) {
+        missingTables.push(tbl);
+      }
+    }
+    if (db.driver === 'sqlite' && db instanceof SqliteDbAdapter) {
+      const pragmaRow = db.rawDb.prepare('PRAGMA quick_check(1)').get() as Record<string, unknown> | undefined;
+      const checkVal = String(
+        pragmaRow?.quick_check ?? pragmaRow?.[Object.keys(pragmaRow || {})[0] || ''] ?? ''
+      )
+        .trim()
+        .toLowerCase();
+      if (checkVal !== 'ok') {
+        return {
+          status: 'error',
+          checkedAt,
+          detail: `SQLite quick_check reported: ${checkVal || 'unknown failure'}`,
+          tableCount: EXPECTED_MYSQL_TABLES.length - missingTables.length,
+          missingTables,
+        };
+      }
+      if (missingTables.length > 0) {
+        return {
+          status: 'degraded',
+          checkedAt,
+          detail: `PRAGMA quick_check=ok, but ${missingTables.length} expected table(s) missing`,
+          tableCount: EXPECTED_MYSQL_TABLES.length - missingTables.length,
+          missingTables,
+        };
+      }
+      return {
+        status: 'ok',
+        checkedAt,
+        detail: 'SQLite PRAGMA quick_check passed (ok) & all schema tables present',
+        tableCount: EXPECTED_MYSQL_TABLES.length,
+        missingTables: [],
+      };
+    }
+
+    await db.ping();
+    if (missingTables.length > 0) {
+      return {
+        status: 'degraded',
+        checkedAt,
+        detail: `${missingTables.length} required MySQL table(s) missing: ${missingTables.join(', ')}`,
+        tableCount: EXPECTED_MYSQL_TABLES.length - missingTables.length,
+        missingTables,
+      };
+    }
+    return {
+      status: 'ok',
+      checkedAt,
+      detail: `MySQL ping OK & all ${EXPECTED_MYSQL_TABLES.length} schema tables verified`,
+      tableCount: EXPECTED_MYSQL_TABLES.length,
+      missingTables: [],
+    };
+  } catch (err) {
+    return {
+      status: 'error',
+      checkedAt,
+      detail: err instanceof Error ? err.message : 'Database integrity check failed',
+      tableCount: 0,
+      missingTables: [...EXPECTED_MYSQL_TABLES],
+    };
+  }
+}
+
+export function verifyBackupIntegrity(targetFileName?: string): BackupVerificationSummary {
+  const backups = listBackups().filter((b) => b.file.endsWith('.json'));
+  const lastDailyBackupAt = getLastDailyBackupTimestamp();
+  const target = targetFileName
+    ? backups.find((b) => b.file === targetFileName)
+    : backups[0];
+
+  if (!target) {
+    return {
+      status: 'missing',
+      latestBackupFile: null,
+      latestBackupAt: null,
+      sha256Valid: false,
+      reason: targetFileName
+        ? `Backup file "${targetFileName}" not found on disk.`
+        : 'No verified JSON backup snapshot found on disk yet.',
+      backupCount: backups.length,
+      lastDailyBackupAt,
+    };
+  }
+
+  const resolved = resolveBackupFilePath(target.file);
+  if (!resolved) {
+    return {
+      status: 'missing',
+      latestBackupFile: target.file,
+      latestBackupAt: target.createdAt,
+      sha256Valid: false,
+      reason: 'Backup file could not be resolved on disk.',
+      backupCount: backups.length,
+      lastDailyBackupAt,
+    };
+  }
+
+  try {
+    const raw = fs.readFileSync(resolved, 'utf8');
+    const parsed = JSON.parse(raw) as { backupId?: string; snapshot?: Record<string, unknown> };
+    if (!parsed || typeof parsed !== 'object' || !parsed.snapshot) {
+      return {
+        status: 'mismatch',
+        latestBackupFile: target.file,
+        latestBackupAt: target.createdAt,
+        sha256Valid: false,
+        expectedSha256: target.sha256,
+        reason: 'Backup JSON structure is incomplete (missing snapshot object).',
+        backupCount: backups.length,
+        lastDailyBackupAt,
+      };
+    }
+    const actualSha256 = crypto.createHash('sha256').update(raw).digest('hex');
+    const shaMatches = !target.sha256 || target.sha256 === actualSha256;
+    if (!shaMatches) {
+      return {
+        status: 'mismatch',
+        latestBackupFile: target.file,
+        latestBackupAt: target.createdAt,
+        sha256Valid: false,
+        expectedSha256: target.sha256,
+        actualSha256,
+        reason: 'SHA-256 digest on disk does not match manifest record.',
+        backupCount: backups.length,
+        lastDailyBackupAt,
+      };
+    }
+    const ageMs = Date.now() - Date.parse(target.createdAt);
+    const isStale = Number.isFinite(ageMs) && ageMs > 1000 * 60 * 60 * 36;
+    return {
+      status: isStale ? 'stale' : 'verified',
+      latestBackupFile: target.file,
+      latestBackupAt: target.createdAt,
+      sha256Valid: true,
+      expectedSha256: target.sha256,
+      actualSha256,
+      reason: isStale
+        ? 'SHA-256 verified, but latest backup is over 36 hours old.'
+        : 'Latest JSON snapshot parsed cleanly and SHA-256 matches manifest.',
+      backupCount: backups.length,
+      lastDailyBackupAt,
+    };
+  } catch (err) {
+    return {
+      status: 'mismatch',
+      latestBackupFile: target.file,
+      latestBackupAt: target.createdAt,
+      sha256Valid: false,
+      expectedSha256: target.sha256,
+      reason: err instanceof Error ? err.message : 'Failed to parse or hash backup file.',
+      backupCount: backups.length,
+      lastDailyBackupAt,
+    };
+  }
+}
+
+function getDirTotalBytes(dirPath: string): number {
+  try {
+    if (!fs.existsSync(dirPath)) return 0;
+    let total = 0;
+    for (const entry of fs.readdirSync(dirPath, { withFileTypes: true })) {
+      const full = path.join(dirPath, entry.name);
+      if (entry.isFile()) {
+        total += fs.statSync(full).size;
+      } else if (entry.isDirectory()) {
+        total += getDirTotalBytes(full);
+      }
+    }
+    return total;
+  } catch {
+    return 0;
+  }
+}
+
+export function getStorageAndDiskTelemetry(): StorageAndDiskTelemetry {
+  const backupDir = resolveBackupDir();
+  const mediaDir = path.join(DATA_DIR, 'imported-media');
+  const sqlitePath = resolveSqliteDbPath();
+
+  const backupsBytes = getDirTotalBytes(backupDir);
+  const mediaBytes = getDirTotalBytes(mediaDir);
+  const dataBytes = getDirTotalBytes(DATA_DIR);
+  let sqliteDbBytes = 0;
+  try {
+    if (fs.existsSync(sqlitePath)) {
+      sqliteDbBytes += fs.statSync(sqlitePath).size;
+      if (fs.existsSync(`${sqlitePath}-wal`)) sqliteDbBytes += fs.statSync(`${sqlitePath}-wal`).size;
+    }
+  } catch {
+    sqliteDbBytes = 0;
+  }
+
+  let diskTotalBytes: number | undefined;
+  let diskFreeBytes: number | undefined;
+  let diskUsedPercent: number | undefined;
+  try {
+    ensureDirectories();
+    const statFs = fs.statfsSync(DATA_DIR);
+    const total = Number(statFs.blocks) * Number(statFs.bsize);
+    const free = Number(statFs.bavail) * Number(statFs.bsize);
+    if (Number.isFinite(total) && total > 0 && Number.isFinite(free)) {
+      diskTotalBytes = total;
+      diskFreeBytes = free;
+      diskUsedPercent = Math.round(((total - free) / total) * 1000) / 10;
+    }
+  } catch {
+    // statfsSync may not be available on restricted filesystems
+  }
+
+  return {
+    dataBytes,
+    backupsBytes,
+    mediaBytes,
+    sqliteDbBytes,
+    diskTotalBytes,
+    diskFreeBytes,
+    diskUsedPercent,
+  };
+}
+

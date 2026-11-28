@@ -1583,4 +1583,115 @@ export interface GuestRegistrationPrefill {
   orderNumber?: string;
 }
 
+export interface ActiveSessionRecord {
+  sid: string;
+  userId: string;
+  role: string;
+  name: string;
+  ip?: string;
+  userAgent?: string;
+  createdAt: string;
+  lastSeenAt: string;
+  expiresAt: string;
+  revokedAt?: string;
+  isCurrent?: boolean;
+}
+
+export interface ApiErrorEventRecord {
+  id: string;
+  method: string;
+  path: string;
+  statusCode: number;
+  message: string;
+  timestamp: string;
+  actorRole?: string;
+}
+
+export interface RestoreTestRecord {
+  testedAt: string;
+  fileName: string;
+  status: 'passed' | 'failed';
+  sha256Match: boolean;
+  recordsVerified: number;
+  sourceFormat: 'server_snapshot' | 'client_export';
+  testedByName?: string;
+  error?: string;
+}
+
+export interface DatabaseIntegrityCheckResult {
+  status: 'ok' | 'degraded' | 'error';
+  checkedAt: string;
+  detail: string;
+  tableCount: number;
+  missingTables: string[];
+}
+
+export interface BackupVerificationSummary {
+  status: 'verified' | 'mismatch' | 'missing' | 'stale';
+  latestBackupFile: string | null;
+  latestBackupAt: string | null;
+  sha256Valid: boolean;
+  expectedSha256?: string;
+  actualSha256?: string;
+  reason: string;
+  backupCount: number;
+  lastDailyBackupAt: string | null;
+}
+
+export interface StorageAndDiskTelemetry {
+  dataBytes: number;
+  backupsBytes: number;
+  mediaBytes: number;
+  sqliteDbBytes: number;
+  diskTotalBytes?: number;
+  diskFreeBytes?: number;
+  diskUsedPercent?: number;
+}
+
+export interface SystemHealthReport {
+  checkedAt: string;
+  appVersion: string;
+  environment: string;
+  serverBootedAt: string;
+  uptimeSeconds: number;
+  backendStatus: 'ok' | 'degraded' | 'error';
+  database: {
+    driver: 'mysql' | 'sqlite';
+    connected: boolean;
+    latencyMs: number | null;
+    identityLabel: string;
+    error?: string;
+  };
+  integrity: DatabaseIntegrityCheckResult;
+  migrations: {
+    count: number;
+    latestMigrationId: string | null;
+    latestAppliedAt: string | null;
+    items: Array<{ id: string; appliedAt: string; notes?: string }>;
+  };
+  backup: BackupVerificationSummary;
+  lastRestoreTest: RestoreTestRecord | null;
+  sync: {
+    sseClientsCount: number;
+    syncVersion: string;
+    collectionCount: number;
+  };
+  sessions: {
+    activeSessionsCount: number;
+    activeUsersCount: number;
+    revokedCount: number;
+    activeList: ActiveSessionRecord[];
+  };
+  operations: {
+    pendingCodOrdersCount: number;
+    pendingWhatsappQueueCount: number;
+    pendingInvestorRequestsCount: number;
+    failedCrmAutomationsCount: number;
+    recentApiErrorsCount: number;
+  };
+  apiErrors: ApiErrorEventRecord[];
+  storage: StorageAndDiskTelemetry;
+}
+
+
 

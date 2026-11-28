@@ -31,9 +31,11 @@ import type {
   RecurringInvoice,
   ReminderTemplate,
   Reseller,
+  RestoreTestRecord,
   ReviewRewardSubmission,
   SalespersonReferral,
   SavedBroadcastCampaign,
+  SystemHealthReport,
   Transaction,
   UserAccount,
   UserRole,
@@ -1379,17 +1381,23 @@ export async function apiSubmitCheckoutOrder(payload: {
   codOrder?: CODOrder;
   resellerId?: string;
   couponCode?: string;
+  idempotencyKey?: string;
 }): Promise<{
   ok: boolean;
   error?: string;
   order?: CheckoutOrderSummary;
   guestClaimToken?: string;
   whatsappNotification?: WhatsAppNotificationStatus;
+  idempotentReplay?: boolean;
 }> {
   try {
+    const headers: Record<string, string> = {
+      ...(getAuthHeaders() as Record<string, string>),
+      ...(payload.idempotencyKey ? { 'x-idempotency-key': payload.idempotencyKey } : {}),
+    };
     const res = await apiFetch('/api/orders/checkout', {
       method: 'POST',
-      headers: getAuthHeaders(),
+      headers,
       cache: 'no-store',
       body: JSON.stringify(payload),
     });
@@ -1399,6 +1407,7 @@ export async function apiSubmitCheckoutOrder(payload: {
       order?: CheckoutOrderSummary;
       guestClaimToken?: string;
       whatsappNotification?: WhatsAppNotificationStatus;
+      idempotentReplay?: boolean;
     }>(res);
     if (!parsed.ok) {
       return {
@@ -1412,6 +1421,7 @@ export async function apiSubmitCheckoutOrder(payload: {
       order: parsed.data?.order,
       guestClaimToken: parsed.data?.guestClaimToken,
       whatsappNotification: parsed.data?.whatsappNotification,
+      idempotentReplay: parsed.data?.idempotentReplay,
     };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
@@ -1729,6 +1739,115 @@ export async function apiRestoreServerBackup(
       await refreshSyncState();
     }
     return { ok: true, summary: parsed.data.summary };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
+export async function apiFetchSystemHealth(): Promise<{
+  ok: boolean;
+  health?: SystemHealthReport;
+  error?: string;
+}> {
+  try {
+    const res = await apiFetch('/api/admin/system-health', {
+      headers: getAuthHeaders(),
+      cache: 'no-store',
+    });
+    const parsed = await safeParseJsonResponse<{
+      ok?: boolean;
+      health?: SystemHealthReport;
+      error?: string;
+    }>(res);
+    if (!parsed.ok || !parsed.data?.ok || !parsed.data.health) {
+      return {
+        ok: false,
+        error: parsed.data?.error || parsed.error || 'Failed to load live system health.',
+      };
+    }
+    return { ok: true, health: parsed.data.health };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
+export async function apiVerifyRestoreBackup(fileName?: string): Promise<{
+  ok: boolean;
+  summary?: ServerRestoreSummary;
+  lastRestoreTest?: RestoreTestRecord;
+  error?: string;
+}> {
+  try {
+    const res = await apiFetch('/api/admin/backups/verify-restore', {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      cache: 'no-store',
+      body: JSON.stringify(fileName ? { fileName } : {}),
+    });
+    const parsed = await safeParseJsonResponse<{
+      ok?: boolean;
+      summary?: ServerRestoreSummary;
+      lastRestoreTest?: RestoreTestRecord;
+      error?: string;
+    }>(res);
+    if (!parsed.ok || !parsed.data?.ok) {
+      return {
+        ok: false,
+        lastRestoreTest: parsed.data?.lastRestoreTest,
+        error: parsed.data?.error || parsed.error || 'Backup restore verification failed.',
+      };
+    }
+    return {
+      ok: true,
+      summary: parsed.data.summary,
+      lastRestoreTest: parsed.data.lastRestoreTest,
+    };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
+export async function apiRevokeSession(sid: string): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await apiFetch(`/api/admin/sessions/${encodeURIComponent(sid)}/revoke`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      cache: 'no-store',
+      body: JSON.stringify({}),
+    });
+    const parsed = await safeParseJsonResponse<{ ok?: boolean; error?: string }>(res);
+    if (!parsed.ok || !parsed.data?.ok) {
+      return { ok: false, error: parsed.data?.error || parsed.error || 'Failed to revoke session.' };
+    }
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
+export async function apiRevokeUserSessions(
+  userId: string,
+  excludeCurrent = true
+): Promise<{ ok: boolean; revokedCount?: number; error?: string }> {
+  try {
+    const res = await apiFetch('/api/admin/sessions/revoke-user', {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      cache: 'no-store',
+      body: JSON.stringify({ userId, excludeCurrent }),
+    });
+    const parsed = await safeParseJsonResponse<{
+      ok?: boolean;
+      revokedCount?: number;
+      error?: string;
+    }>(res);
+    if (!parsed.ok || !parsed.data?.ok) {
+      return {
+        ok: false,
+        error: parsed.data?.error || parsed.error || 'Failed to revoke user sessions.',
+      };
+    }
+    return { ok: true, revokedCount: parsed.data.revokedCount };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
   }

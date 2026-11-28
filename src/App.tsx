@@ -150,6 +150,7 @@ import { WalkInSalesView } from './components/WalkInSalesView.tsx';
 import { ProductImporterModal } from './components/ProductImporterModal.tsx';
 import { FinancialMasterView } from './components/FinancialMasterView.tsx';
 import { CRMWorkspaceView } from './components/CRMWorkspaceView.tsx';
+import { SystemHealthView } from './components/SystemHealthView.tsx';
 import {
   ToastBanner,
   ToastMessage,
@@ -903,6 +904,7 @@ export default function App() {
       transaction: newTx,
       codOrder: newCODOrder,
       resellerId: matchedReseller?.id,
+      idempotencyKey: saleData.idempotencyKey,
     });
 
     if (!checkoutResult.ok) {
@@ -2476,6 +2478,7 @@ export default function App() {
             onRefreshAllData={handleRefreshAllData}
             customers={customers}
             resellers={resellers}
+            onOpenSystemHealth={() => handleTabChange('system_health')}
             onUpdateCustomer={(updatedCust) => {
               const updated = customers.map((c) => (c.id === updatedCust.id ? updatedCust : c));
               setCustomers(updated);
@@ -2486,6 +2489,14 @@ export default function App() {
               setResellers(updated);
               saveResellers(updated);
             }}
+          />
+        )}
+
+        {/* 11. SYSTEM HEALTH & GOVERNANCE MONITOR (ADMIN ONLY) */}
+        {currentTab === 'system_health' && (
+          <SystemHealthView
+            currentUserRole={activeRole}
+            onOpenBackupSettings={() => handleTabChange('settings')}
           />
         )}
       </main>

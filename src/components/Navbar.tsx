@@ -34,6 +34,7 @@ import {
   HeartHandshake,
   LifeBuoy,
   RefreshCw,
+  Activity,
 } from 'lucide-react';
 import type { AppUser, BusinessProfile, CategoryRecord, ProductItem, UserRole } from '../types/index.ts';
 import { getSyncStatus, retrySyncNow, subscribeSyncStatus, type SyncStatusSnapshot } from '../utils/storage.ts';
@@ -229,6 +230,7 @@ export const Navbar: React.FC<NavbarProps> = ({
     { id: 'reports', label: 'Daybook & Reports', urdu: 'روزنامچہ و آڈٹ', icon: BarChart3 },
   ];
   const adminDropdownItems: NavItem[] = [
+    { id: 'system_health', label: 'System Health & Diagnostics', urdu: 'سسٹم ہیلتھ و سیکیورٹی', icon: Activity },
     { id: 'financial_master', label: 'Profit Master & Expenses', urdu: 'منافع، اخراجات و بریک ایون', icon: Calculator },
     { id: 'settings', label: 'Payment Accounts & Settings', urdu: 'اکاؤنٹس، واصل و سیٹنگز', icon: CreditCard },
     { id: 'hr_payroll', label: 'HR Hiring, Attendance & Salaries', urdu: 'ملازمین، حاضری و تنخواہیں', icon: Users },

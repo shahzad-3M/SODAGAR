@@ -6,6 +6,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import express, { NextFunction, Request, Response } from 'express';
 import type {
+  ActiveSessionRecord,
+  ApiErrorEventRecord,
   BusinessProfile,
   CategoryRecord,
   CheckoutOrderSummary,
@@ -32,7 +34,9 @@ import type {
   ProductItem,
   PublicOrderTrackingResult,
   Reseller,
+  RestoreTestRecord,
   ReviewRewardSubmission,
+  SystemHealthReport,
   Transaction,
   UserAccount,
   UserRole,
@@ -91,9 +95,13 @@ import {
   getCollectionVersionInfo,
   getCollectionVersions,
   getCrmLoyaltyConfig,
+  getDatabaseIdentityLabel,
   getDb,
   getFullSyncState,
+  getIdempotencyRecord,
   getLastDailyBackupTimestamp,
+  getSchemaMigrationsList,
+  getStorageAndDiskTelemetry,
   getSyncVersion,
   hasCrmAutomationIdempotencyKey,
   hashServerSecret,
@@ -102,16 +110,19 @@ import {
   insertAdminAuditLog,
   insertCrmActivityEvent,
   insertCrmAutomationLog,
+  isInternalServerCollectionKey,
   listBackups,
   mergeCollectionArrayNonDestructively,
   mergeLocalSnapshotNonDestructively,
   replaceCitiesAndAreasFromList,
   resolveBackupFilePath,
   restoreBackupSnapshotNonDestructively,
+  runDatabaseIntegrityCheck,
   runDailyBackupIfNeeded,
   sanitizeAndValidateCollectionItemDates,
   saveCollectionValue,
   saveCrmLoyaltyConfig,
+  saveIdempotencyRecord,
   syncDeliveryCitiesIntoBusinessProfile,
   touchSyncVersion,
   upsertCategoryRow,
@@ -124,6 +135,7 @@ import {
   upsertCrmTicket,
   upsertCustomerRow,
   upsertProductRow,
+  verifyBackupIntegrity,
   verifyServerSecret,
   withDbTransaction,
 } from './src/server/db.ts';
@@ -175,25 +187,200 @@ const numericPort = Number(rawPort);
 const isNamedSocket = !Number.isFinite(numericPort) || numericPort <= 0;
 const PORT: number | string = isNamedSocket ? rawPort : numericPort;
 const HOST = readCliArg('--host') || process.env.npm_config_host || process.env.HOST || '0.0.0.0';
+const SERVER_BOOTED_AT = new Date().toISOString();
+const APP_VERSION: string = (() => {
+  try {
+    const raw = fs.readFileSync(path.resolve(process.cwd(), 'package.json'), 'utf8');
+    const pkg = JSON.parse(raw) as { version?: string };
+    return pkg?.version && pkg.version !== '0.0.0' ? pkg.version : '1.0.0';
+  } catch {
+    return '1.0.0';
+  }
+})();
+
+const API_ERROR_RING_MAX = 100;
+const apiErrorRingBuffer: ApiErrorEventRecord[] = [];
+
+function recordApiErrorEvent(evt: Omit<ApiErrorEventRecord, 'id' | 'timestamp'>): void {
+  const entry: ApiErrorEventRecord = {
+    id: `err_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+    timestamp: new Date().toISOString(),
+    ...evt,
+    message: String(evt.message || 'Server error').slice(0, 240),
+  };
+  apiErrorRingBuffer.unshift(entry);
+  if (apiErrorRingBuffer.length > API_ERROR_RING_MAX) {
+    apiErrorRingBuffer.length = API_ERROR_RING_MAX;
+  }
+}
+
 function getSessionSecret(): string {
   return process.env.SESSION_SECRET?.trim() || getCachedServerSessionSecret();
 }
 
 interface SessionClaims {
+  sid: string;
   userId: string;
   role: string;
   name: string;
   exp: number;
 }
 
+const SESSION_TTL_MS = 1000 * 60 * 60 * 24 * 7;
+const SESSION_LAST_SEEN_TOUCH_INTERVAL_MS = 60 * 1000;
+const sessionRegistryCache = new Map<string, ActiveSessionRecord>();
+let sessionRegistryHydrated = false;
+let sessionRegistryHydratePromise: Promise<void> | null = null;
+const lastSessionTouchFlushed = new Map<string, number>();
+
+async function ensureSessionRegistryLoaded(db: DbExecutor): Promise<void> {
+  if (sessionRegistryHydrated) return;
+  if (sessionRegistryHydratePromise) return sessionRegistryHydratePromise;
+  sessionRegistryHydratePromise = (async () => {
+    try {
+      const list = await getCollectionValue<ActiveSessionRecord[]>(db, 'active_sessions', []);
+      if (Array.isArray(list)) {
+        const cutoff = Date.now() - 1000 * 60 * 60 * 24;
+        for (const rec of list) {
+          if (!rec?.sid) continue;
+          const expMs = Date.parse(rec.expiresAt || '');
+          if (Number.isFinite(expMs) && expMs < cutoff && !rec.revokedAt) continue;
+          sessionRegistryCache.set(rec.sid, rec);
+        }
+      }
+      sessionRegistryHydrated = true;
+    } finally {
+      sessionRegistryHydratePromise = null;
+    }
+  })();
+  return sessionRegistryHydratePromise;
+}
+
+async function persistSessionRegistry(db: DbExecutor): Promise<void> {
+  const cutoff = Date.now() - 1000 * 60 * 60 * 24 * 7;
+  const pruned: ActiveSessionRecord[] = [];
+  for (const rec of sessionRegistryCache.values()) {
+    const expMs = Date.parse(rec.expiresAt || '');
+    const revMs = rec.revokedAt ? Date.parse(rec.revokedAt) : NaN;
+    if ((Number.isFinite(expMs) && expMs < cutoff) || (Number.isFinite(revMs) && revMs < cutoff)) {
+      sessionRegistryCache.delete(rec.sid);
+      continue;
+    }
+    pruned.push(rec);
+  }
+  pruned.sort((a, b) => (b.lastSeenAt || '').localeCompare(a.lastSeenAt || ''));
+  await saveCollectionValue(db, 'active_sessions', pruned.slice(0, 300));
+}
+
 function signSessionToken(claims: Omit<SessionClaims, 'exp'>): string {
   const payload: SessionClaims = {
     ...claims,
-    exp: Date.now() + 1000 * 60 * 60 * 24 * 7, // 7 days
+    exp: Date.now() + SESSION_TTL_MS,
   };
   const encoded = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
   const sig = crypto.createHmac('sha256', getSessionSecret()).update(encoded).digest('base64url');
   return `${encoded}.${sig}`;
+}
+
+async function issueTrackedSession(
+  db: DbExecutor,
+  req: Request,
+  claims: Omit<SessionClaims, 'sid' | 'exp'>
+): Promise<string> {
+  await ensureSessionRegistryLoaded(db);
+  const sid = `ses_${crypto.randomBytes(12).toString('hex')}`;
+  const nowIso = new Date().toISOString();
+  const expiresAt = new Date(Date.now() + SESSION_TTL_MS).toISOString();
+  const rec: ActiveSessionRecord = {
+    sid,
+    userId: claims.userId,
+    role: claims.role,
+    name: claims.name,
+    ip: req.ip || req.socket?.remoteAddress || undefined,
+    userAgent: (req.header('user-agent') || '').slice(0, 160) || undefined,
+    createdAt: nowIso,
+    lastSeenAt: nowIso,
+    expiresAt,
+  };
+  sessionRegistryCache.set(sid, rec);
+  lastSessionTouchFlushed.set(sid, Date.now());
+  await persistSessionRegistry(db);
+  return signSessionToken({ sid, ...claims });
+}
+
+async function isSessionRevokedOrInvalid(db: DbExecutor, claims: SessionClaims): Promise<boolean> {
+  if (!claims.sid) return true;
+  await ensureSessionRegistryLoaded(db);
+  const existing = sessionRegistryCache.get(claims.sid);
+  if (existing?.revokedAt) return true;
+  if (!existing) {
+    // Re-register active unexpired HMAC session if registry was trimmed or empty on first boot
+    const nowIso = new Date().toISOString();
+    sessionRegistryCache.set(claims.sid, {
+      sid: claims.sid,
+      userId: claims.userId,
+      role: claims.role,
+      name: claims.name,
+      createdAt: nowIso,
+      lastSeenAt: nowIso,
+      expiresAt: new Date(claims.exp).toISOString(),
+    });
+    return false;
+  }
+  const nowMs = Date.now();
+  const lastFlushed = lastSessionTouchFlushed.get(claims.sid) || 0;
+  if (nowMs - lastFlushed >= SESSION_LAST_SEEN_TOUCH_INTERVAL_MS) {
+    existing.lastSeenAt = new Date(nowMs).toISOString();
+    lastSessionTouchFlushed.set(claims.sid, nowMs);
+    void persistSessionRegistry(db).catch(() => {});
+  }
+  return false;
+}
+
+async function revokeSessionById(db: DbExecutor, sid: string): Promise<boolean> {
+  if (!sid) return false;
+  await ensureSessionRegistryLoaded(db);
+  const existing = sessionRegistryCache.get(sid);
+  const nowIso = new Date().toISOString();
+  if (existing) {
+    if (existing.revokedAt) return true;
+    existing.revokedAt = nowIso;
+    sessionRegistryCache.set(sid, existing);
+  } else {
+    sessionRegistryCache.set(sid, {
+      sid,
+      userId: 'unknown',
+      role: 'unknown',
+      name: 'Revoked Session',
+      createdAt: nowIso,
+      lastSeenAt: nowIso,
+      expiresAt: new Date(Date.now() + SESSION_TTL_MS).toISOString(),
+      revokedAt: nowIso,
+    });
+  }
+  await persistSessionRegistry(db);
+  return true;
+}
+
+async function revokeSessionsForUser(
+  db: DbExecutor,
+  userId: string,
+  excludeSid?: string
+): Promise<number> {
+  await ensureSessionRegistryLoaded(db);
+  const nowIso = new Date().toISOString();
+  let count = 0;
+  for (const [sid, rec] of sessionRegistryCache.entries()) {
+    if (rec.userId === userId && !rec.revokedAt && (!excludeSid || sid !== excludeSid)) {
+      rec.revokedAt = nowIso;
+      sessionRegistryCache.set(sid, rec);
+      count++;
+    }
+  }
+  if (count > 0) {
+    await persistSessionRegistry(db);
+  }
+  return count;
 }
 
 function verifySessionToken(token?: string | null): SessionClaims | null {
@@ -216,6 +403,7 @@ function verifySessionToken(token?: string | null): SessionClaims | null {
   try {
     const parsed = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8')) as SessionClaims;
     if (!parsed.exp || Date.now() > parsed.exp) return null;
+    if (!parsed.sid || typeof parsed.sid !== 'string') return null;
     return parsed;
   } catch {
     return null;
@@ -510,6 +698,7 @@ setInterval(() => {
 }, 5 * 60 * 1000).unref();
 
 interface ResolvedActor extends ActorContext {
+  sessionId?: string;
   account?: UserAccount;
   username?: string;
   urduName?: string;
@@ -668,6 +857,9 @@ async function resolveActor(req: Request): Promise<ResolvedActor> {
   if (!claims) {
     return { role: undefined };
   }
+  if (await isSessionRevokedOrInvalid(db, claims)) {
+    return { role: undefined };
+  }
 
   const accounts = await getCollectionValue<UserAccount[]>(db, 'user_accounts', []);
   const account =
@@ -689,6 +881,7 @@ async function resolveActor(req: Request): Promise<ResolvedActor> {
     const basePerms = getDefaultCrmPermissionsForRole(role, account.crmRole);
     return {
       id: account.id,
+      sessionId: claims.sid,
       username: account.username,
       role,
       name: account.fullName || claims.name,
@@ -721,6 +914,7 @@ async function resolveActor(req: Request): Promise<ResolvedActor> {
   ) {
     return {
       id: 'usr_superadmin',
+      sessionId: claims.sid,
       username: 'admin',
       role: 'super_admin',
       name: claims.name || 'Shahzad Malik',
@@ -738,6 +932,7 @@ async function resolveActor(req: Request): Promise<ResolvedActor> {
     if (!cust || cust.status === 'archived') return { role: undefined };
     return {
       id: cust.id,
+      sessionId: claims.sid,
       role: 'customer',
       name: cust.name,
       urduName: cust.urduName,
@@ -756,6 +951,7 @@ async function resolveActor(req: Request): Promise<ResolvedActor> {
     if (!resAcc || resAcc.status !== 'active') return { role: undefined };
     return {
       id: resAcc.id,
+      sessionId: claims.sid,
       role: 'reseller',
       name: resAcc.name,
       resellerCode: resAcc.referralCode,
@@ -798,7 +994,9 @@ function sendRouteError(res: Response, err: unknown, fallbackMessage: string) {
     res.status(400).json({ error: err instanceof Error ? err.message : fallbackMessage });
     return;
   }
-  res.status(500).json({ error: err instanceof Error ? err.message : fallbackMessage });
+  const msg = err instanceof Error ? err.message : fallbackMessage;
+  res.locals.lastErrorMessage = msg;
+  res.status(500).json({ error: msg });
 }
 
 async function startServer() {
@@ -883,13 +1081,28 @@ async function startServer() {
       res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
       res.setHeader(
         'Access-Control-Allow-Headers',
-        'Content-Type, Authorization, Accept, x-session-token, x-client-id, x-requested-with'
+        'Content-Type, Authorization, Accept, x-session-token, x-client-id, x-requested-with, x-idempotency-key'
       );
       if (req.method === 'OPTIONS') {
         res.status(204).end();
         return;
       }
     }
+
+    // Track failed / 5xx server API responses cleanly for Admin System Health diagnostics
+    res.on('finish', () => {
+      if (res.statusCode >= 500) {
+        recordApiErrorEvent({
+          method: req.method,
+          path: req.path,
+          statusCode: res.statusCode,
+          message:
+            typeof res.locals?.lastErrorMessage === 'string' && res.locals.lastErrorMessage
+              ? res.locals.lastErrorMessage
+              : `HTTP ${res.statusCode} on ${req.method} ${req.path}`,
+        });
+      }
+    });
 
     // CSRF mitigation for cookie-authenticated mutations
     const isMutation = !['GET', 'HEAD', 'OPTIONS'].includes(req.method.toUpperCase());
@@ -1041,6 +1254,293 @@ async function startServer() {
         broadcastSyncEvent('all', req.header('x-client-id'));
       }
       res.json({ ok: true, summary, syncVersion: getSyncVersion() });
+    })
+  );
+
+  app.post(
+    '/api/admin/backups/verify-restore',
+    asyncRoute(async (req, res) => {
+      const actor = await resolveActor(req);
+      if (actor.role !== 'super_admin' && actor.role !== 'admin') {
+        res.status(403).json({ error: 'Only administrators can verify backup restoration.' });
+        return;
+      }
+
+      const requestedFile =
+        typeof req.body?.fileName === 'string' && req.body.fileName.trim()
+          ? req.body.fileName.trim()
+          : undefined;
+      const verification = verifyBackupIntegrity(requestedFile);
+      if (!verification.latestBackupFile) {
+        res.status(404).json({ error: verification.reason || 'No backup snapshot available to test.' });
+        return;
+      }
+      const resolved = resolveBackupFilePath(verification.latestBackupFile);
+      if (!resolved) {
+        res.status(404).json({ error: 'Backup snapshot file could not be resolved on disk.' });
+        return;
+      }
+
+      const db = await getDb();
+      let restoreRecord: RestoreTestRecord;
+      try {
+        const parsed = JSON.parse(fs.readFileSync(resolved, 'utf8')) as Record<string, unknown>;
+        const summary = await restoreBackupSnapshotNonDestructively(parsed, { dryRun: true });
+        restoreRecord = {
+          testedAt: new Date().toISOString(),
+          fileName: verification.latestBackupFile,
+          status: verification.sha256Valid ? 'passed' : 'failed',
+          sha256Match: verification.sha256Valid,
+          recordsVerified: summary.totalRecordsInFile,
+          sourceFormat: summary.sourceFormat,
+          testedByName: actor.name || actor.role,
+          error: verification.sha256Valid ? undefined : verification.reason,
+        };
+        const existingMeta = await getCollectionValue<Record<string, unknown>>(
+          db,
+          'system_governance_meta',
+          {}
+        );
+        await saveCollectionValue(db, 'system_governance_meta', {
+          ...existingMeta,
+          lastRestoreTest: restoreRecord,
+        });
+        await insertAdminAuditLog(db, {
+          action: 'verify_backup_restore_test',
+          entityType: 'backup',
+          entityId: verification.latestBackupFile,
+          actorId: actor.id,
+          actorName: actor.name,
+          actorRole: actor.role,
+          details: {
+            status: restoreRecord.status,
+            sha256Match: restoreRecord.sha256Match,
+            recordsVerified: restoreRecord.recordsVerified,
+          },
+        });
+        res.json({
+          ok: true,
+          verification,
+          summary,
+          lastRestoreTest: restoreRecord,
+        });
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : 'Non-destructive restore test failed.';
+        restoreRecord = {
+          testedAt: new Date().toISOString(),
+          fileName: verification.latestBackupFile,
+          status: 'failed',
+          sha256Match: verification.sha256Valid,
+          recordsVerified: 0,
+          sourceFormat: 'server_snapshot',
+          testedByName: actor.name || actor.role,
+          error: errMsg,
+        };
+        const existingMeta = await getCollectionValue<Record<string, unknown>>(
+          db,
+          'system_governance_meta',
+          {}
+        );
+        await saveCollectionValue(db, 'system_governance_meta', {
+          ...existingMeta,
+          lastRestoreTest: restoreRecord,
+        }).catch(() => {});
+        res.status(500).json({ error: errMsg, verification, lastRestoreTest: restoreRecord });
+      }
+    })
+  );
+
+  app.get(
+    '/api/admin/system-health',
+    asyncRoute(async (req, res) => {
+      const actor = await resolveActor(req);
+      if (actor.role !== 'super_admin' && actor.role !== 'admin') {
+        res.status(403).json({ error: 'Only administrators can access System Health diagnostics.' });
+        return;
+      }
+
+      const checkedAt = new Date().toISOString();
+      const baseHealth = await checkDatabaseHealth(dbStartupError);
+      let dbLatencyMs: number | null = null;
+      let dbConnected = baseHealth.connected;
+      let dbError = baseHealth.error;
+
+      const db = await getDb();
+      const pingStart = Date.now();
+      try {
+        await db.ping();
+        dbLatencyMs = Date.now() - pingStart;
+        dbConnected = true;
+      } catch (pingErr) {
+        dbConnected = false;
+        dbError = pingErr instanceof Error ? pingErr.message : 'Database ping failed';
+      }
+
+      const [integrity, migrationsList, metaObj, codOrders, notifications, invRequests, crmAutoLogs] =
+        await Promise.all([
+          runDatabaseIntegrityCheck(db),
+          getSchemaMigrationsList(db),
+          getCollectionValue<{ lastRestoreTest?: RestoreTestRecord | null }>(
+            db,
+            'system_governance_meta',
+            {}
+          ),
+          getCollectionValue<CODOrder[]>(db, 'cod_orders', []),
+          getCollectionValue<Array<{ status?: string }>>(db, 'notifications', []),
+          getCollectionValue<InvestorProductRequest[]>(db, 'investor_requests', []),
+          getAllCrmAutomationLogs(db).catch(() => []),
+        ]);
+
+      await ensureSessionRegistryLoaded(db);
+      const nowMs = Date.now();
+      const activeSessions: ActiveSessionRecord[] = [];
+      let revokedCount = 0;
+      const activeUsers = new Set<string>();
+      for (const rec of sessionRegistryCache.values()) {
+        if (rec.revokedAt) {
+          revokedCount++;
+          continue;
+        }
+        const expMs = Date.parse(rec.expiresAt || '');
+        if (Number.isFinite(expMs) && expMs <= nowMs) continue;
+        activeUsers.add(rec.userId);
+        activeSessions.push({
+          ...rec,
+          isCurrent: Boolean(actor.sessionId && rec.sid === actor.sessionId),
+        });
+      }
+      activeSessions.sort((a, b) => (b.lastSeenAt || '').localeCompare(a.lastSeenAt || ''));
+
+      const backup = verifyBackupIntegrity();
+      const storage = getStorageAndDiskTelemetry();
+      const pendingCodOrdersCount = Array.isArray(codOrders)
+        ? codOrders.filter((o) => o.status === 'pending' || o.status === 'dispatched').length
+        : 0;
+      const pendingWhatsappQueueCount = Array.isArray(notifications)
+        ? notifications.filter((n) => n.status === 'pending').length
+        : 0;
+      const pendingInvestorRequestsCount = Array.isArray(invRequests)
+        ? invRequests.filter((r) => r.status === 'pending').length
+        : 0;
+      const failedCrmAutomationsCount = Array.isArray(crmAutoLogs)
+        ? crmAutoLogs.filter((l) => String(l.status || '').includes('fail')).length
+        : 0;
+
+      const backendStatus: SystemHealthReport['backendStatus'] =
+        !dbConnected || integrity.status === 'error'
+          ? 'error'
+          : integrity.status === 'degraded' ||
+            backup.status === 'mismatch' ||
+            backup.status === 'missing'
+          ? 'degraded'
+          : 'ok';
+
+      const report: SystemHealthReport = {
+        checkedAt,
+        appVersion: APP_VERSION,
+        environment: baseHealth.environment,
+        serverBootedAt: SERVER_BOOTED_AT,
+        uptimeSeconds: Math.floor(process.uptime()),
+        backendStatus,
+        database: {
+          driver: baseHealth.database,
+          connected: dbConnected,
+          latencyMs: dbLatencyMs,
+          identityLabel: getDatabaseIdentityLabel(),
+          error: dbError,
+        },
+        integrity,
+        migrations: {
+          count: migrationsList.length,
+          latestMigrationId: migrationsList[0]?.id || null,
+          latestAppliedAt: migrationsList[0]?.appliedAt || null,
+          items: migrationsList.slice(0, 25),
+        },
+        backup,
+        lastRestoreTest: metaObj?.lastRestoreTest || null,
+        sync: {
+          sseClientsCount: sseClients.size,
+          syncVersion: getSyncVersion(),
+          collectionCount: Object.keys(baseHealth.collectionVersions || {}).length,
+        },
+        sessions: {
+          activeSessionsCount: activeSessions.length,
+          activeUsersCount: activeUsers.size,
+          revokedCount,
+          activeList: activeSessions.slice(0, 100),
+        },
+        operations: {
+          pendingCodOrdersCount,
+          pendingWhatsappQueueCount,
+          pendingInvestorRequestsCount,
+          failedCrmAutomationsCount,
+          recentApiErrorsCount: apiErrorRingBuffer.length,
+        },
+        apiErrors: apiErrorRingBuffer.slice(0, 40),
+        storage,
+      };
+
+      res.json({ ok: true, health: report });
+    })
+  );
+
+  app.post(
+    '/api/admin/sessions/:sid/revoke',
+    asyncRoute(async (req, res) => {
+      const actor = await resolveActor(req);
+      if (actor.role !== 'super_admin' && actor.role !== 'admin') {
+        res.status(403).json({ error: 'Only administrators can revoke active sessions.' });
+        return;
+      }
+      const sid = String(req.params.sid || '').trim();
+      if (!sid) {
+        res.status(400).json({ error: 'Session ID is required.' });
+        return;
+      }
+      const db = await getDb();
+      await revokeSessionById(db, sid);
+      await insertAdminAuditLog(db, {
+        action: 'revoke_session',
+        entityType: 'session',
+        entityId: sid,
+        actorId: actor.id,
+        actorName: actor.name,
+        actorRole: actor.role,
+      });
+      res.json({ ok: true, revokedSid: sid });
+    })
+  );
+
+  app.post(
+    '/api/admin/sessions/revoke-user',
+    asyncRoute(async (req, res) => {
+      const actor = await resolveActor(req);
+      if (actor.role !== 'super_admin' && actor.role !== 'admin') {
+        res.status(403).json({ error: 'Only administrators can revoke user sessions.' });
+        return;
+      }
+      const targetUserId = String(req.body?.userId || '').trim();
+      const excludeCurrent = req.body?.excludeCurrent !== false;
+      if (!targetUserId) {
+        res.status(400).json({ error: 'Target userId is required.' });
+        return;
+      }
+      const db = await getDb();
+      const revokedCount = await revokeSessionsForUser(
+        db,
+        targetUserId,
+        excludeCurrent ? actor.sessionId : undefined
+      );
+      await insertAdminAuditLog(db, {
+        action: 'revoke_user_sessions',
+        entityType: 'user',
+        entityId: targetUserId,
+        actorId: actor.id,
+        actorName: actor.name,
+        actorRole: actor.role,
+        details: { revokedCount, excludeCurrent },
+      });
+      res.json({ ok: true, revokedCount });
     })
   );
 
@@ -1272,7 +1772,11 @@ async function startServer() {
             canAuthorizeCreditSale: true,
             isAuthenticated: true,
           };
-          const sessionToken = signSessionToken({ userId: userObj.id, role: 'super_admin', name: userObj.name });
+          const sessionToken = await issueTrackedSession(db, req, {
+            userId: userObj.id,
+            role: 'super_admin',
+            name: userObj.name,
+          });
           setSessionCookie(req, res, sessionToken);
           await recordLoginAudit(db, {
             userId: userObj.id,
@@ -1369,7 +1873,11 @@ async function startServer() {
             temporaryPasswordExpiresAt: acc.temporaryPasswordExpiresAt,
             isAuthenticated: true,
           };
-          const sessionToken = signSessionToken({ userId: acc.id, role: acc.role, name: acc.fullName });
+          const sessionToken = await issueTrackedSession(db, req, {
+            userId: acc.id,
+            role: acc.role,
+            name: acc.fullName,
+          });
           setSessionCookie(req, res, sessionToken);
           await recordLoginAudit(db, {
             userId: acc.id,
@@ -1413,7 +1921,7 @@ async function startServer() {
             canAuthorizeCreditSale: false,
             isAuthenticated: true,
           };
-          const sessionToken = signSessionToken({
+          const sessionToken = await issueTrackedSession(db, req, {
             userId: matchedReseller.id,
             role: 'reseller',
             name: matchedReseller.name,
@@ -1465,7 +1973,7 @@ async function startServer() {
             canAuthorizeCreditSale: false,
             isAuthenticated: true,
           };
-          const sessionToken = signSessionToken({
+          const sessionToken = await issueTrackedSession(db, req, {
             userId: matchedCustomer.id,
             role: 'customer',
             name: matchedCustomer.name,
@@ -1501,6 +2009,15 @@ async function startServer() {
   app.post(
     '/api/auth/logout',
     asyncRoute(async (req, res) => {
+      const authHeader = req.header('authorization');
+      const bearer = authHeader?.startsWith('Bearer ') ? authHeader.slice(7).trim() : undefined;
+      const cookieToken = parseCookieMap(req.headers.cookie).get(SESSION_COOKIE_NAME);
+      const token = bearer || req.header('x-session-token') || cookieToken;
+      const claims = verifySessionToken(token);
+      if (claims?.sid) {
+        const db = await getDb();
+        await revokeSessionById(db, claims.sid);
+      }
       clearSessionCookie(req, res);
       res.json({ ok: true });
     })
@@ -1777,7 +2294,11 @@ async function startServer() {
       temporaryPasswordExpiresAt: tempPasswordExpiresAt,
       isAuthenticated: true,
     };
-    const sessionToken = signSessionToken({ userId: accId, role: 'customer', name: cleanName });
+    const sessionToken = await issueTrackedSession(db, req, {
+      userId: accId,
+      role: 'customer',
+      name: cleanName,
+    });
     setSessionCookie(req, res, sessionToken);
     recordAuthFailure(`reg:${req.ip || 'unknown'}`);
     broadcastSyncEvent('customers', req.header('x-client-id'));
@@ -4206,6 +4727,7 @@ async function startServer() {
         codOrder,
         resellerId,
         couponCode,
+        idempotencyKey: bodyIdempotencyKey,
       } = (req.body || {}) as {
         items?: Array<{ productId: string; quantity: number; variationId?: string; selectedSize?: string }>;
         customer?: Customer;
@@ -4213,7 +4735,22 @@ async function startServer() {
         codOrder?: CODOrder;
         resellerId?: string;
         couponCode?: string;
+        idempotencyKey?: string;
       };
+      const checkoutIdempotencyKey = String(
+        bodyIdempotencyKey || req.header('x-idempotency-key') || ''
+      ).trim();
+
+      if (checkoutIdempotencyKey) {
+        const cached = await getIdempotencyRecord(db, checkoutIdempotencyKey, 'orders_checkout');
+        if (cached) {
+          res.status(cached.statusCode).json({
+            ...cached.response,
+            idempotentReplay: true,
+          });
+          return;
+        }
+      }
 
       const isPrivilegedSeller =
         actor.role === 'super_admin' || actor.role === 'admin' || actor.role === 'manager' || actor.role === 'staff';
@@ -4674,6 +5211,9 @@ async function startServer() {
             const returnedAt = validateAndNormalizeDateTime(codOrder.returnedAt, 'codOrder.returnedAt');
             const cleanOrder: CODOrder = {
               ...codOrder,
+              orderNumber:
+                (codOrder.orderNumber || '').trim() ||
+                `MM-${new Date().getFullYear()}-${Math.floor(100000 + Math.random() * 900000)}`,
               invoiceNumber: persistedInvoiceNumber,
               customerId: savedCustomer?.id || codOrder.customerId || transaction?.customerId,
               customerName: rawBuyerName || codOrder.customerName,
@@ -4796,6 +5336,15 @@ async function startServer() {
             })),
             createdAt: nowCheckoutIso,
           };
+
+          if (checkoutIdempotencyKey && resolvedSummary) {
+            await saveIdempotencyRecord(txDb, checkoutIdempotencyKey, 'orders_checkout', 200, {
+              ok: true,
+              syncVersion: getSyncVersion(),
+              order: resolvedSummary,
+              guestClaimToken,
+            });
+          }
         });
       } catch (err) {
         sendRouteError(res, err, 'Checkout persistence failed.');
@@ -5317,6 +5866,11 @@ async function startServer() {
       }
 
       const key = req.params.collectionKey;
+      if (isInternalServerCollectionKey(key)) {
+        res.status(403).json({ error: `Internal system collection "${key}" cannot be modified directly.` });
+        return;
+      }
+
       const isAdmin = actor.role === 'super_admin' || actor.role === 'admin';
       const isManager = actor.role === 'manager';
       const isStaff = actor.role === 'staff';
@@ -5332,6 +5886,18 @@ async function startServer() {
         }
         if (!isStaff && !CUSTOMER_WRITABLE_COLLECTIONS.has(key)) {
           res.status(403).json({ error: `Insufficient permissions to modify "${key}".` });
+          return;
+        }
+      }
+
+      const collectionIdempotencyKey = String(
+        req.body?.idempotencyKey || req.header('x-idempotency-key') || ''
+      ).trim();
+      if (collectionIdempotencyKey) {
+        const db = await getDb();
+        const cached = await getIdempotencyRecord(db, collectionIdempotencyKey, `collection:${key}`);
+        if (cached) {
+          res.status(cached.statusCode).json({ ...cached.response, idempotentReplay: true });
           return;
         }
       }
@@ -5513,6 +6079,14 @@ async function startServer() {
             });
           } else {
             await saveCollectionValue(txDb, key, data, sourceClientId);
+          }
+
+          if (collectionIdempotencyKey) {
+            await saveIdempotencyRecord(txDb, collectionIdempotencyKey, `collection:${key}`, 200, {
+              ok: true,
+              syncVersion: getSyncVersion(),
+              collectionVersion: getCollectionVersionInfo(key).version,
+            });
           }
         });
       } catch (err) {
@@ -7109,13 +7683,17 @@ async function startServer() {
       errObj?.statusCode ||
       errObj?.status ||
       (errObj?.type === 'entity.too.large' ? 413 : 500);
+    const errMsg =
+      status === 413
+        ? 'Submitted payload is too large. Please paste only the product HTML body.'
+        : errObj?.type === 'entity.parse.failed'
+        ? 'Malformed JSON request body.'
+        : errObj?.message || 'Unexpected server error.';
+    if (status >= 500) {
+      res.locals.lastErrorMessage = errMsg;
+    }
     res.status(status).json({
-      error:
-        status === 413
-          ? 'Submitted payload is too large. Please paste only the product HTML body.'
-          : errObj?.type === 'entity.parse.failed'
-          ? 'Malformed JSON request body.'
-          : errObj?.message || 'Unexpected server error.',
+      error: errMsg,
     });
   });
 
@@ -7136,8 +7714,9 @@ async function startServer() {
     process.env.NODE_ENV === 'production' ||
     (process.env.NODE_ENV !== 'development' && !isAiStudioDev && (Boolean(kService) || hasBuiltDist));
 
+  const isTestEnv = process.env.NODE_ENV === 'test';
   // Frontend middleware / static dist serving (production NEVER starts Vite dev middleware)
-  if (!isProduction) {
+  if (!isProduction && !isTestEnv) {
     const { createServer: createViteServer } = await import('vite');
     const vitePromise = createViteServer({
       server: {

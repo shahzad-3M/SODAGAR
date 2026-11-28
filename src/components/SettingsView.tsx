@@ -92,6 +92,7 @@ interface SettingsViewProps {
   resellers?: Reseller[];
   onUpdateCustomer?: (customer: Customer) => void;
   onUpdateReseller?: (reseller: Reseller) => void;
+  onOpenSystemHealth?: () => void;
 }
 
 export const SettingsView: React.FC<SettingsViewProps> = ({
@@ -102,6 +103,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   resellers = [],
   onUpdateCustomer,
   onUpdateReseller,
+  onOpenSystemHealth,
 }) => {
   const [formData, setFormData] = useState<BusinessProfile>(profile);
   const [savedSuccess, setSavedSuccess] = useState(false);
@@ -2611,15 +2613,27 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   Automated 24-hour snapshots run on the server alongside manual JSON export and verified merge-only restore. Sensitive credentials and session secrets are automatically stripped or hashed in downloads.
                 </p>
               </div>
-              <button
-                type="button"
-                onClick={() => void loadBackupStatus()}
-                disabled={backupLoading}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-slate-700 dark:text-slate-200 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 rounded-lg cursor-pointer self-start shrink-0 disabled:opacity-60"
-              >
-                <RefreshCw className={`w-3.5 h-3.5 ${backupLoading ? 'animate-spin' : ''}`} />
-                Refresh Status
-              </button>
+              <div className="flex flex-wrap items-center gap-2 self-start shrink-0">
+                {onOpenSystemHealth && (
+                  <button
+                    type="button"
+                    onClick={onOpenSystemHealth}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold text-amber-900 dark:text-slate-950 bg-[#FFD200] hover:bg-amber-400 rounded-lg cursor-pointer whitespace-nowrap"
+                  >
+                    <ShieldCheck className="w-3.5 h-3.5" />
+                    <span>Open System Health &amp; Restore Test</span>
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => void loadBackupStatus()}
+                  disabled={backupLoading}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-slate-700 dark:text-slate-200 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 rounded-lg cursor-pointer disabled:opacity-60"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${backupLoading ? 'animate-spin' : ''}`} />
+                  Refresh Status
+                </button>
+              </div>
             </div>
 
             {/* Live Health & Schedule Summary Cards */}

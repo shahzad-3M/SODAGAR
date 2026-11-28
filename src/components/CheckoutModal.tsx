@@ -82,6 +82,7 @@ export interface CheckoutSalePayload {
   notes: string;
   sendWhatsApp: boolean;
   resellerCode?: string;
+  idempotencyKey?: string;
 }
 
 interface CheckoutModalProps {
@@ -248,6 +249,19 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
   });
   const [formError, setFormError] = useState<string>('');
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
+  const idempotencyKeyRef = React.useRef<string>('');
+
+  const cartSignature = cart
+    .map((it) => `${it.product.id}:${it.product.selectedSize || ''}:${it.quantity}`)
+    .join('|');
+
+  useEffect(() => {
+    if (!isOpen) return;
+    idempotencyKeyRef.current =
+      typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+        ? `chk_${crypto.randomUUID()}`
+        : `chk_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+  }, [isOpen, cartSignature]);
 
   // Sync POS selection into basic checkout form
   useEffect(() => {
@@ -844,11 +858,15 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
           `Order: ${cart.map((c) => `${c.product.name} (${c.quantity}x)`).join(', ')}`,
         sendWhatsApp,
         resellerCode: resellerCode.trim() || undefined,
+        idempotencyKey:
+          idempotencyKeyRef.current ||
+          `chk_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`,
       });
 
       if (result && result.ok === false) {
         setFormError(result.error || 'Order could not be placed. Please check your details and try again.');
       } else if (result && result.ok && result.order) {
+        idempotencyKeyRef.current = '';
         setConfirmedCheckout({
           order: result.order,
           guestClaimToken: result.guestClaimToken,
