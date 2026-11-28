@@ -23,18 +23,18 @@ import {
   Settings,
   Sparkles,
   Edit3,
+  Copy,
 } from 'lucide-react';
 import type { CRMPermissions, CRMRoleSpecialization, LoginFormConfig, LoginAuditRecord, UserAccount, UserRole } from '../types/index.ts';
 import {
-  createUserAccount,
   getLoginAudits,
   getLoginFormConfig,
   getUserAccounts,
   saveLoginFormConfig,
   updateUserAccount,
   apiAdminResetPassword,
+  apiAdminCreateUser,
 } from '../utils/storage.ts';
-import { createPasswordRecord } from '../utils/security.ts';
 
 const CRM_ROLE_LABELS: Array<{ value: CRMRoleSpecialization; label: string }> = [
   { value: 'administrator', label: 'Administrator (Full CRM Access)' },
@@ -81,7 +81,13 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
   // Modals state
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
   const [isResetSuccessModalOpen, setIsResetSuccessModalOpen] = useState(false);
-  const [resetModalData, setResetModalData] = useState<{ user: UserAccount; tempPin: string } | null>(null);
+  const [resetModalData, setResetModalData] = useState<{
+    user: UserAccount;
+    tempPin: string;
+    isTemporary?: boolean;
+    expiresAt?: string;
+  } | null>(null);
+  const [copiedTempPass, setCopiedTempPass] = useState(false);
   const [editingUser, setEditingUser] = useState<UserAccount | null>(null);
   const [notification, setNotification] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
 
@@ -105,7 +111,8 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
   const [newCrmRole, setNewCrmRole] = useState<CRMRoleSpecialization>('salesperson');
   const [newCrmPermissions, setNewCrmPermissions] = useState<CRMPermissions>({});
   const [customPassword, setCustomPassword] = useState('');
-  const [useDefaultMobilePin, setUseDefaultMobilePin] = useState(true);
+  const [autoGenerateTempPassword, setAutoGenerateTempPassword] = useState(true);
+  const [isCreatingUser, setIsCreatingUser] = useState(false);
 
   const refreshData = () => {
     setUsers(getUserAccounts());
@@ -132,49 +139,49 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
     return matchesSearch && matchesRole && matchesStatus;
   });
 
-  // Handle Create User
+  // Handle Create User (server-authoritative with random 30-min temp password or custom private password)
   const handleCreateUser = async (e: React.FormEvent) => {
     e.preventDefault();
     const cleanPhone = newPhone.trim().replace(/[\s-]/g, '');
-    const cleanUsername = newUsername.trim().toLowerCase();
+    const cleanUsername = newUsername.trim().replace(/^@+/, '').toLowerCase();
+    const cleanCustom = customPassword.trim();
 
     if (!cleanPhone) {
       showNotification('error', 'Phone number is required');
       return;
     }
 
-    if (users.some((u) => u.username.toLowerCase() === cleanUsername)) {
+    if (cleanUsername && users.some((u) => u.username.toLowerCase() === cleanUsername)) {
       showNotification('error', `Username '${cleanUsername}' is already taken.`);
       return;
     }
 
-    let initialPin = customPassword.trim();
-    if (useDefaultMobilePin || !initialPin) {
-      const digits = cleanPhone.replace(/\D/g, '');
-      initialPin = digits.length >= 6 ? digits.slice(-6) : digits.padEnd(6, '0');
+    if (!autoGenerateTempPassword && cleanCustom.length < 4) {
+      showNotification('error', 'Custom temporary password must be at least 4 characters.');
+      return;
     }
-
-    const passRecord = await createPasswordRecord(initialPin);
 
     const isSellerRole = newRole === 'super_admin' || newRole === 'admin' || newRole === 'manager' || newRole === 'staff';
     const allowCredit = newRole === 'super_admin' || newRole === 'admin' || (isSellerRole && newCreditAuth);
 
-    const created = createUserAccount({
-      username: cleanUsername,
-      fullName: newFullName.trim() || `User ${cleanUsername}`,
+    setIsCreatingUser(true);
+    const serverCreate = await apiAdminCreateUser({
+      username: cleanUsername || cleanPhone.replace(/\D/g, ''),
+      fullName: newFullName.trim() || `User ${cleanUsername || cleanPhone}`,
       phone: cleanPhone,
       email: newEmail.trim() || undefined,
       role: newRole,
-      status: 'active',
       canAuthorizeCreditSale: allowCredit,
       crmRole: isSellerRole ? newCrmRole : undefined,
       crmPermissions: isSellerRole ? newCrmPermissions : undefined,
-      passwordHash: passRecord.hash,
-      passwordSalt: passRecord.salt,
-      mustChangePassword: true,
-      isTemporaryPassword: true,
-      suggestedDefaultPin: initialPin,
+      customPassword: autoGenerateTempPassword ? undefined : cleanCustom,
     });
+    setIsCreatingUser(false);
+
+    if (!serverCreate.ok || !serverCreate.user) {
+      showNotification('error', serverCreate.error || 'Could not create user account on server.');
+      return;
+    }
 
     setIsCreateModalOpen(false);
     setNewUsername('');
@@ -184,9 +191,16 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
     setNewCreditAuth(false);
     setNewCrmPermissions({});
     setCustomPassword('');
+    setAutoGenerateTempPassword(true);
     refreshData();
 
-    setResetModalData({ user: created, tempPin: initialPin });
+    setCopiedTempPass(false);
+    setResetModalData({
+      user: serverCreate.user,
+      tempPin: serverCreate.temporaryPassword || cleanCustom,
+      isTemporary: serverCreate.isTemporary ?? true,
+      expiresAt: serverCreate.temporaryPasswordExpiresAt,
+    });
     setIsResetSuccessModalOpen(true);
   };
 
@@ -195,24 +209,28 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
     if (user.role === 'super_admin') {
       showNotification(
         'error',
-        'Super Admin does not use a suggested default PIN. Change Master PIN securely inside My Account or Settings.'
+        'Super Admin does not use temporary recovery passwords. Change Master PIN securely inside My Account or Settings.'
       );
       return;
     }
-    const serverReset = await apiAdminResetPassword(user.id, undefined, user.username);
+    const serverReset = await apiAdminResetPassword(user.id, undefined, user.username, 'temporary');
     if (!serverReset.ok || !serverReset.tempPin) {
       showNotification('error', serverReset.error || 'Could not reset password on server.');
       return;
     }
     refreshData();
+    setCopiedTempPass(false);
     setResetModalData({
       user: {
         ...user,
         username: serverReset.username || user.username,
         mustChangePassword: true,
         isTemporaryPassword: true,
+        temporaryPasswordExpiresAt: serverReset.expiresAt,
       },
       tempPin: serverReset.tempPin,
+      isTemporary: serverReset.isTemporary ?? true,
+      expiresAt: serverReset.expiresAt,
     });
     setIsResetSuccessModalOpen(true);
   };
@@ -586,16 +604,16 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
                               <span>Edit</span>
                             </button>
 
-                            {/* Reset Password Button (Disabled/omitted for Super Admin so no suggested default PIN exists) */}
+                            {/* Issue Random 30-min Temp Password Button */}
                             {user.role !== 'super_admin' && (
                               <button
                                 type="button"
                                 onClick={() => handleResetPassword(user)}
                                 className="px-2 py-1 text-[11px] font-bold text-amber-700 dark:text-amber-300 bg-amber-50 hover:bg-amber-100 dark:bg-amber-950/50 dark:hover:bg-amber-900/60 rounded border border-amber-300 dark:border-amber-800 transition-colors cursor-pointer flex items-center gap-1"
-                                title="Reset to temporary default PIN (last 6 digits of mobile)"
+                                title="Issue a random 30-minute temporary password"
                               >
                                 <RotateCcw className="w-3 h-3" />
-                                <span>Reset PIN</span>
+                                <span>Temp Password</span>
                               </button>
                             )}
 
@@ -974,19 +992,19 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
                 <label className="flex items-center gap-2 cursor-pointer select-none mb-2">
                   <input
                     type="checkbox"
-                    checked={useDefaultMobilePin}
-                    onChange={(e) => setUseDefaultMobilePin(e.target.checked)}
+                    checked={autoGenerateTempPassword}
+                    onChange={(e) => setAutoGenerateTempPassword(e.target.checked)}
                     className="w-4 h-4 rounded text-amber-500"
                   />
                   <span className="text-xs font-semibold text-slate-800 dark:text-slate-200">
-                    Use last 6 digits of mobile number as default temporary PIN (Recommended)
+                    Auto-generate random unguessable temporary password (valid for 30 minutes) (Recommended)
                   </span>
                 </label>
 
-                {!useDefaultMobilePin && (
+                {!autoGenerateTempPassword && (
                   <div>
                     <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-1">
-                      Set Custom Temporary PIN:
+                      Set Custom Temporary Password (valid 30 mins):
                     </label>
                     <input
                       type="text"
@@ -1009,9 +1027,10 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
                 </button>
                 <button
                   type="submit"
-                  className="px-5 py-2 bg-slate-900 hover:bg-slate-800 dark:bg-amber-500 dark:text-slate-950 dark:hover:bg-amber-400 text-white font-black text-xs rounded-lg transition-colors cursor-pointer"
+                  disabled={isCreatingUser}
+                  className="px-5 py-2 bg-slate-900 hover:bg-slate-800 dark:bg-amber-500 dark:text-slate-950 dark:hover:bg-amber-400 text-white font-black text-xs rounded-lg transition-colors cursor-pointer disabled:opacity-50"
                 >
-                  Create User
+                  {isCreatingUser ? 'Creating...' : 'Create User'}
                 </button>
               </div>
             </form>
@@ -1019,7 +1038,7 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
         </div>
       )}
 
-      {/* TEMPORARY DEFAULT PIN ISSUED MODAL */}
+      {/* RANDOM TEMPORARY PASSWORD ISSUED MODAL */}
       {isResetSuccessModalOpen && resetModalData && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/75 backdrop-blur-xs p-3 sm:p-4 overflow-y-auto">
           <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl w-full max-w-md overflow-hidden shadow-2xl my-4 text-center p-6 space-y-4">
@@ -1029,10 +1048,10 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
 
             <div>
               <h3 className="text-base font-black text-slate-900 dark:text-white">
-                Temporary Default Password Generated
+                Random Temporary Password Generated
               </h3>
               <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-                عارضی ڈیفالٹ پاس ورڈ کامیابی سے جاری کر دیا گیا ہے۔
+                خفیہ عارضی پاس ورڈ کامیابی سے جاری کر دیا گیا ہے (صرف 30 منٹ کے لیے کارآمد)۔
               </p>
             </div>
 
@@ -1053,16 +1072,42 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
                 <span className="text-slate-500">Mobile Phone:</span>
                 <span className="font-mono text-slate-900 dark:text-white">{resetModalData.user.phone}</span>
               </div>
-              <div className="flex justify-between text-xs items-center pt-2 border-t border-slate-200 dark:border-slate-700">
-                <span className="font-bold text-amber-600 dark:text-amber-400">Temporary Password / PIN:</span>
-                <span className="font-mono text-base font-black tracking-widest text-slate-900 dark:text-white bg-[#FFD200]/30 px-2 py-0.5 rounded">
-                  {resetModalData.tempPin}
+              <div className="flex justify-between text-xs items-center pt-2 border-t border-slate-200 dark:border-slate-700 gap-2">
+                <span className="font-bold text-amber-600 dark:text-amber-400">Temporary Password:</span>
+                <div className="flex items-center gap-1.5">
+                  <span className="font-mono text-base font-black tracking-wider text-slate-900 dark:text-white bg-[#FFD200]/30 px-2.5 py-0.5 rounded select-all">
+                    {resetModalData.tempPin}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      navigator.clipboard?.writeText(resetModalData.tempPin);
+                      setCopiedTempPass(true);
+                      setTimeout(() => setCopiedTempPass(false), 2000);
+                    }}
+                    className="px-2 py-1 rounded bg-slate-200 hover:bg-slate-300 dark:bg-slate-700 dark:hover:bg-slate-600 text-slate-800 dark:text-white text-[11px] font-bold flex items-center gap-1 cursor-pointer"
+                  >
+                    {copiedTempPass ? <Check className="w-3 h-3 text-emerald-600" /> : <Copy className="w-3 h-3" />}
+                    <span>{copiedTempPass ? 'Copied' : 'Copy'}</span>
+                  </button>
+                </div>
+              </div>
+              <div className="flex justify-between text-[11px] pt-1 text-amber-700 dark:text-amber-300 font-semibold">
+                <span>Validity Window:</span>
+                <span>
+                  30 minutes
+                  {resetModalData.expiresAt
+                    ? ` (until ${new Date(resetModalData.expiresAt).toLocaleTimeString([], {
+                        hour: '2-digit',
+                        minute: '2-digit',
+                      })})`
+                    : ''}
                 </span>
               </div>
             </div>
 
             <p className="text-[11px] text-slate-500 dark:text-slate-400 leading-relaxed text-left">
-              ⚠️ <strong>Mandatory Security Notice:</strong> This credential is a temporary recovery suggestion only. The user will be required to establish a new private password immediately upon their next login.
+              ⚠️ <strong>Security Notice:</strong> Share this password securely with the user. It expires automatically in <strong>30 minutes</strong>, and the user will be prompted to set a private password immediately after signing in.
             </p>
 
             <button
@@ -1070,6 +1115,7 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
               onClick={() => {
                 setIsResetSuccessModalOpen(false);
                 setResetModalData(null);
+                setCopiedTempPass(false);
               }}
               className="w-full py-2.5 bg-slate-900 hover:bg-slate-800 dark:bg-amber-500 dark:text-slate-950 dark:hover:bg-amber-400 text-white font-black text-xs rounded-xl shadow-xs transition-colors cursor-pointer"
             >

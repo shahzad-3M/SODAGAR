@@ -232,21 +232,28 @@ export const ProductImporterModal: React.FC<ProductImporterModalProps> = ({
 
     const res = await apiScrapeProductUrl(normalizedUrl, overrideHtml);
     const rawUrl = normalizedUrl;
+    const errText =
+      res.error ||
+      'Failed to extract product information from this link. Use "Paste HTML Source" or "Create Manual Draft from Link" below.';
+
     if (!res.ok || !res.product) {
       setIsLoading(false);
       setProgressPercent(0);
-      setImportError(
-        res.error ||
-          'Failed to extract product information from this URL. Some sites block automated requests — you can open the page source (Ctrl+U / Inspect) and paste HTML below as fallback.'
-      );
-      setShowHtmlFallback(true);
+      setImportError(errText);
+      const shouldSuggestHtml =
+        /paste html|inspect|outerhtml|blocked|challenge|captcha|cors|shell|dynamically|html source|timed out|could not reach/i.test(
+          errText
+        );
+      if (shouldSuggestHtml) {
+        setShowHtmlFallback(true);
+      }
       logProductImport({
         sourceUrl: rawUrl,
         productTitle: 'Failed Extraction',
         status: 'failed',
         variationsCount: 0,
         imagesCount: 0,
-        notes: res.error || 'Inaccessible or protected website',
+        notes: errText,
       });
       setLogs(getProductImportLogs());
       return;
@@ -298,6 +305,79 @@ export const ProductImporterModal: React.FC<ProductImporterModalProps> = ({
         : 'Live extraction completed.',
     });
     setLogs(getProductImportLogs());
+  };
+
+  const handleCreateManualDraftFromUrl = () => {
+    const raw = importUrl.trim();
+    const withProtocol = /^https?:\/\//i.test(raw) ? raw : raw ? `https://${raw}` : '';
+    let domain = 'External Store';
+    let derivedName = 'New Imported Product';
+    try {
+      if (withProtocol) {
+        const u = new URL(withProtocol);
+        domain = u.hostname.replace(/^www\./i, '');
+        const slug = u.pathname.split('/').filter(Boolean).pop() || '';
+        if (slug) {
+          derivedName = decodeURIComponent(slug)
+            .replace(/\.html?$/i, '')
+            .replace(/[-_]+/g, ' ')
+            .replace(/\b\w/g, (c) => c.toUpperCase())
+            .trim() || derivedName;
+        }
+      }
+    } catch {
+      // keep defaults
+    }
+
+    const freshCatRecords = getCategoryRecords();
+    setCategoryRecords(freshCatRecords);
+    const draftProduct: ProductItem = {
+      id: `prod_man_${Date.now()}`,
+      name: derivedName,
+      urduName: '',
+      category: freshCatRecords[0]?.name || 'General Wholesale',
+      deliveryType: 'standard',
+      sku: `MAN-${domain.split('.')[0].slice(0, 4).toUpperCase() || 'ITEM'}-${Math.floor(1000 + Math.random() * 9000)}`,
+      costPrice: 0,
+      marketPrice: 0,
+      ourPrice: 0,
+      stockQty: 25,
+      minStockAlert: 10,
+      salesCount: 0,
+      totalRevenue: 0,
+      totalProfit: 0,
+      isWinningItem: false,
+      badgeText: 'IMPORTED LOT',
+      websiteUrl: withProtocol || undefined,
+      sourceUrl: withProtocol || undefined,
+      sourceWebsiteName: domain,
+      imageUrl: '',
+      pictures: [],
+      brand: domain,
+      shortDescription: '',
+      details: '',
+      description: '',
+      specifications: { 'Source Host': domain },
+      features: [],
+      tags: [],
+      variations: [],
+      sizes: [],
+      status: 'draft',
+      createdAt: new Date().toISOString().split('T')[0],
+    };
+
+    setImportError(null);
+    setShowHtmlFallback(false);
+    setDuplicateMatch(null);
+    setOverwriteConfirmed(false);
+    setExtractedProduct(draftProduct);
+    setSelectedCategory(draftProduct.category);
+    setSelectedMainCatId(freshCatRecords[0]?.id || '');
+    setSelectedSubCatId('');
+    setSelectedChildCatId('');
+    setScrapeStatsSummary(
+      `Manual draft initialized from ${domain}. Upload photos, set pricing & details below, and save.`
+    );
   };
 
   // IMAGE MANAGEMENT: Local File Uploads
@@ -926,14 +1006,24 @@ export const ProductImporterModal: React.FC<ProductImporterModalProps> = ({
 
                 {showHtmlFallback && (
                   <div className="pt-2 border-t border-slate-200 dark:border-slate-800 space-y-2">
+                    <div className="text-[11px] text-slate-600 dark:text-slate-300 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-lg px-3 py-2 leading-relaxed">
+                      <strong>How to copy HTML properly:</strong> On Shopify/WooCommerce pages, press <code className="px-1 bg-slate-100 dark:bg-slate-800 rounded">Ctrl+U</code> → <code className="px-1 bg-slate-100 dark:bg-slate-800 rounded">Ctrl+A</code> → <code className="px-1 bg-slate-100 dark:bg-slate-800 rounded">Ctrl+C</code>. On <strong>Daraz / React / JavaScript</strong> sites, open the page, right-click → <strong>Inspect</strong> → right-click the top <code className="px-1 bg-slate-100 dark:bg-slate-800 rounded">&lt;html&gt;</code> tag → <strong>Copy → Copy outerHTML</strong>.
+                    </div>
                     <textarea
                       rows={4}
                       value={htmlFallbackSource}
                       onChange={(e) => setHtmlFallbackSource(e.target.value)}
-                      placeholder="Optional fallback: If a store uses Cloudflare/bot protection, copy page source (Ctrl+U -> Ctrl+A -> Ctrl+C) and paste HTML here, then click Extract from Pasted HTML..."
+                      placeholder="Paste full HTML source / outerHTML here, then click Extract from Pasted HTML..."
                       className="w-full px-3 py-2 text-[11px] font-mono bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-lg text-slate-800 dark:text-slate-100"
                     />
-                    <div className="flex justify-end">
+                    <div className="flex justify-end gap-2">
+                      <button
+                        type="button"
+                        onClick={handleCreateManualDraftFromUrl}
+                        className="px-3 py-1.5 bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 text-slate-700 dark:text-slate-200 font-bold text-xs rounded-lg cursor-pointer hover:bg-slate-100 dark:hover:bg-slate-700"
+                      >
+                        Create Manual Draft from Link
+                      </button>
                       <button
                         type="button"
                         disabled={isLoading || !htmlFallbackSource.trim()}
@@ -976,27 +1066,41 @@ export const ProductImporterModal: React.FC<ProductImporterModalProps> = ({
 
               {/* ERROR ALERT */}
               {importError && (
-                <div className="bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-800 rounded-xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-red-800 dark:text-red-200 text-xs">
-                  <div className="flex items-start gap-2">
+                <div className="bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-800 rounded-xl p-4 flex flex-col gap-3 text-red-800 dark:text-red-200 text-xs">
+                  <div className="flex items-start gap-2.5">
                     <AlertCircle className="w-4 h-4 shrink-0 text-red-500 mt-0.5" />
-                    <span>{importError}</span>
+                    <div className="space-y-1 flex-1">
+                      <div className="font-bold text-red-900 dark:text-red-100">
+                        Product Extraction Could Not Complete Automatically
+                      </div>
+                      <div className="whitespace-pre-line leading-relaxed text-red-800/95 dark:text-red-200/95">
+                        {importError}
+                      </div>
+                    </div>
                   </div>
-                  <div className="flex items-center gap-2 shrink-0">
+                  <div className="flex flex-wrap items-center justify-end gap-2 pt-1 border-t border-red-200/70 dark:border-red-800/60">
                     {!showHtmlFallback && (
                       <button
                         type="button"
                         onClick={() => setShowHtmlFallback(true)}
-                        className="px-3 py-1 bg-white dark:bg-slate-800 border border-red-300 dark:border-red-700 text-red-700 dark:text-red-200 font-bold rounded hover:bg-red-100 cursor-pointer text-[11px]"
+                        className="px-3 py-1.5 bg-white dark:bg-slate-800 border border-red-300 dark:border-red-700 text-red-700 dark:text-red-200 font-bold rounded-lg hover:bg-red-100 cursor-pointer text-[11px]"
                       >
                         Paste HTML Source
                       </button>
                     )}
                     <button
                       type="button"
-                      onClick={() => handleStartImport(importUrl)}
-                      className="px-3 py-1 bg-red-600 text-white font-bold rounded hover:bg-red-500 cursor-pointer text-[11px]"
+                      onClick={handleCreateManualDraftFromUrl}
+                      className="px-3 py-1.5 bg-white dark:bg-slate-800 border border-amber-400 dark:border-amber-700 text-amber-800 dark:text-amber-200 font-bold rounded-lg hover:bg-amber-50 dark:hover:bg-amber-950/40 cursor-pointer text-[11px]"
                     >
-                      Retry
+                      Create Manual Draft from Link
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleStartImport(importUrl)}
+                      className="px-3 py-1.5 bg-red-600 text-white font-bold rounded-lg hover:bg-red-500 cursor-pointer text-[11px]"
+                    >
+                      Retry Link
                     </button>
                   </div>
                 </div>

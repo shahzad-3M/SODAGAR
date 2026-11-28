@@ -33,6 +33,7 @@ import type {
   ReviewRewardSubmission,
   Transaction,
   UserAccount,
+  UserRole,
 } from './src/types/index.ts';
 import {
   defaultBusinessProfile,
@@ -927,13 +928,32 @@ async function startServer() {
   );
 
   // 4. AUTHENTICATION & ACCOUNT SECURITY ENDPOINTS
-  const generateTemporaryPassword = (length = 8): string => {
-    const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-    let out = '';
-    for (let i = 0; i < length; i++) {
-      out += alphabet[crypto.randomInt(0, alphabet.length)];
+  const TEMP_PASSWORD_TTL_MS = 30 * 60 * 1000;
+
+  const generateTemporaryPassword = (length = 10): string => {
+    const upper = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
+    const lower = 'abcdefghjkmnpqrstuvwxyz';
+    const digits = '23456789';
+    const all = upper + lower + digits;
+    const chars: string[] = [
+      upper[crypto.randomInt(0, upper.length)],
+      lower[crypto.randomInt(0, lower.length)],
+      digits[crypto.randomInt(0, digits.length)],
+    ];
+    while (chars.length < Math.max(8, length)) {
+      chars.push(all[crypto.randomInt(0, all.length)]);
     }
-    return out;
+    for (let i = chars.length - 1; i > 0; i--) {
+      const j = crypto.randomInt(0, i + 1);
+      [chars[i], chars[j]] = [chars[j], chars[i]];
+    }
+    return chars.join('');
+  };
+
+  const isTempPasswordExpired = (expiresAt?: string | null): boolean => {
+    if (!expiresAt) return false;
+    const ms = Date.parse(expiresAt);
+    return Number.isFinite(ms) && Date.now() > ms;
   };
 
   const recordLoginAudit = async (
@@ -969,6 +989,7 @@ async function startServer() {
       const { identifier, pin } = (req.body || {}) as { identifier?: string; pin?: string };
       const cleanId = normalizePhoneOrId(identifier || '');
       const cleanIdLower = (identifier || '').trim().toLowerCase();
+      const cleanUsernameLookup = cleanIdLower.replace(/^@+/, '');
       const cleanPin = (pin || '').trim();
 
       if (!cleanId || !cleanPin) {
@@ -976,7 +997,7 @@ async function startServer() {
         return;
       }
 
-      const rateKey = `login:${req.ip || 'unknown'}:${cleanIdLower || cleanId}`;
+      const rateKey = `login:${req.ip || 'unknown'}:${cleanUsernameLookup || cleanId}`;
       const rateIpKey = `login_ip:${req.ip || 'unknown'}`;
       const rl = checkAuthRateLimit(rateKey);
       const rlIp = checkAuthRateLimit(rateIpKey);
@@ -995,7 +1016,9 @@ async function startServer() {
       const envMasterPin = (process.env.ADMIN_MASTER_PIN || '').trim();
 
       const isSuperId =
-        cleanId === '03125256266' || cleanIdLower === 'admin' || cleanIdLower === 'admin@madinamarket.pk';
+        cleanId === '03125256266' ||
+        cleanUsernameLookup === 'admin' ||
+        cleanIdLower === 'admin@madinamarket.pk';
       if (isSuperId) {
         const matchesEnvMaster = Boolean(envMasterPin) && cleanPin === envMasterPin;
         const matchesStoredSuper = superAdminAcc
@@ -1070,16 +1093,13 @@ async function startServer() {
       const matchingAccounts = accounts.filter(
         (u) =>
           normalizePhoneOrId(u.phone) === cleanId ||
-          u.username.toLowerCase() === cleanIdLower ||
+          (u.username && u.username.toLowerCase() === cleanUsernameLookup) ||
           (u.email && u.email.toLowerCase() === cleanIdLower)
       );
 
       for (const acc of matchingAccounts) {
         const validHash = verifyServerSecret(cleanPin, acc.passwordHash, acc.passwordSalt);
-        const digits = acc.phone.replace(/\D/g, '');
-        const defaultPin = digits.length >= 6 ? digits.slice(-6) : '123456';
-        const validTemp = !acc.passwordHash && cleanPin === defaultPin;
-        if (validHash || validTemp) {
+        if (validHash) {
           if (acc.status !== 'active') {
             await recordLoginAudit(db, {
               userId: acc.id,
@@ -1090,6 +1110,21 @@ async function startServer() {
               note: 'Blocked suspended account',
             });
             res.status(403).json({ error: 'Account is suspended or inactive.' });
+            return;
+          }
+          if (acc.isTemporaryPassword && isTempPasswordExpired(acc.temporaryPasswordExpiresAt)) {
+            await recordLoginAudit(db, {
+              userId: acc.id,
+              userName: acc.fullName,
+              role: acc.role,
+              identifier: cleanId,
+              status: 'failed',
+              note: 'Expired 30-minute temporary password attempt',
+            });
+            res.status(401).json({
+              error:
+                'This temporary password has expired (valid for 30 minutes). Please request a new temporary password from Store Admin or Support.',
+            });
             return;
           }
           clearAuthFailures(rateKey);
@@ -1134,6 +1169,7 @@ async function startServer() {
               acc.role === 'admin' ||
               Boolean(acc.canAuthorizeCreditSale ?? acc.managerAuthorities?.canAuthorizeCreditSale),
             mustChangePassword: Boolean(acc.mustChangePassword),
+            temporaryPasswordExpiresAt: acc.temporaryPasswordExpiresAt,
             isAuthenticated: true,
           };
           const sessionToken = signSessionToken({ userId: acc.id, role: acc.role, name: acc.fullName });
@@ -1155,12 +1191,8 @@ async function startServer() {
       const matchedReseller = resellers.find(
         (r) => normalizePhoneOrId(r.phone) === cleanId || r.referralCode.toLowerCase() === cleanIdLower
       );
-      if (matchedReseller) {
-        const digits = matchedReseller.phone.replace(/\D/g, '');
-        const fallbackPin = digits.length >= 6 ? digits.slice(-6) : '123456';
-        const validPin = matchedReseller.pin
-          ? verifyServerSecret(cleanPin, matchedReseller.pin)
-          : cleanPin === fallbackPin;
+      if (matchedReseller && matchedReseller.pin) {
+        const validPin = verifyServerSecret(cleanPin, matchedReseller.pin);
         if (validPin) {
           if (matchedReseller.status !== 'active') {
             res.status(403).json({ error: 'Reseller account is inactive.' });
@@ -1210,12 +1242,8 @@ async function startServer() {
           c.id === cleanId ||
           (c.email && c.email.toLowerCase() === cleanIdLower)
       );
-      if (matchedCustomer) {
-        const digits = matchedCustomer.phone.replace(/\D/g, '');
-        const fallbackPin = digits.length >= 6 ? digits.slice(-6) : '123456';
-        const validPin = matchedCustomer.pin
-          ? verifyServerSecret(cleanPin, matchedCustomer.pin)
-          : cleanPin === fallbackPin;
+      if (matchedCustomer && matchedCustomer.pin) {
+        const validPin = verifyServerSecret(cleanPin, matchedCustomer.pin);
         if (validPin) {
           if (matchedCustomer.status === 'archived') {
             res.status(403).json({ error: 'Customer account is archived.' });
@@ -1402,7 +1430,10 @@ async function startServer() {
     }
 
     const resolvedUsername = cleanUsernameInput || normPhone || cleanPhone;
-    const effectiveSecret = shouldGenerateTemp ? generateTemporaryPassword(8) : cleanPin;
+    const effectiveSecret = shouldGenerateTemp ? generateTemporaryPassword(10) : cleanPin;
+    const tempPasswordExpiresAt = shouldGenerateTemp
+      ? new Date(Date.now() + TEMP_PASSWORD_TTL_MS).toISOString()
+      : undefined;
     const now = new Date().toISOString();
     const custId = `cust_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
     const newCust: Customer = {
@@ -1441,6 +1472,7 @@ async function startServer() {
       passwordSalt: hashed.salt,
       mustChangePassword: shouldGenerateTemp,
       isTemporaryPassword: shouldGenerateTemp,
+      temporaryPasswordExpiresAt: tempPasswordExpiresAt,
       linkedCustomerId: custId,
       createdAt: now,
       createdBy: 'self_registration',
@@ -1454,7 +1486,7 @@ async function startServer() {
       eventType: 'note_added',
       notes: `Customer self-registered via portal (@${resolvedUsername}). Notification WhatsApp: ${resolvedWhatsapp}${
         cleanEmail ? ` | Email: ${cleanEmail}` : ''
-      }${shouldGenerateTemp ? ' (Temporary password issued)' : ''}`,
+      }${shouldGenerateTemp ? ' (30-min random temporary password issued)' : ''}`,
     });
 
     const userObj = {
@@ -1469,6 +1501,7 @@ async function startServer() {
       customerId: custId,
       canAuthorizeCreditSale: false,
       mustChangePassword: shouldGenerateTemp,
+      temporaryPasswordExpiresAt: tempPasswordExpiresAt,
       isAuthenticated: true,
     };
     const sessionToken = signSessionToken({ userId: accId, role: 'customer', name: cleanName });
@@ -1482,6 +1515,7 @@ async function startServer() {
       username: resolvedUsername,
       sessionToken,
       temporaryPassword: shouldGenerateTemp ? effectiveSecret : undefined,
+      temporaryPasswordExpiresAt: tempPasswordExpiresAt,
       whatsappNumber: resolvedWhatsapp,
       email: cleanEmail || undefined,
     });
@@ -1552,14 +1586,18 @@ async function startServer() {
     );
     if (acc) {
       const envMasterPin = (process.env.ADMIN_MASTER_PIN || '').trim();
-      const digits = (acc.phone || '').replace(/\D/g, '');
-      const defaultAccPin = digits.length >= 6 ? digits.slice(-6) : '123456';
       const verified =
         verifyServerSecret(cur, acc.passwordHash, acc.passwordSalt) ||
-        (!acc.passwordHash && cur === defaultAccPin) ||
         (acc.role === 'super_admin' && Boolean(envMasterPin) && cur === envMasterPin);
       if (!verified) {
         res.status(403).json({ error: 'Current PIN / password is incorrect.' });
+        return;
+      }
+      if (acc.isTemporaryPassword && isTempPasswordExpired(acc.temporaryPasswordExpiresAt)) {
+        res.status(403).json({
+          error:
+            'Your temporary password has expired (valid for 30 minutes). Please ask an administrator to issue a new temporary password.',
+        });
         return;
       }
       const hashed = hashServerSecret(next);
@@ -1572,6 +1610,7 @@ async function startServer() {
               passwordSalt: hashed.salt,
               isTemporaryPassword: false,
               mustChangePassword: false,
+              temporaryPasswordExpiresAt: undefined,
             }
           : u
       );
@@ -1737,18 +1776,23 @@ async function startServer() {
       newPin?: string;
       tempPin?: string;
       code?: string;
+      mode?: 'temporary' | 'custom_permanent';
     };
     const lookupKey = String(req.params.id || body.targetId || body.id || body.username || '').trim();
     const lookupLower = lookupKey.replace(/^@+/, '').toLowerCase();
     const lookupNormPhone = normalizePhoneOrId(lookupKey);
     const rawPin = String(body.newPin || body.tempPin || body.code || '').trim();
-    const effectivePin = rawPin || generateTemporaryPassword(8);
+    const isCustomPermanent = body.mode === 'custom_permanent' && rawPin.length >= 4;
+    const isTemporary = !isCustomPermanent;
+    const effectivePin = isCustomPermanent ? rawPin : rawPin || generateTemporaryPassword(10);
+    const expiresAt = isTemporary ? new Date(Date.now() + TEMP_PASSWORD_TTL_MS).toISOString() : undefined;
+
     if (!lookupKey) {
       res.status(400).json({ error: 'Target user ID or username is required.' });
       return;
     }
     if (effectivePin.length < 4) {
-      res.status(400).json({ error: 'New temporary PIN must be at least 4 characters.' });
+      res.status(400).json({ error: 'Password / PIN must be at least 4 characters.' });
       return;
     }
 
@@ -1757,6 +1801,9 @@ async function startServer() {
     const target = accounts.find(
       (u) =>
         u.id === lookupKey ||
+        u.linkedCustomerId === lookupKey ||
+        u.id === `usr_cust_${lookupKey}` ||
+        u.id === `usr_res_${lookupKey}` ||
         u.username?.toLowerCase() === lookupLower ||
         normalizePhoneOrId(u.phone) === lookupNormPhone
     );
@@ -1772,44 +1819,94 @@ async function startServer() {
               ...u,
               passwordHash: hashed.hash,
               passwordSalt: hashed.salt,
-              isTemporaryPassword: true,
-              mustChangePassword: true,
+              isTemporaryPassword: isTemporary,
+              mustChangePassword: isTemporary,
+              temporaryPasswordExpiresAt: expiresAt,
+              suggestedDefaultPin: undefined,
             }
           : u
       );
       await saveCollectionValue(db, 'user_accounts', updated);
+
+      if (target.linkedCustomerId) {
+        const linkedCust = (await getAllCustomersFromDb(db)).find((c) => c.id === target.linkedCustomerId);
+        if (linkedCust && linkedCust.pin) {
+          const cleanCust = { ...linkedCust };
+          delete cleanCust.pin;
+          await upsertCustomerRow(db, cleanCust);
+        }
+      }
+
       await insertAdminAuditLog(db, {
-        action: 'admin_reset_user_pin',
+        action: isTemporary ? 'admin_issue_temp_password' : 'admin_set_custom_pin',
         entityType: 'user_account',
         entityId: target.id,
         actorId: actor.id,
         actorName: actor.name,
         actorRole: actor.role,
-        details: { targetUsername: target.username, targetRole: target.role },
+        details: { targetUsername: target.username, targetRole: target.role, expiresAt },
       });
       broadcastSyncEvent('user_accounts', req.header('x-client-id'));
-      res.json({ ok: true, tempPin: effectivePin, username: target.username });
+      res.json({
+        ok: true,
+        tempPin: effectivePin,
+        isTemporary,
+        expiresAt,
+        username: target.username,
+      });
       return;
     }
 
-    // Also allow resetting Customer or Reseller PINs securely as scrypt hashes
+    // Create/link authoritative UserAccount when resetting a Customer or Reseller who did not have one yet
     const customers = await getAllCustomersFromDb(db);
     const cust = customers.find(
       (c) => c.id === lookupKey || normalizePhoneOrId(c.phone) === lookupNormPhone
     );
     if (cust) {
-      const hashedSingle = hashSingleSecretString(effectivePin);
-      await upsertCustomerRow(db, { ...cust, pin: hashedSingle });
+      const hashed = hashServerSecret(effectivePin);
+      const resolvedUsername = normalizePhoneDigits(cust.phone) || cust.id;
+      const newAcc: UserAccount = {
+        id: `usr_cust_${cust.id}`,
+        fullName: cust.name,
+        urduName: cust.urduName,
+        username: resolvedUsername,
+        phone: cust.phone,
+        whatsapp: cust.whatsapp || cust.phone,
+        whatsappSameAsPhone: cust.whatsappSameAsPhone ?? true,
+        email: cust.email,
+        role: 'customer',
+        status: 'active',
+        passwordHash: hashed.hash,
+        passwordSalt: hashed.salt,
+        isTemporaryPassword: isTemporary,
+        mustChangePassword: isTemporary,
+        temporaryPasswordExpiresAt: expiresAt,
+        linkedCustomerId: cust.id,
+        createdAt: new Date().toISOString(),
+        createdBy: actor.id || 'admin',
+      };
+      const cleanCust = { ...cust };
+      delete cleanCust.pin;
+      await upsertCustomerRow(db, cleanCust);
+      await saveCollectionValue(db, 'user_accounts', [...accounts, newAcc]);
       await insertAdminAuditLog(db, {
-        action: 'admin_reset_customer_pin',
+        action: isTemporary ? 'admin_issue_customer_temp_password' : 'admin_set_customer_pin',
         entityType: 'customer',
         entityId: cust.id,
         actorId: actor.id,
         actorName: actor.name,
         actorRole: actor.role,
+        details: { expiresAt },
       });
+      broadcastSyncEvent('user_accounts', req.header('x-client-id'));
       broadcastSyncEvent('customers', req.header('x-client-id'));
-      res.json({ ok: true, tempPin: effectivePin });
+      res.json({
+        ok: true,
+        tempPin: effectivePin,
+        isTemporary,
+        expiresAt,
+        username: resolvedUsername,
+      });
       return;
     }
 
@@ -1821,19 +1918,47 @@ async function startServer() {
         normalizePhoneOrId(r.phone) === lookupNormPhone
     );
     if (resAcc) {
+      const hashed = hashServerSecret(effectivePin);
+      const resolvedUsername = resAcc.referralCode.toLowerCase() || normalizePhoneDigits(resAcc.phone) || resAcc.id;
+      const newAcc: UserAccount = {
+        id: `usr_res_${resAcc.id}`,
+        fullName: resAcc.name,
+        urduName: resAcc.urduName,
+        username: resolvedUsername,
+        phone: resAcc.phone,
+        role: 'reseller',
+        status: resAcc.status === 'active' ? 'active' : 'inactive',
+        passwordHash: hashed.hash,
+        passwordSalt: hashed.salt,
+        isTemporaryPassword: isTemporary,
+        mustChangePassword: isTemporary,
+        temporaryPasswordExpiresAt: expiresAt,
+        linkedResellerCode: resAcc.referralCode,
+        createdAt: new Date().toISOString(),
+        createdBy: actor.id || 'admin',
+      };
       const hashedSingle = hashSingleSecretString(effectivePin);
       const updatedResellers = resellers.map((r) => (r.id === resAcc.id ? { ...r, pin: hashedSingle } : r));
       await saveCollectionValue(db, 'resellers', updatedResellers);
+      await saveCollectionValue(db, 'user_accounts', [...accounts, newAcc]);
       await insertAdminAuditLog(db, {
-        action: 'admin_reset_reseller_pin',
+        action: isTemporary ? 'admin_issue_reseller_temp_password' : 'admin_set_reseller_pin',
         entityType: 'reseller',
         entityId: resAcc.id,
         actorId: actor.id,
         actorName: actor.name,
         actorRole: actor.role,
+        details: { expiresAt },
       });
+      broadcastSyncEvent('user_accounts', req.header('x-client-id'));
       broadcastSyncEvent('resellers', req.header('x-client-id'));
-      res.json({ ok: true, tempPin: effectivePin });
+      res.json({
+        ok: true,
+        tempPin: effectivePin,
+        isTemporary,
+        expiresAt,
+        username: resolvedUsername,
+      });
       return;
     }
 
@@ -1842,6 +1967,111 @@ async function startServer() {
 
   app.post('/api/admin/users/:id/reset-password', asyncRoute(handleAdminResetPassword));
   app.post('/api/account/admin-pin-update', asyncRoute(handleAdminResetPassword));
+
+  const handleAdminCreateUser = async (req: Request, res: Response) => {
+    const actor = await resolveActor(req);
+    if (actor.role !== 'super_admin' && actor.role !== 'admin') {
+      res.status(403).json({ error: 'Only administrators can create user accounts.' });
+      return;
+    }
+    const body = (req.body || {}) as {
+      fullName?: string;
+      username?: string;
+      phone?: string;
+      email?: string;
+      role?: UserRole;
+      canAuthorizeCreditSale?: boolean;
+      crmRole?: CRMRoleSpecialization;
+      crmPermissions?: CRMPermissions;
+      customPin?: string;
+      customPassword?: string;
+      autoGenerateTemp?: boolean;
+    };
+    const cleanFullName = String(body.fullName || '').trim();
+    const cleanPhone = String(body.phone || '').trim().replace(/[\s-]/g, '');
+    const cleanEmail = String(body.email || '').trim().toLowerCase();
+    const normalizedUsername = validateAndNormalizeUsername(String(body.username || ''));
+    const requestedRole = body.role || 'customer';
+
+    if (!cleanPhone || !normalizedUsername) {
+      res.status(400).json({
+        error: 'Phone number and a valid username (3–32 letters, numbers, _, ., or -) are required.',
+      });
+      return;
+    }
+    if (requestedRole === 'super_admin') {
+      res.status(403).json({ error: 'Cannot create additional Super Admin accounts.' });
+      return;
+    }
+
+    const customPin = String(body.customPassword || body.customPin || '').trim();
+    const useRandomTemp = body.autoGenerateTemp === true || !customPin;
+    if (!useRandomTemp && customPin.length < 4) {
+      res.status(400).json({ error: 'Custom password / PIN must be at least 4 characters.' });
+      return;
+    }
+
+    const db = await getDb();
+    const accounts = await getCollectionValue<UserAccount[]>(db, 'user_accounts', []);
+    if (accounts.some((u) => u.username?.toLowerCase() === normalizedUsername)) {
+      res.status(409).json({ error: `Username "@${normalizedUsername}" is already taken.` });
+      return;
+    }
+
+    const effectivePin = useRandomTemp ? generateTemporaryPassword(10) : customPin;
+    const expiresAt = new Date(Date.now() + TEMP_PASSWORD_TTL_MS).toISOString();
+    const hashed = hashServerSecret(effectivePin);
+    const isSellerRole = requestedRole === 'admin' || requestedRole === 'manager' || requestedRole === 'staff';
+    const allowCredit = requestedRole === 'admin' || (isSellerRole && Boolean(body.canAuthorizeCreditSale));
+    const now = new Date().toISOString();
+
+    const newAcc: UserAccount = {
+      id: `usr_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      username: normalizedUsername,
+      fullName: cleanFullName || `User ${normalizedUsername}`,
+      phone: cleanPhone,
+      email: cleanEmail || undefined,
+      role: requestedRole,
+      status: 'active',
+      canAuthorizeCreditSale: allowCredit,
+      crmRole: isSellerRole ? body.crmRole : undefined,
+      crmPermissions: isSellerRole ? body.crmPermissions : undefined,
+      passwordHash: hashed.hash,
+      passwordSalt: hashed.salt,
+      mustChangePassword: true,
+      isTemporaryPassword: true,
+      temporaryPasswordExpiresAt: expiresAt,
+      createdAt: now,
+      createdBy: actor.id || 'admin',
+      loginCount: 0,
+    };
+
+    await saveCollectionValue(db, 'user_accounts', [...accounts, newAcc]);
+    await insertAdminAuditLog(db, {
+      action: 'admin_create_user',
+      entityType: 'user_account',
+      entityId: newAcc.id,
+      actorId: actor.id,
+      actorName: actor.name,
+      actorRole: actor.role,
+      details: { username: newAcc.username, role: newAcc.role, expiresAt },
+    });
+    broadcastSyncEvent('user_accounts', req.header('x-client-id'));
+
+    const { passwordHash: _ph, passwordSalt: _ps, ...safeUser } = newAcc;
+    res.json({
+      ok: true,
+      user: safeUser,
+      tempPin: effectivePin,
+      temporaryPassword: effectivePin,
+      isTemporary: true,
+      expiresAt,
+      temporaryPasswordExpiresAt: expiresAt,
+    });
+  };
+
+  app.post('/api/admin/users', asyncRoute(handleAdminCreateUser));
+  app.post('/api/account/admin-user-create', asyncRoute(handleAdminCreateUser));
 
   app.post(
     '/api/account/username-update',
@@ -2235,8 +2465,17 @@ async function startServer() {
     })
   );
 
-  // 5B. REAL URL PRODUCT SCRAPER ENDPOINT
-  app.post('/api/products/scrape-url', async (req, res) => {
+  // 5B. REAL URL PRODUCT SCRAPER ENDPOINT (+ WAF-SAFE BASE64 ALIAS)
+  const decodeUtf8Base64 = (b64?: string): string | undefined => {
+    if (!b64 || typeof b64 !== 'string') return undefined;
+    try {
+      return Buffer.from(b64, 'base64').toString('utf8');
+    } catch {
+      return undefined;
+    }
+  };
+
+  const handleProductLinkPreview = async (req: Request, res: Response) => {
     try {
       const actor = await resolveActor(req);
       if (!actor.id) {
@@ -2248,23 +2487,28 @@ async function startServer() {
       }
       if (actor.role !== 'super_admin' && actor.role !== 'admin' && actor.role !== 'manager') {
         res.status(403).json({
-          error: 'Only administrators or store managers can scrape external product links.',
+          error: 'Only administrators or store managers can extract external product links.',
         });
         return;
       }
 
-      const { url, htmlOverride } = (req.body || {}) as {
+      const body = (req.body || {}) as {
         url?: string;
+        encodedUrl?: string;
         htmlOverride?: string;
+        encodedHtml?: string;
       };
-      if (!url || typeof url !== 'string' || !url.trim()) {
+      const resolvedUrl = (body.url || decodeUtf8Base64(body.encodedUrl) || '').trim();
+      const resolvedHtml = body.htmlOverride || decodeUtf8Base64(body.encodedHtml);
+
+      if (!resolvedUrl) {
         res.status(400).json({ error: 'Product URL is required.' });
         return;
       }
 
       const db = await getDb();
       const categories = await getAllCategoriesFromDb(db);
-      const result = await scrapeProductFromUrl(url.trim(), categories, htmlOverride);
+      const result = await scrapeProductFromUrl(resolvedUrl, categories, resolvedHtml);
       res.json({
         ok: true,
         product: result.product,
@@ -2274,7 +2518,10 @@ async function startServer() {
       const message = err instanceof Error ? err.message : 'Unable to fetch or parse product page.';
       res.status(422).json({ error: message });
     }
-  });
+  };
+
+  app.post('/api/products/scrape-url', handleProductLinkPreview);
+  app.post('/api/catalog/link-preview', handleProductLinkPreview);
 
   // 5B-2. CACHE EXTERNAL IMAGE LOCALLY ON SERVER
   app.post('/api/media/cache', async (req, res) => {
@@ -6098,10 +6345,11 @@ async function startServer() {
   const distDir =
     distDirCandidates.find((dir) => fs.existsSync(path.join(dir, 'index.html'))) || distDirCandidates[0];
   const hasBuiltDist = fs.existsSync(path.join(distDir, 'index.html'));
+  const kService = (process.env.K_SERVICE || '').trim();
+  const isAiStudioDev = kService.startsWith('ais-dev-');
   const isProduction =
     process.env.NODE_ENV === 'production' ||
-    Boolean(process.env.K_SERVICE) ||
-    (process.env.NODE_ENV !== 'development' && hasBuiltDist);
+    (process.env.NODE_ENV !== 'development' && !isAiStudioDev && (Boolean(kService) || hasBuiltDist));
 
   // Frontend middleware / static dist serving (production NEVER starts Vite dev middleware)
   if (!isProduction) {

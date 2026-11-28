@@ -60,6 +60,7 @@ interface RegistrationConfirmationState {
   whatsappNumber: string;
   email?: string;
   temporaryPassword: string;
+  temporaryPasswordExpiresAt?: string;
   user: Partial<AppUser> & { role: UserRole };
 }
 
@@ -202,7 +203,7 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
       if (authUser.mustChangePassword === true) {
         setPendingUserAccount({
           id: authUser.id || `usr_${Date.now()}`,
-          username: cleanId,
+          username: authUser.username || cleanId,
           fullName: authUser.name || 'User',
           urduName: authUser.urduName,
           phone: authUser.phone || cleanId,
@@ -321,6 +322,7 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
       whatsappNumber: resolvedWhatsapp,
       email: regRes.email || cleanEmail || undefined,
       temporaryPassword: tempPassword,
+      temporaryPasswordExpiresAt: regRes.temporaryPasswordExpiresAt,
       user: confirmedUser,
     });
     setWhatsappSentDone(false);
@@ -339,9 +341,9 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
       `Login Mobile: ${conf.phone}`,
       `Notification WhatsApp: ${conf.whatsappNumber}`,
       ...(conf.email ? [`Email: ${conf.email}`] : []),
-      `Temporary Password: ${conf.temporaryPassword}`,
+      `Temporary Password (valid 30 mins): ${conf.temporaryPassword}`,
       ``,
-      `Please sign in at ${siteOrigin} and change your temporary password from your account settings.`,
+      `Please sign in at ${siteOrigin} within 30 minutes and set your private password from your account settings.`,
     ].join('\n');
   };
 
@@ -369,6 +371,7 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
       }
       onSelectRole(pendingUserAccount.role, {
         id: pendingUserAccount.id,
+        username: pendingUserAccount.username,
         name: pendingUserAccount.fullName,
         urduName: pendingUserAccount.urduName,
         phone: pendingUserAccount.phone,
@@ -943,9 +946,14 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
               )}
 
               <div className="pt-2 border-t border-slate-200 dark:border-slate-700">
-                <span className="text-[11px] font-bold text-slate-600 dark:text-slate-300 block mb-1">
-                  Temporary Password (عارضی پاس ورڈ):
-                </span>
+                <div className="flex items-center justify-between gap-2 mb-1">
+                  <span className="text-[11px] font-bold text-slate-600 dark:text-slate-300">
+                    Temporary Password (عارضی پاس ورڈ):
+                  </span>
+                  <span className="px-1.5 py-0.5 rounded bg-amber-100 dark:bg-amber-900/60 text-amber-800 dark:text-amber-200 text-[10px] font-bold">
+                    Valid 30 mins
+                  </span>
+                </div>
                 <div className="flex items-center gap-2">
                   <div className="flex-1 px-3 py-2 rounded-lg bg-white dark:bg-slate-900 border border-amber-300 dark:border-amber-700 font-mono text-sm font-black tracking-widest text-slate-900 dark:text-amber-300 flex items-center justify-between">
                     <span>
@@ -973,6 +981,15 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
                     <span>{copiedTempPass ? 'Copied' : 'Copy'}</span>
                   </button>
                 </div>
+                <p className="text-[10px] text-amber-700 dark:text-amber-300 mt-1 font-medium">
+                  This unguessable temporary password expires in 30 minutes
+                  {regConfirmation.temporaryPasswordExpiresAt
+                    ? ` (${new Date(regConfirmation.temporaryPasswordExpiresAt).toLocaleTimeString([], {
+                        hour: '2-digit',
+                        minute: '2-digit',
+                      })})`
+                    : ''}. Please set your own private password below.
+                </p>
               </div>
             </div>
 

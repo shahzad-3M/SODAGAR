@@ -31,6 +31,7 @@ import {
   ChevronLeft,
   ChevronRight,
   Database,
+  Copy,
 } from 'lucide-react';
 import type { BusinessProfile, Customer, DeliveryCityConfig, LoginAuditRecord, Reseller } from '../types/index.ts';
 import { defaultDeliveryCities } from '../utils/defaultData.ts';
@@ -43,7 +44,6 @@ import {
   saveLoginAudits,
   apiChangeMasterPin,
   apiAdminResetPassword,
-  getDefaultPinForPhone,
   getCustomers,
   saveCustomers,
   getResellers,
@@ -124,6 +124,14 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [userDirPage, setUserDirPage] = useState(1);
   const USER_DIR_PAGE_SIZE = 25;
   const [userListNotice, setUserListNotice] = useState<string | null>(null);
+  const [issuedTempPasswordInfo, setIssuedTempPasswordInfo] = useState<{
+    name: string;
+    phone: string;
+    roleLabel: string;
+    tempPin: string;
+    expiresAt?: string;
+    copied?: boolean;
+  } | null>(null);
   const [serverHealth, setServerHealth] = useState<ServerHealthInfo | null>(null);
   const [serverBackups, setServerBackups] = useState<ServerBackupEntry[]>([]);
   const [dailyBackupLastAt, setDailyBackupLastAt] = useState<string | null>(null);
@@ -597,12 +605,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     setTimeout(() => setPinChangeMsg(null), 3500);
   };
 
-  // 1-CLICK RESET USER PIN TO DEFAULT (SERVER HASHED)
-  const handleResetUserPinToDefault = async (user: Customer | Reseller, role: 'customer' | 'reseller') => {
-    const defaultPin = getDefaultPinForPhone(user.phone);
-    const res = await apiAdminResetPassword(user.id, defaultPin);
-    if (!res.ok) {
-      pushToast(res.error || `Failed to reset PIN for ${user.name}.`, 'error');
+  // 1-CLICK ISSUE RANDOM 30-MIN TEMPORARY PASSWORD (SERVER HASHED)
+  const handleIssueTempPassword = async (user: Customer | Reseller, role: 'customer' | 'reseller') => {
+    const res = await apiAdminResetPassword(user.id, undefined, undefined, 'temporary');
+    if (!res.ok || !res.tempPin) {
+      pushToast(res.error || `Failed to issue temporary password for ${user.name}.`, 'error');
       return;
     }
     if (role === 'customer' && onUpdateCustomer) {
@@ -611,40 +618,50 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       onUpdateReseller({ ...(user as Reseller), pin: undefined });
     }
     onRefreshAllData();
+    const roleLabel = role === 'customer' ? 'Customer' : 'Reseller';
     const roleUrdu = role === 'customer' ? 'کسٹمر' : 'ری سیلر';
+    setIssuedTempPasswordInfo({
+      name: user.name,
+      phone: user.phone,
+      roleLabel,
+      tempPin: res.tempPin,
+      expiresAt: res.expiresAt,
+      copied: false,
+    });
     setUserListNotice(
-      `${roleUrdu} "${user.name}" کا پن ڈیفالٹ (موبائل کے آخری 6 ہندسے) پر محفوظ طریقے سے ری سیٹ ہو گیا۔`
+      `${roleUrdu} "${user.name}" کے لیے 30 منٹ کا نیا خفیہ عارضی پاس ورڈ جاری کر دیا گیا ہے۔`
     );
-    pushToast(`Security PIN reset to default for ${user.name}.`, 'success');
-    setTimeout(() => setUserListNotice(null), 4000);
+    pushToast(`Random 30-min temporary password issued for ${user.name}.`, 'success');
+    setTimeout(() => setUserListNotice(null), 5000);
   };
 
   // SET CUSTOM PIN FOR A USER (SERVER HASHED)
   const handleSetCustomUserPin = (user: Customer | Reseller, role: 'customer' | 'reseller') => {
     setInputPrompt({
-      title: 'Set Custom Security PIN',
-      label: `نیا کم از کم 4 ہندسوں کا پن کوڈ درج کریں برائے ${user.name} (${user.phone}):`,
+      title: 'Set Custom Security PIN / Password',
+      label: `نیا کم از کم 4 حروف یا ہندسوں کا پاس ورڈ / پن کوڈ درج کریں برائے ${user.name} (${user.phone}):`,
       initialValue: '',
       submitLabel: 'Save Hashed PIN',
       onSubmit: async (input) => {
         const clean = input.trim();
         if (clean.length < 4) {
-          pushToast('PIN must be at least 4 digits.', 'error');
+          pushToast('Password / PIN must be at least 4 characters.', 'error');
           return;
         }
-        const res = await apiAdminResetPassword(user.id, clean);
+        const res = await apiAdminResetPassword(user.id, clean, undefined, 'custom_permanent');
         if (!res.ok) {
-          pushToast(res.error || `Could not update PIN for ${user.name}.`, 'error');
+          pushToast(res.error || `Could not update password for ${user.name}.`, 'error');
           return;
         }
         if (role === 'customer' && onUpdateCustomer) {
-          onUpdateCustomer({ ...(user as Customer) });
+          onUpdateCustomer({ ...(user as Customer), pin: undefined });
         } else if (role === 'reseller' && onUpdateReseller) {
-          onUpdateReseller({ ...(user as Reseller) });
+          onUpdateReseller({ ...(user as Reseller), pin: undefined });
         }
+        setIssuedTempPasswordInfo(null);
         onRefreshAllData();
-        setUserListNotice(`نیا سیکیورٹی پن برائے ${user.name} سرور پر محفوظ (Encrypted) ہو گیا۔`);
-        pushToast(`Security PIN updated securely for ${user.name}.`, 'success');
+        setUserListNotice(`نیا خفیہ پاس ورڈ برائے ${user.name} سرور پر محفوظ (Encrypted) ہو گیا۔`);
+        pushToast(`Security password updated securely for ${user.name}.`, 'success');
         setTimeout(() => setUserListNotice(null), 4000);
       },
     });
@@ -2148,7 +2165,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     Customer &amp; Reseller Security PINs / صارفین کے پن کوڈز
                   </h3>
                   <p className="text-xs text-slate-500 dark:text-slate-400">
-                    Policy: Default PIN is the <span className="font-semibold text-slate-900 dark:text-white">last 6 digits of mobile number</span>. Users can change PIN inside their personal portal.
+                    Policy: Temporary passwords are <span className="font-semibold text-slate-900 dark:text-white">randomly generated &amp; unguessable, valid for 30 minutes</span>. Users set their own private password upon login.
                   </p>
                 </div>
               </div>
@@ -2217,6 +2234,55 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               <div className="mt-3 p-3 rounded-lg bg-emerald-50 dark:bg-emerald-950/40 text-emerald-800 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800 text-xs flex items-center gap-2">
                 <Check className="w-4 h-4 shrink-0" />
                 <span>{userListNotice}</span>
+              </div>
+            )}
+
+            {issuedTempPasswordInfo && (
+              <div className="mt-3 p-3.5 rounded-xl bg-amber-50 dark:bg-amber-950/40 border border-amber-300 dark:border-amber-700 text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div className="space-y-0.5">
+                  <div className="font-bold text-amber-900 dark:text-amber-200 flex items-center gap-1.5">
+                    <KeyRound className="w-4 h-4 text-amber-600 shrink-0" />
+                    <span>
+                      Temporary Password for {issuedTempPasswordInfo.name} ({issuedTempPasswordInfo.roleLabel})
+                    </span>
+                  </div>
+                  <div className="text-[11px] text-amber-800 dark:text-amber-300">
+                    Mobile: <span className="font-mono font-semibold">{issuedTempPasswordInfo.phone}</span> · Valid for{' '}
+                    <strong>30 minutes</strong>
+                    {issuedTempPasswordInfo.expiresAt
+                      ? ` (until ${new Date(issuedTempPasswordInfo.expiresAt).toLocaleTimeString([], {
+                          hour: '2-digit',
+                          minute: '2-digit',
+                        })})`
+                      : ''}
+                  </div>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  <span className="font-mono text-sm font-black tracking-wider bg-white dark:bg-slate-900 border border-amber-300 dark:border-amber-700 text-slate-900 dark:text-amber-300 px-3 py-1.5 rounded-lg select-all">
+                    {issuedTempPasswordInfo.tempPin}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      navigator.clipboard?.writeText(issuedTempPasswordInfo.tempPin);
+                      setIssuedTempPasswordInfo((prev) => (prev ? { ...prev, copied: true } : prev));
+                      setTimeout(() => {
+                        setIssuedTempPasswordInfo((prev) => (prev ? { ...prev, copied: false } : prev));
+                      }, 2000);
+                    }}
+                    className="px-2.5 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-[11px] flex items-center gap-1 cursor-pointer"
+                  >
+                    {issuedTempPasswordInfo.copied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                    <span>{issuedTempPasswordInfo.copied ? 'Copied' : 'Copy'}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setIssuedTempPasswordInfo(null)}
+                    className="text-amber-700 dark:text-amber-300 hover:underline text-[11px] font-semibold px-1 cursor-pointer"
+                  >
+                    Dismiss
+                  </button>
+                </div>
               </div>
             )}
 
@@ -2289,18 +2355,20 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                           <td className="py-2.5 px-3 text-right">
                             <div className="inline-flex items-center gap-1">
                               <button
-                                onClick={() => void handleResetUserPinToDefault(u, u.userType)}
-                                className="px-2 py-1 text-[11px] font-medium text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 rounded border border-slate-200 dark:border-slate-700 cursor-pointer flex items-center gap-1"
-                                title="Reset to hashed default (last 6 digits of mobile)"
+                                type="button"
+                                onClick={() => void handleIssueTempPassword(u, u.userType)}
+                                className="px-2 py-1 text-[11px] font-medium text-amber-800 dark:text-amber-300 bg-amber-50/70 hover:bg-amber-100 dark:bg-amber-950/40 dark:hover:bg-amber-900/50 rounded border border-amber-200 dark:border-amber-800 cursor-pointer flex items-center gap-1"
+                                title="Generate a random unguessable temporary password valid for 30 minutes"
                               >
-                                <RotateCcw className="w-3 h-3 text-slate-500" />
-                                <span>Reset to Default</span>
+                                <RotateCcw className="w-3 h-3 text-amber-600" />
+                                <span>Temp Password (30m)</span>
                               </button>
 
                               <button
+                                type="button"
                                 onClick={() => handleSetCustomUserPin(u, u.userType)}
                                 className="px-2 py-1 text-[11px] font-medium text-blue-600 dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-950/50 rounded border border-blue-200 dark:border-blue-800 cursor-pointer"
-                                title="Assign custom hashed PIN"
+                                title="Assign custom hashed password / PIN"
                               >
                                 Set PIN
                               </button>

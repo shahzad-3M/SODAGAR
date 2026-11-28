@@ -42,7 +42,6 @@ import {
   getCODOrders,
   getCurrentUser,
   getCustomers,
-  getDefaultPinForPhone,
   getEmployees,
   getInvestors,
   getLuckyDraws,
@@ -685,7 +684,6 @@ export default function App() {
         creditLimit: 5000,
         paymentTermsDays: 7,
         status: 'active',
-        pin: getDefaultPinForPhone(saleData.buyerDetails.phone),
         createdAt: todayStr,
       };
       activeCustomers = [customer, ...activeCustomers];
@@ -1034,7 +1032,6 @@ export default function App() {
         creditLimit: 5000,
         paymentTermsDays: 7,
         status: 'active',
-        pin: getDefaultPinForPhone(order.phone || '03000000000'),
         createdAt: todayStr,
       };
       activeCustomers = [matchedCustomer, ...activeCustomers];

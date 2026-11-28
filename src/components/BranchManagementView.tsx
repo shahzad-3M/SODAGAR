@@ -44,6 +44,9 @@ import {
   createUserAccount,
   updateUserAccount,
   resetUserPasswordToDefault,
+  generateRandomTemporaryPassword,
+  TEMP_PASSWORD_TTL_MINUTES,
+  apiAdminCreateUser,
   getSalespersonReferrals,
   saveSalespersonReferrals,
   getCommissionRecords,
@@ -306,39 +309,72 @@ export const BranchManagementView: React.FC<BranchManagementViewProps> = ({
     }
 
     const assignedBranch = branches.find((b) => b.id === newManagerForm.branchId);
-    const plainPin = newManagerForm.password.trim() || newManagerForm.phone.replace(/\D/g, '').slice(-6) || '123456';
-    const pwdRecord = await createPasswordRecord(plainPin);
+    const customPwd = newManagerForm.password.trim();
+    if (customPwd && customPwd.length < 4) {
+      pushToast('Custom temporary password must be at least 4 characters.', 'error');
+      return;
+    }
 
-    const created = createUserAccount({
-      username: newManagerForm.username.trim(),
+    const defaultAuthorities = {
+      canRegisterWalkIn: true,
+      canEnterSales: true,
+      canViewStock: true,
+      canManageStock: false,
+      canRecordPayment: true,
+      canRecordCash: true,
+      canManageOrders: true,
+      canManageCustomers: true,
+      canAssignReferral: true,
+      canTrackReferrals: true,
+      canViewReports: true,
+      canViewHistory: true,
+      canAuthorizeDiscount: true,
+      maxDiscountPercent: 10,
+    };
+
+    const serverCreate = await apiAdminCreateUser({
+      username: newManagerForm.username.trim().replace(/^@+/, '').toLowerCase(),
       fullName: newManagerForm.fullName.trim(),
       phone: newManagerForm.phone.trim(),
       email: newManagerForm.email.trim() || undefined,
       role: 'manager',
-      status: 'active',
-      passwordHash: pwdRecord.hash,
-      passwordSalt: pwdRecord.salt,
-      suggestedDefaultPin: plainPin,
-      mustChangePassword: true,
-      linkedBranchId: assignedBranch?.id,
-      linkedBranchName: assignedBranch?.name,
-      managerAuthorities: {
-        canRegisterWalkIn: true,
-        canEnterSales: true,
-        canViewStock: true,
-        canManageStock: false,
-        canRecordPayment: true,
-        canRecordCash: true,
-        canManageOrders: true,
-        canManageCustomers: true,
-        canAssignReferral: true,
-        canTrackReferrals: true,
-        canViewReports: true,
-        canViewHistory: true,
-        canAuthorizeDiscount: true,
-        maxDiscountPercent: 10,
-      },
+      customPassword: customPwd || undefined,
     });
+
+    let created = serverCreate.ok ? serverCreate.user : undefined;
+    let issuedTempPass = serverCreate.temporaryPassword || customPwd;
+
+    if (!created) {
+      if (serverCreate.error && !serverCreate.error.toLowerCase().includes('network')) {
+        pushToast(serverCreate.error, 'error');
+        return;
+      }
+      issuedTempPass = customPwd || generateRandomTemporaryPassword(10);
+      const pwdRecord = await createPasswordRecord(issuedTempPass);
+      const expiresAt = new Date(Date.now() + TEMP_PASSWORD_TTL_MINUTES * 60 * 1000).toISOString();
+      created = createUserAccount({
+        username: newManagerForm.username.trim().replace(/^@+/, '').toLowerCase(),
+        fullName: newManagerForm.fullName.trim(),
+        phone: newManagerForm.phone.trim(),
+        email: newManagerForm.email.trim() || undefined,
+        role: 'manager',
+        status: 'active',
+        passwordHash: pwdRecord.hash,
+        passwordSalt: pwdRecord.salt,
+        mustChangePassword: true,
+        isTemporaryPassword: true,
+        temporaryPasswordExpiresAt: expiresAt,
+        linkedBranchId: assignedBranch?.id,
+        linkedBranchName: assignedBranch?.name,
+        managerAuthorities: defaultAuthorities,
+      });
+    } else {
+      updateUserAccount(created.id, {
+        linkedBranchId: assignedBranch?.id,
+        linkedBranchName: assignedBranch?.name,
+        managerAuthorities: defaultAuthorities,
+      });
+    }
 
     if (created) {
       if (assignedBranch) {
@@ -364,7 +400,10 @@ export const BranchManagementView: React.FC<BranchManagementViewProps> = ({
         branchId: '',
         password: '',
       });
-      pushToast(`Store Manager account created successfully! Temporary PIN: ${plainPin}`, 'success');
+      pushToast(
+        `Store Manager created! Temporary Password (valid 30 mins): ${issuedTempPass}`,
+        'success'
+      );
     } else {
       pushToast('Username or phone already taken.', 'error');
     }
@@ -1538,13 +1577,13 @@ export const BranchManagementView: React.FC<BranchManagementViewProps> = ({
 
               <div>
                 <label className="text-slate-600 dark:text-slate-400 font-bold block mb-1">
-                  Temporary PIN (Leave blank for last 6 digits of mobile)
+                  Temporary Password (Leave blank to auto-generate random 30-min password)
                 </label>
                 <input
-                  type="password"
+                  type="text"
                   value={newManagerForm.password}
                   onChange={(e) => setNewManagerForm({ ...newManagerForm, password: e.target.value })}
-                  placeholder="******"
+                  placeholder="Optional (auto-generated if empty)"
                   className="w-full px-3 py-2 border border-slate-200 dark:border-slate-700 rounded-lg bg-white dark:bg-slate-800 font-mono"
                 />
               </div>

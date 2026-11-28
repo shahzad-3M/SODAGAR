@@ -665,15 +665,43 @@ export async function tryFetchProductInBrowserFallback(
   try {
     parsed = new URL(targetUrl);
   } catch {
-    return { ok: false, error: 'Invalid URL format.' };
+    return {
+      ok: false,
+      error: 'Invalid product link format. Please paste a full link starting with https:// or http://.',
+    };
   }
+
+  const domain = parsed.hostname.replace(/^www\./i, '');
+  const attemptNotes: string[] = [];
+
+  const isUsefulProductHtml = (html: string): { ok: boolean; reason?: string } => {
+    const sample = html.slice(0, 60000).toLowerCase();
+    if (
+      sample.includes('/cdn-cgi/challenge-platform/') ||
+      sample.includes('cf-browser-verification') ||
+      sample.includes('<title>just a moment...</title>') ||
+      sample.includes('attention required! | cloudflare')
+    ) {
+      return { ok: false, reason: 'blocked by Cloudflare anti-bot verification' };
+    }
+    if (
+      sample.includes('sorry, we just need to make sure you\'re not a robot') ||
+      sample.includes('type the characters you see in this image')
+    ) {
+      return { ok: false, reason: 'blocked by CAPTCHA check' };
+    }
+    if (html.length < 400 || !/<title|<h1|<meta/i.test(html)) {
+      return { ok: false, reason: 'returned an empty or JavaScript-only HTML shell' };
+    }
+    return { ok: true };
+  };
 
   // 1. Try Shopify .json endpoint directly if URL contains /products/<handle>
   const shopifyMatch = parsed.pathname.match(/\/products\/([^/?#]+)/i);
   if (shopifyMatch?.[1]) {
     try {
       const jsonUrl = `${parsed.origin}/products/${shopifyMatch[1].replace(/\.json$/i, '')}.json`;
-      const res = await fetch(jsonUrl, { mode: 'cors', signal: AbortSignal.timeout(7000) });
+      const res = await fetch(jsonUrl, { mode: 'cors', signal: AbortSignal.timeout(6000) });
       if (res.ok) {
         const data = (await res.json()) as { product?: Record<string, unknown> };
         if (data?.product && typeof data.product.title === 'string') {
@@ -689,58 +717,103 @@ export async function tryFetchProductInBrowserFallback(
           parsedResult.diagnostics.strategiesUsed = ['Shopify JSON Direct'];
           return { ok: true, product: parsedResult.product, diagnostics: parsedResult.diagnostics };
         }
+      } else {
+        attemptNotes.push(`Shopify JSON returned HTTP ${res.status}`);
       }
-    } catch {
-      // continue to proxy/HTML bridges
+    } catch (err) {
+      const msg = err instanceof Error && err.name === 'TimeoutError' ? 'timed out' : 'blocked by CORS';
+      attemptNotes.push(`Shopify JSON ${msg}`);
     }
   }
 
   // 2. Try direct CORS fetch of HTML page
   try {
-    const directRes = await fetch(targetUrl, { mode: 'cors', signal: AbortSignal.timeout(7000) });
+    const directRes = await fetch(targetUrl, { mode: 'cors', signal: AbortSignal.timeout(6000) });
     if (directRes.ok) {
       const html = await directRes.text();
-      if (html && html.length > 400 && /<title|<h1|<meta/i.test(html)) {
-        return { ok: true, ...parseProductFromHtmlInBrowser(targetUrl, html, categories) };
+      const check = isUsefulProductHtml(html);
+      if (check.ok) {
+        const parsedDirect = parseProductFromHtmlInBrowser(targetUrl, html, categories);
+        if ((parsedDirect.product.pictures?.length ?? 0) > 0 || parsedDirect.product.ourPrice > 0) {
+          return { ok: true, ...parsedDirect };
+        }
+        attemptNotes.push('Direct fetch returned no price or images (JS-rendered page)');
+      } else {
+        attemptNotes.push(`Direct fetch ${check.reason}`);
       }
+    } else {
+      attemptNotes.push(`Direct browser fetch returned HTTP ${directRes.status}`);
     }
-  } catch {
-    // CORS not enabled on remote host; proceed to CORS bridge
+  } catch (err) {
+    const msg =
+      err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError')
+        ? 'timed out'
+        : 'blocked by website CORS policy';
+    attemptNotes.push(`Direct browser fetch ${msg}`);
   }
 
   // 3. Try CORS bridge fetchers
-  const bridges = [
-    async () => {
-      const r = await fetch(`https://api.allorigins.win/get?url=${encodeURIComponent(targetUrl)}`, {
-        signal: AbortSignal.timeout(9000),
-      });
-      if (!r.ok) return null;
-      const j = (await r.json()) as { contents?: string };
-      return j?.contents || null;
+  const bridges: Array<{ name: string; run: () => Promise<string | null> }> = [
+    {
+      name: 'CORS bridge #1',
+      run: async () => {
+        const r = await fetch(`https://api.allorigins.win/get?url=${encodeURIComponent(targetUrl)}`, {
+          signal: AbortSignal.timeout(8000),
+        });
+        if (!r.ok) {
+          attemptNotes.push(`CORS bridge #1 returned HTTP ${r.status}`);
+          return null;
+        }
+        const j = (await r.json()) as { contents?: string };
+        return j?.contents || null;
+      },
     },
-    async () => {
-      const r = await fetch(`https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(targetUrl)}`, {
-        signal: AbortSignal.timeout(9000),
-      });
-      if (!r.ok) return null;
-      return await r.text();
+    {
+      name: 'CORS bridge #2',
+      run: async () => {
+        const r = await fetch(`https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(targetUrl)}`, {
+          signal: AbortSignal.timeout(8000),
+        });
+        if (!r.ok) {
+          attemptNotes.push(`CORS bridge #2 returned HTTP ${r.status}`);
+          return null;
+        }
+        return await r.text();
+      },
     },
   ];
 
-  for (const fetcher of bridges) {
+  for (const bridge of bridges) {
     try {
-      const html = await fetcher();
-      if (html && html.length > 400 && /<title|<h1|<meta/i.test(html)) {
-        return { ok: true, ...parseProductFromHtmlInBrowser(targetUrl, html, categories) };
+      const html = await bridge.run();
+      if (!html) continue;
+      const check = isUsefulProductHtml(html);
+      if (!check.ok) {
+        attemptNotes.push(`${bridge.name} ${check.reason}`);
+        continue;
       }
-    } catch {
-      // try next bridge
+      const parsedBridge = parseProductFromHtmlInBrowser(targetUrl, html, categories);
+      if ((parsedBridge.product.pictures?.length ?? 0) > 0 || parsedBridge.product.ourPrice > 0) {
+        return { ok: true, ...parsedBridge };
+      }
+      attemptNotes.push(`${bridge.name} received HTML without product price/images (JS-rendered page)`);
+    } catch (err) {
+      const msg =
+        err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError')
+          ? 'timed out'
+          : 'unreachable';
+      attemptNotes.push(`${bridge.name} ${msg}`);
     }
   }
 
+  const summaryDetails = attemptNotes.length > 0 ? `\nDetails: ${attemptNotes.join('; ')}.` : '';
   return {
     ok: false,
     error:
-      'Could not reach the backend scraper or direct store page (blocked by host/CORS). Click "Paste HTML Source" below (Ctrl+U -> Ctrl+A -> Ctrl+C on the product page) and click "Extract from Pasted HTML" — it parses directly in your browser.',
+      `Could not automatically download product details from ${domain}.${summaryDetails}\n` +
+      `Recommended next step:\n` +
+      `• Standard stores (WordPress/WooCommerce/Shopify): Open the link, press Ctrl+U -> Ctrl+A -> Ctrl+C, and paste into "Paste HTML Source" below.\n` +
+      `• Dynamic stores (Daraz/React): Open the link, right-click -> Inspect -> right-click <html> -> Copy -> Copy outerHTML, and paste below.\n` +
+      `• Or click "Create Manual Draft from Link" to enter the product directly.`,
   };
 }

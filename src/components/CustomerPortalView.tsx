@@ -44,7 +44,6 @@ import {
   apiSaveCrmTicket,
   apiUpdateUsername,
   createUserAccount,
-  getDefaultPinForPhone,
   getUserAccounts,
   updateCustomerPin,
   updateUserAccount,
@@ -332,17 +331,12 @@ export const CustomerPortalView: React.FC<CustomerPortalViewProps> = ({
         (u.role === 'customer' && cleanUserPhone && u.phone.replace(/\D/g, '') === cleanUserPhone)
     );
 
-    const defaultPin = getDefaultPinForPhone(customer?.phone || currentUser.phone || '');
-    const currentStored = customer?.pin || defaultPin;
-
     const isAccMatch = matchedUserAcc
       ? await verifyPassword(curPass, matchedUserAcc.passwordHash, matchedUserAcc.passwordSalt)
       : false;
-    const isCustomerPinMatch = await verifyPassword(curPass, currentStored);
-    const isDefaultMatch =
-      !matchedUserAcc?.passwordHash && !customer?.pin && curPass === defaultPin;
+    const isCustomerPinMatch = customer?.pin ? await verifyPassword(curPass, customer.pin) : false;
 
-    if (!isAccMatch && !isCustomerPinMatch && !isDefaultMatch) {
+    if (!isAccMatch && !isCustomerPinMatch) {
       setSecurityError('Current password is incorrect. Please check and try again.');
       setIsUpdatingPassword(false);
       return;

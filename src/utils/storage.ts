@@ -43,6 +43,8 @@ import type {
   CRMCampaign,
   CRMCustomSegmentRule,
   CRMDashboardKPIs,
+  CRMPermissions,
+  CRMRoleSpecialization,
   CRMFollowUpTask,
   CRMLead,
   CRMLoyaltyAccount,
@@ -856,6 +858,20 @@ export async function apiActivateProductArrival(
   }
 }
 
+function encodeUtf8ToBase64(text: string): string {
+  try {
+    const bytes = new TextEncoder().encode(text);
+    let binary = '';
+    const chunkSize = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+    }
+    return btoa(binary);
+  } catch {
+    return btoa(unescape(encodeURIComponent(text)));
+  }
+}
+
 export async function apiScrapeProductUrl(
   url: string,
   htmlOverride?: string
@@ -875,7 +891,24 @@ export async function apiScrapeProductUrl(
   };
   error?: string;
 }> {
-  const attemptServerScrape = async (): Promise<Response> => {
+  type ScrapeResponseShape = {
+    ok?: boolean;
+    product?: ProductItem;
+    diagnostics?: {
+      strategiesUsed: string[];
+      currencyDetected: string;
+      originalPriceText?: string;
+      imagesFound: number;
+      imagesDownloaded?: number;
+      specsFound: number;
+      featuresFound: number;
+      variantsFound: number;
+      videoFound: boolean;
+    };
+    error?: string;
+  };
+
+  const attemptPrimaryScrape = async (): Promise<Response> => {
     return apiFetch('/api/products/scrape-url', {
       method: 'POST',
       headers: getAuthHeaders(),
@@ -884,11 +917,23 @@ export async function apiScrapeProductUrl(
     });
   };
 
+  const attemptSafeLinkPreview = async (): Promise<Response> => {
+    return apiFetch('/api/catalog/link-preview', {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      cache: 'no-store',
+      body: JSON.stringify({
+        encodedUrl: encodeUtf8ToBase64(url),
+        encodedHtml: htmlOverride ? encodeUtf8ToBase64(htmlOverride) : undefined,
+      }),
+    });
+  };
+
   try {
-    let res = await attemptServerScrape();
+    let res = await attemptPrimaryScrape();
     if (res.status === 502 || res.status === 503 || res.status === 504 || res.status === 505) {
       await new Promise((r) => setTimeout(r, 700));
-      res = await attemptServerScrape();
+      res = await attemptPrimaryScrape();
     }
 
     if (res.status === 401) {
@@ -905,26 +950,35 @@ export async function apiScrapeProductUrl(
       return {
         ok: false,
         error:
-          'Your session expired or needs a fresh sign-in after the security upgrade. Please sign in again as Super Admin, Admin, or Manager.',
+          'Your session expired or needs a fresh sign-in. Please sign in again as Super Admin, Admin, or Manager before importing products.',
       };
     }
 
-    const parsed = await safeParseJsonResponse<{
-      ok?: boolean;
-      product?: ProductItem;
-      diagnostics?: {
-        strategiesUsed: string[];
-        currencyDetected: string;
-        originalPriceText?: string;
-        imagesFound: number;
-        imagesDownloaded?: number;
-        specsFound: number;
-        featuresFound: number;
-        variantsFound: number;
-        videoFound: boolean;
-      };
-      error?: string;
-    }>(res);
+    let parsed = await safeParseJsonResponse<ScrapeResponseShape>(res);
+
+    // Retry via WAF-safe base64 endpoint if proxy/ModSecurity blocked URL/HTML payload with HTML 403/404/405/413
+    const isPermissionError =
+      res.status === 403 && Boolean(parsed.data?.error?.toLowerCase().includes('only administrators'));
+    const shouldRetrySafeEndpoint =
+      !parsed.ok &&
+      !isPermissionError &&
+      (res.status === 404 ||
+        res.status === 405 ||
+        res.status === 413 ||
+        (res.status === 403 && !parsed.data) ||
+        Boolean(parsed.error?.toLowerCase().includes('unexpected html')));
+
+    if (shouldRetrySafeEndpoint) {
+      res = await attemptSafeLinkPreview();
+      if (res.status === 401) {
+        return {
+          ok: false,
+          error:
+            'Your session expired or needs a fresh sign-in. Please sign in again as Super Admin, Admin, or Manager.',
+        };
+      }
+      parsed = await safeParseJsonResponse<ScrapeResponseShape>(res);
+    }
 
     const data = parsed.data;
     if (parsed.ok && data?.ok && data.product) {
@@ -939,10 +993,22 @@ export async function apiScrapeProductUrl(
       };
     }
 
-    // For pasted HTML source, never let proxy/WAF/403-HTML/413/500/502/503/504/505 block parsing — parse locally in browser!
+    // For pasted HTML source, never let gateway/size limits block parsing — parse locally in browser!
     if (htmlOverride && htmlOverride.trim()) {
       try {
         const localParsed = parseProductFromHtmlInBrowser(url, htmlOverride, getCategoryRecords());
+        if (
+          (localParsed.product.pictures?.length ?? 0) === 0 &&
+          localParsed.product.ourPrice === 0 &&
+          (!localParsed.product.details || localParsed.product.details.trim().length < 60)
+        ) {
+          return {
+            ok: false,
+            error:
+              data?.error ||
+              'No product title, price, or images could be detected in the pasted HTML.\nTip: On dynamic sites (Daraz/React), View Source (Ctrl+U) may be empty — instead open DevTools (right-click -> Inspect -> right-click <html> -> Copy -> Copy outerHTML) after the product loads, or click "Create Manual Draft from Link".',
+          };
+        }
         return {
           ok: true,
           product: localParsed.product,
@@ -960,7 +1026,23 @@ export async function apiScrapeProductUrl(
       }
     }
 
-    const isBackendOrProxyFailure =
+    const serverErrText = data?.error || '';
+    const isAuthoritativeInputOrPageError =
+      Boolean(serverErrText) &&
+      (res.status === 400 ||
+        /private or local network|public online store|public website url|valid https?:\/\/|returned http 404|returned http 410|not a product webpage|loads product details dynamically|no product price, images/i.test(
+          serverErrText
+        ));
+
+    if (isAuthoritativeInputOrPageError) {
+      return {
+        ok: false,
+        error: serverErrText,
+      };
+    }
+
+    const shouldTryBrowserFallback =
+      !serverErrText ||
       res.status === 404 ||
       res.status === 405 ||
       res.status === 500 ||
@@ -969,9 +1051,10 @@ export async function apiScrapeProductUrl(
       res.status === 504 ||
       res.status === 505 ||
       res.status === 422 ||
-      (parsed.error?.includes('unexpected HTML page') ?? false);
+      /blocked access|anti-bot|captcha|timed out|dns|could not reach/i.test(serverErrText) ||
+      Boolean(parsed.error?.includes('unexpected HTML page'));
 
-    if (isBackendOrProxyFailure) {
+    if (shouldTryBrowserFallback) {
       const fallbackRes = await tryFetchProductInBrowserFallback(url, getCategoryRecords());
       if (fallbackRes.ok && fallbackRes.product) {
         return {
@@ -980,19 +1063,25 @@ export async function apiScrapeProductUrl(
           diagnostics: fallbackRes.diagnostics,
         };
       }
+      if (serverErrText && fallbackRes.error) {
+        return {
+          ok: false,
+          error: `${serverErrText}\n\nBrowser direct check also could not fetch the page:\n${fallbackRes.error}`,
+        };
+      }
       return {
         ok: false,
         error:
-          data?.error ||
+          serverErrText ||
           fallbackRes.error ||
           parsed.error ||
-          `Server returned HTTP ${res.status}. Open the page in your browser, copy Page Source (Ctrl+U -> Ctrl+A -> Ctrl+C), and use "Paste HTML Source" below.`,
+          `Server returned HTTP ${res.status}. Open the product page in your browser, copy Page Source / outerHTML, and paste it below.`,
       };
     }
 
     return {
       ok: false,
-      error: data?.error || parsed.error || 'Could not scrape product details from URL.',
+      error: serverErrText || parsed.error || 'Could not extract product details from URL.',
     };
   } catch (err) {
     if (htmlOverride && htmlOverride.trim()) {
@@ -1018,9 +1107,10 @@ export async function apiScrapeProductUrl(
         diagnostics: fallbackRes.diagnostics,
       };
     }
+    const networkMsg = err instanceof Error ? err.message : 'Network error during URL scrape';
     return {
       ok: false,
-      error: err instanceof Error ? err.message : 'Network error during URL scrape',
+      error: fallbackRes.error ? `Server request failed (${networkMsg}).\n\n${fallbackRes.error}` : networkMsg,
     };
   }
 }
@@ -1968,7 +2058,45 @@ export function saveLoginAudits(logs: LoginAuditRecord[]): void {
   saveToStorage(STORAGE_KEYS.LOGIN_AUDITS, logs);
 }
 
-// Default PIN extraction from mobile number
+export const TEMP_PASSWORD_TTL_MINUTES = 30;
+
+// Generate a cryptographically random, unguessable mixed-case + digits temporary password
+export function generateRandomTemporaryPassword(length = 10): string {
+  const upper = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
+  const lower = 'abcdefghjkmnpqrstuvwxyz';
+  const digits = '23456789';
+  const all = upper + lower + digits;
+  const pickChar = (alphabet: string): string => {
+    if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+      const buf = new Uint32Array(1);
+      crypto.getRandomValues(buf);
+      return alphabet[buf[0] % alphabet.length];
+    }
+    return alphabet[Math.floor(Math.random() * alphabet.length)];
+  };
+
+  const chars = [pickChar(upper), pickChar(lower), pickChar(digits)];
+  while (chars.length < Math.max(8, length)) {
+    chars.push(pickChar(all));
+  }
+  // Fisher-Yates shuffle
+  for (let i = chars.length - 1; i > 0; i--) {
+    let j = 0;
+    if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+      const buf = new Uint32Array(1);
+      crypto.getRandomValues(buf);
+      j = buf[0] % (i + 1);
+    } else {
+      j = Math.floor(Math.random() * (i + 1));
+    }
+    const tmp = chars[i];
+    chars[i] = chars[j];
+    chars[j] = tmp;
+  }
+  return chars.join('');
+}
+
+// Legacy helper retained only for old offline fallback checks (never used to suggest passwords)
 export function getDefaultPinForPhone(phone: string): string {
   const digits = phone.replace(/\D/g, '');
   if (digits.length >= 6) {
@@ -2039,6 +2167,7 @@ export async function apiRegisterCustomer(payload: {
   username?: string;
   sessionToken?: string;
   temporaryPassword?: string;
+  temporaryPasswordExpiresAt?: string;
   whatsappNumber?: string;
   email?: string;
   error?: string;
@@ -2062,6 +2191,7 @@ export async function apiRegisterCustomer(payload: {
         username?: string;
         sessionToken?: string;
         temporaryPassword?: string;
+        temporaryPasswordExpiresAt?: string;
         whatsappNumber?: string;
         email?: string;
         error?: string;
@@ -2086,6 +2216,7 @@ export async function apiRegisterCustomer(payload: {
       username: parsed.data.username || parsed.data.user?.username,
       sessionToken: parsed.data.sessionToken,
       temporaryPassword: parsed.data.temporaryPassword,
+      temporaryPasswordExpiresAt: parsed.data.temporaryPasswordExpiresAt,
       whatsappNumber: parsed.data.whatsappNumber,
       email: parsed.data.email,
     };
@@ -2164,8 +2295,16 @@ export async function apiChangeMasterPin(
 export async function apiAdminResetPassword(
   userId: string,
   tempPin?: string,
-  username?: string
-): Promise<{ ok: boolean; tempPin?: string; username?: string; error?: string }> {
+  username?: string,
+  mode: 'temporary' | 'custom_permanent' = 'temporary'
+): Promise<{
+  ok: boolean;
+  tempPin?: string;
+  isTemporary?: boolean;
+  expiresAt?: string;
+  username?: string;
+  error?: string;
+}> {
   try {
     const postReset = async (endpoint: string, payloadObj: Record<string, unknown>) => {
       const res = await apiFetch(endpoint, {
@@ -2177,6 +2316,8 @@ export async function apiAdminResetPassword(
       return safeParseJsonResponse<{
         ok?: boolean;
         tempPin?: string;
+        isTemporary?: boolean;
+        expiresAt?: string;
         username?: string;
         error?: string;
       }>(res);
@@ -2185,12 +2326,14 @@ export async function apiAdminResetPassword(
     let parsed = await postReset(`/api/admin/users/${encodeURIComponent(userId)}/reset-password`, {
       tempPin,
       username,
+      mode,
     });
     if (shouldRetryViaSafeAccountEndpoint(parsed)) {
       parsed = await postReset('/api/account/admin-pin-update', {
         targetId: userId,
         code: tempPin,
         username,
+        mode,
       });
     }
     if (!parsed.ok || !parsed.data?.ok) {
@@ -2200,7 +2343,65 @@ export async function apiAdminResetPassword(
     return {
       ok: true,
       tempPin: parsed.data.tempPin,
+      isTemporary: parsed.data.isTemporary,
+      expiresAt: parsed.data.expiresAt,
       username: parsed.data.username,
+    };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
+export async function apiAdminCreateUser(payload: {
+  fullName: string;
+  username: string;
+  phone: string;
+  email?: string;
+  role: UserRole;
+  canAuthorizeCreditSale?: boolean;
+  crmRole?: CRMRoleSpecialization;
+  crmPermissions?: CRMPermissions;
+  customPassword?: string;
+}): Promise<{
+  ok: boolean;
+  user?: UserAccount;
+  temporaryPassword?: string;
+  temporaryPasswordExpiresAt?: string;
+  isTemporary?: boolean;
+  error?: string;
+}> {
+  try {
+    const postCreate = async (endpoint: string) => {
+      const res = await apiFetch(endpoint, {
+        method: 'POST',
+        headers: getAuthHeaders(),
+        cache: 'no-store',
+        body: JSON.stringify(payload),
+      });
+      return safeParseJsonResponse<{
+        ok?: boolean;
+        user?: UserAccount;
+        temporaryPassword?: string;
+        temporaryPasswordExpiresAt?: string;
+        isTemporary?: boolean;
+        error?: string;
+      }>(res);
+    };
+
+    let parsed = await postCreate('/api/admin/users');
+    if (shouldRetryViaSafeAccountEndpoint(parsed)) {
+      parsed = await postCreate('/api/account/admin-user-create');
+    }
+    if (!parsed.ok || !parsed.data?.ok || !parsed.data.user) {
+      return { ok: false, error: parsed.data?.error || parsed.error || 'Could not create user on server.' };
+    }
+    await refreshSyncState();
+    return {
+      ok: true,
+      user: parsed.data.user,
+      temporaryPassword: parsed.data.temporaryPassword,
+      temporaryPasswordExpiresAt: parsed.data.temporaryPasswordExpiresAt,
+      isTemporary: parsed.data.isTemporary,
     };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
@@ -3001,12 +3202,17 @@ export function updateUserAccount(id: string, updates: Partial<UserAccount>): bo
   return true;
 }
 
-export function resetUserPasswordToDefault(userId: string): { tempPin: string; account?: UserAccount } {
+export function resetUserPasswordToDefault(userId: string): {
+  tempPin: string;
+  expiresAt: string;
+  account?: UserAccount;
+} {
   const accounts = getUserAccounts();
+  const tempPin = generateRandomTemporaryPassword(10);
+  const expiresAt = new Date(Date.now() + TEMP_PASSWORD_TTL_MINUTES * 60 * 1000).toISOString();
   const target = accounts.find((a) => a.id === userId);
-  if (!target) return { tempPin: '123456' };
+  if (!target) return { tempPin, expiresAt };
 
-  const tempPin = getDefaultPinForPhone(target.phone);
   const updatedAccounts = accounts.map((a) => {
     if (a.id === userId) {
       return {
@@ -3015,7 +3221,7 @@ export function resetUserPasswordToDefault(userId: string): { tempPin: string; a
         passwordSalt: undefined,
         mustChangePassword: true,
         isTemporaryPassword: true,
-        suggestedDefaultPin: tempPin,
+        temporaryPasswordExpiresAt: expiresAt,
       };
     }
     return a;
@@ -3031,7 +3237,7 @@ export function resetUserPasswordToDefault(userId: string): { tempPin: string; a
     if (res) updateResellerPin(res.id, tempPin);
   }
 
-  return { tempPin, account: updatedAccounts.find((a) => a.id === userId) };
+  return { tempPin, expiresAt, account: updatedAccounts.find((a) => a.id === userId) };
 }
 
 // CONFIGURABLE LOGIN FORM CONFIGURATION

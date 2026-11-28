@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import dns from 'node:dns/promises';
 import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
@@ -161,12 +162,40 @@ function isBlockedHostOrIp(hostname: string): boolean {
     if (parts[0] === 169 && parts[1] === 254) return true;
     if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true;
     if (parts[0] === 192 && parts[1] === 168) return true;
+    if (parts[0] === 100 && parts[1] >= 64 && parts[1] <= 127) return true;
   } else if (ipType === 6) {
-    if (lower === '::1' || lower.startsWith('fe80:') || lower.startsWith('fc') || lower.startsWith('fd')) {
+    if (lower === '::1' || lower === '::' || lower.startsWith('fe80:') || lower.startsWith('fc') || lower.startsWith('fd')) {
       return true;
+    }
+    if (lower.startsWith('::ffff:')) {
+      return isBlockedHostOrIp(lower.slice('::ffff:'.length));
     }
   }
   return false;
+}
+
+async function assertSafePublicUrl(parsedUrl: URL): Promise<void> {
+  if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
+    throw new Error('Only http:// and https:// product links are supported.');
+  }
+  if (isBlockedHostOrIp(parsedUrl.hostname)) {
+    throw new Error('Private or local network links cannot be imported. Please paste a public online store product URL.');
+  }
+  if (net.isIP(parsedUrl.hostname) === 0) {
+    try {
+      const records = await dns.lookup(parsedUrl.hostname, { all: true });
+      for (const rec of records) {
+        if (isBlockedHostOrIp(rec.address)) {
+          throw new Error('This domain resolves to a restricted internal IP address and cannot be fetched.');
+        }
+      }
+    } catch (dnsErr) {
+      if (dnsErr instanceof Error && dnsErr.message.includes('restricted internal IP')) {
+        throw dnsErr;
+      }
+      // Allow fetch() to produce standard DNS error message if lookup failed
+    }
+  }
 }
 
 function resolveAbsoluteUrl(candidate: string | undefined | null, baseUrl: string): string | null {
@@ -550,19 +579,40 @@ async function fetchHtmlWithHeaders(parsedUrl: URL): Promise<{ html: string; fin
   try {
     attempt = await fetchUrlText(parsedUrl.href, primaryHeaders, 9500);
   } catch (err) {
-    const msg = err instanceof Error ? err.message : '';
+    const rawMsg = err instanceof Error ? err.message : '';
+    const causeCode = (err as { cause?: { code?: string } })?.cause?.code || '';
     const isAbort = err instanceof Error && err.name === 'AbortError';
     if (isAbort) {
       throw new Error(
-        `Connection to ${domain} timed out. Use "Paste HTML Source" below as an instant fallback.`
+        `Connection to ${domain} timed out (no response within 10 seconds).\n` +
+          `How to fix: Open the link in your browser to confirm it loads, then click "Paste HTML Source" below and paste the page HTML.`
+      );
+    }
+    if (causeCode === 'ENOTFOUND' || causeCode === 'EAI_AGAIN' || /enotfound|eai_again/i.test(rawMsg)) {
+      throw new Error(
+        `Website domain "${domain}" could not be found (DNS lookup failed).\n` +
+          `How to fix: Check the URL for typos or open the link in a browser tab first to make sure the website address is valid.`
+      );
+    }
+    if (causeCode === 'ECONNREFUSED' || /econnrefused/i.test(rawMsg)) {
+      throw new Error(
+        `${domain} refused the server connection.\n` +
+          `How to fix: Open the product page in your browser and use "Paste HTML Source" below.`
+      );
+    }
+    if (/cert|ssl|tls/i.test(rawMsg + ' ' + causeCode)) {
+      throw new Error(
+        `SSL security handshake failed while connecting to ${domain}.\n` +
+          `How to fix: Open the product page in your browser and use "Paste HTML Source" below.`
       );
     }
     throw new Error(
-      `Could not connect to ${domain}${msg ? ` (${msg})` : ''}. Check the link or use "Paste HTML Source" below.`
+      `Could not reach ${domain}${rawMsg ? ` (${rawMsg})` : ''}.\n` +
+        `How to fix: Verify the link works in your browser, or copy the page HTML and use "Paste HTML Source" below.`
     );
   }
 
-  // Fallback retry with clean bot/minimal headers if WAF returned 403/406/429/503 or JS challenge
+  // Fallback retry with clean mobile browser headers if WAF returned 403/406/429/503 or JS challenge
   const challengePrimary = attempt.status >= 200 && attempt.status < 400 ? detectBotChallengePage(attempt.text) : null;
   if ([403, 406, 429, 503].includes(attempt.status) || challengePrimary) {
     try {
@@ -587,20 +637,29 @@ async function fetchHtmlWithHeaders(parsedUrl: URL): Promise<{ html: string; fin
 
   if (attempt.status < 200 || attempt.status >= 400) {
     if (attempt.status === 404) {
-      throw new Error(`Product page not found on ${domain} (HTTP 404). Please check the URL.`);
+      throw new Error(
+        `Product page not found on ${domain} (HTTP 404).\n` +
+          `How to fix: Check that you copied the complete product link and that the item is still published on ${domain}.`
+      );
     }
     if ([401, 403, 406, 429, 503].includes(attempt.status)) {
       throw new Error(
-        `${domain} blocked automated fetching (HTTP ${attempt.status}). Open the product page in your browser, copy Page Source (Ctrl+U -> Ctrl+A -> Ctrl+C), and paste it into "Paste HTML Source" below.`
+        `${domain} blocked automated fetching (HTTP ${attempt.status}).\n` +
+          `How to fix:\n` +
+          `1) Open the product page in Chrome/Edge.\n` +
+          `2) Press Ctrl+U (or Right-click -> Inspect -> right-click <html> -> Copy -> Copy outerHTML for Daraz/React sites).\n` +
+          `3) Paste it into "Paste HTML Source" below.`
       );
     }
     if ([500, 502, 504, 505].includes(attempt.status)) {
       throw new Error(
-        `${domain} returned HTTP ${attempt.status} (${attempt.statusText || 'Gateway/Protocol error'}). Open the product page in your browser, copy Page Source (Ctrl+U -> Ctrl+A -> Ctrl+C), and paste it into "Paste HTML Source" below.`
+        `${domain} had a temporary server error (HTTP ${attempt.status}${attempt.statusText ? ` ${attempt.statusText}` : ''}).\n` +
+          `How to fix: Wait a moment and retry, or open the page in your browser and paste its HTML into "Paste HTML Source" below.`
       );
     }
     throw new Error(
-      `${domain} returned HTTP ${attempt.status} (${attempt.statusText || 'Unavailable'}). Try again or use "Paste HTML Source" below.`
+      `${domain} returned HTTP ${attempt.status} (${attempt.statusText || 'Unavailable'}).\n` +
+        `How to fix: Confirm the link opens a valid product page in your browser, or use "Paste HTML Source" below.`
     );
   }
 
@@ -613,15 +672,26 @@ async function fetchHtmlWithHeaders(parsedUrl: URL): Promise<{ html: string; fin
     !contentType.includes('xhtml')
   ) {
     throw new Error(
-      `This link points to a non-webpage file (${attempt.contentType}). Please paste a product web page URL.`
+      `This URL points to a non-webpage file (${attempt.contentType}) instead of a product page.\n` +
+        `How to fix: Copy the store's webpage link from your browser address bar, not a direct image or PDF link.`
     );
   }
 
   const challenge = detectBotChallengePage(attempt.text);
   if (challenge) {
     throw new Error(
-      `${domain} showed a ${challenge} to automated requests. Open the page in your browser, copy Page Source (Ctrl+U → Ctrl+A → Ctrl+C), and use "Paste HTML Source" below.`
+      `${domain} displayed a ${challenge} that blocks server downloads.\n` +
+        `How to fix:\n` +
+        `1) Open the product page in your browser until the product fully loads.\n` +
+        `2) Copy Page Source (Ctrl+U -> Ctrl+A -> Ctrl+C, or Inspect -> right-click <html> -> Copy outerHTML).\n` +
+        `3) Paste it into "Paste HTML Source" below.`
     );
+  }
+
+  try {
+    await assertSafePublicUrl(new URL(attempt.finalUrl));
+  } catch {
+    throw new Error('Redirect target pointed to a restricted network address and was blocked.');
   }
 
   return { html: attempt.text, finalUrl: attempt.finalUrl };
@@ -1174,9 +1244,7 @@ export async function scrapeProductFromUrl(
     }
     strategiesUsed.push('Manual HTML Source');
   } else {
-    if (isBlockedHostOrIp(parsedUrl.hostname)) {
-      throw new Error('Private/local network URLs are restricted for security reasons.');
-    }
+    await assertSafePublicUrl(parsedUrl);
     try {
       const fetched = await fetchHtmlWithHeaders(parsedUrl);
       html = fetched.html;
@@ -1705,6 +1773,45 @@ export async function scrapeProductFromUrl(
     [...categoryHints, name, ...Array.from(tagSet)],
     categories
   );
+
+  // If neither price, images, structured schema, nor meaningful product text could be extracted,
+  // fail helpfully rather than returning a blank/misleading card (common for React/Daraz SPA shells or non-product URLs).
+  const hasStructuredProductData =
+    Boolean(shopifyProd) || jsonLdProducts.length > 0 || variations.length > 0;
+  const hasCoreProductSignals =
+    imageSet.size > 0 ||
+    Boolean(salePriceRaw && salePriceRaw > 0) ||
+    Boolean(marketPriceRaw && marketPriceRaw > 0) ||
+    (details.trim().length >= 80 && Boolean(name));
+
+  if (!hasStructuredProductData && !hasCoreProductSignals) {
+    const bodyHtmlMatch = html.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
+    const bodyRaw = bodyHtmlMatch ? bodyHtmlMatch[1] : html;
+    const strippedBodyText = stripHtmlTags(
+      bodyRaw.replace(/<script[\s\S]*?<\/script>/gi, ' ').replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    ).trim();
+    const isSpaShell =
+      /<div[^>]+id=["'](?:root|app|__next|__nuxt)["'][^>]*>\s*<\/div>/i.test(html) ||
+      (/<script\b/i.test(html) && strippedBodyText.length < 180);
+
+    if (isSpaShell) {
+      throw new Error(
+        `${domain} loads product details dynamically using JavaScript, so automated fetching only sees an empty shell.\n` +
+          `How to fix:\n` +
+          `1. Open the product link in your browser and wait for the price & photos to load.\n` +
+          `2. Right-click anywhere on the page -> Inspect -> right-click the top <html> tag -> Copy -> Copy outerHTML.\n` +
+          `3. Paste that HTML into "Paste HTML Source" below and click "Extract from Pasted HTML".`
+      );
+    }
+
+    throw new Error(
+      htmlOverride
+        ? `No product details (title, price, or images) could be found in the pasted HTML from ${domain}.\n` +
+            `Tip: On sites like Daraz or React stores, "View Page Source" (Ctrl+U) may be empty — instead open DevTools (Inspect -> right-click <html> -> Copy -> Copy outerHTML) after the product loads, or click "Create Manual Draft from Link" to enter details directly.`
+        : `No product price, images, or product schema were found at this link on ${domain}.\n` +
+            `Please verify the link points to a single product page (not a homepage, category listing, or search results), or use "Paste HTML Source" / "Create Manual Draft from Link" below.`
+    );
+  }
 
   // Convert currencies cleanly to PKR so admin always works in PKR
   const ourPrice = salePriceRaw ? convertToPkrIfForeign(salePriceRaw, currencyDetected) : 0;

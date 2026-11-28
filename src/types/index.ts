@@ -552,7 +552,8 @@ export interface UserAccount {
   passwordSalt?: string;
   mustChangePassword?: boolean;
   isTemporaryPassword?: boolean;
-  suggestedDefaultPin?: string; // e.g. last 6 digits of mobile number for admin reference
+  temporaryPasswordExpiresAt?: string;
+  suggestedDefaultPin?: string; // deprecated legacy field; random 30-min temp passwords are used instead
   linkedCustomerId?: string;
   linkedInvestorId?: string;
   linkedResellerCode?: string;

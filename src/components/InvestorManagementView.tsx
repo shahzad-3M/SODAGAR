@@ -32,7 +32,6 @@ import type {
   UserRole,
 } from '../types/index.ts';
 import {
-  getDefaultPinForPhone,
   getInvestors,
   getInvestorTransactions,
   getResellers,
@@ -364,7 +363,6 @@ export const InvestorManagementView: React.FC<InvestorManagementViewProps> = ({
       accountTitle: accountTitle?.trim() || investor.name,
       accountNumber: accountNumber?.trim() || investor.phone,
       creditLimit: 25000,
-      pin: getDefaultPinForPhone(investor.phone),
       totalReferredOrders: 0,
       totalSales: 0,
       totalPaidSales: 0,
