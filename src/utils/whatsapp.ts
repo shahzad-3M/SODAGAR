@@ -1,5 +1,6 @@
 import type {
   BusinessProfile,
+  CheckoutOrderSummary,
   Customer,
   Investor,
   LuckyDrawWinner,
@@ -1015,4 +1016,73 @@ export function parseProductVideoUrl(rawUrl?: string): ParsedVideoEmbed | null {
   } catch {
     return null;
   }
+}
+
+export function buildGuestOrderWhatsAppConfirmation(
+  order: Pick<
+    CheckoutOrderSummary,
+    | 'orderNumber'
+    | 'trackingNumber'
+    | 'customerName'
+    | 'phone'
+    | 'whatsapp'
+    | 'city'
+    | 'area'
+    | 'address'
+    | 'subtotal'
+    | 'deliveryFee'
+    | 'totalAmount'
+    | 'paymentMode'
+    | 'saleType'
+    | 'items'
+  >,
+  profile: BusinessProfile
+): string {
+  const cur = profile.currencySymbol || 'Rs.';
+  const itemsText = (order.items || [])
+    .map((it) => `• ${it.description} x${it.quantity} — ${cur}${Number(it.amount || 0).toLocaleString('en-PK')}`)
+    .join('\n');
+  const payLabel =
+    order.saleType === 'cod' || order.paymentMode === 'cod'
+      ? 'Cash on Delivery (COD)'
+      : String(order.paymentMode || 'Online Payment').replace(/_/g, ' ').toUpperCase();
+  const trackText = order.trackingNumber ? `\nTracking ID: *${order.trackingNumber}*` : '';
+  const origin = getCurrentOrigin();
+  const supportNo = profile.phone || '03125256266';
+
+  return [
+    `Assalam-o-Alaikum *${order.customerName}*!`,
+    `Thank you for ordering from *${profile.name || '100DAGAR'}*.`,
+    ``,
+    `Order Number: *#${order.orderNumber}*${trackText}`,
+    `Payment Method: ${payLabel}`,
+    `Delivery City: ${order.city}${order.area ? ` (${order.area})` : ''}`,
+    `Address: ${order.address}`,
+    ``,
+    `*Order Items:*`,
+    itemsText || '• Store Order Items',
+    ``,
+    `Subtotal: ${cur}${Number(order.subtotal || 0).toLocaleString('en-PK')}`,
+    `Delivery Charges: ${order.deliveryFee > 0 ? `${cur}${order.deliveryFee.toLocaleString('en-PK')}` : 'FREE'}`,
+    `*Total Payable: ${cur}${Number(order.totalAmount || 0).toLocaleString('en-PK')}*`,
+    ``,
+    `You can track your order anytime on ${origin || 'our store'} using Order # *${order.orderNumber}* and your WhatsApp/Phone number.`,
+    `Support Helpline: ${supportNo}`,
+  ].join('\n');
+}
+
+export function buildOrderSupportWhatsAppMessage(
+  orderNumber: string | undefined,
+  phone: string | undefined,
+  profile: BusinessProfile
+): string {
+  const cleanOrder = (orderNumber || '').trim();
+  const cleanPhone = (phone || '').trim();
+  return [
+    `Assalam-o-Alaikum ${profile.name || '100DAGAR'} Support Team!`,
+    cleanOrder
+      ? `I need assistance with Order #${cleanOrder}${cleanPhone ? ` (Phone/WhatsApp: ${cleanPhone})` : ''}.`
+      : `I need help verifying or tracking my order${cleanPhone ? ` (Phone/WhatsApp: ${cleanPhone})` : ''}.`,
+    `Please assist me. Thank you!`,
+  ].join('\n');
 }

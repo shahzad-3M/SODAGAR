@@ -19,8 +19,24 @@ import {
   Lock,
   Trash2,
   Minus,
+  CheckCircle2,
+  MessageCircle,
+  Truck,
+  UserPlus,
+  Copy,
 } from 'lucide-react';
-import type { AppUser, BusinessProfile, CartItem, Customer, DeliveryCityConfig, PaymentMode, SalePaymentType } from '../types/index.ts';
+import type {
+  AppUser,
+  BusinessProfile,
+  CartItem,
+  CheckoutOrderSummary,
+  Customer,
+  DeliveryCityConfig,
+  GuestRegistrationPrefill,
+  PaymentMode,
+  SalePaymentType,
+  WhatsAppNotificationStatus,
+} from '../types/index.ts';
 import { defaultDeliveryCities } from '../utils/defaultData.ts';
 import {
   DEFAULT_CITY_CENTER_DELIVERY_CHARGE,
@@ -36,6 +52,11 @@ import {
   slugifyId,
 } from '../utils/locationCategoryHelpers.ts';
 import { apiAddCity, apiDeleteCity, apiToggleOtherCities, apiUpdateCity } from '../utils/storage.ts';
+import {
+  buildGuestOrderWhatsAppConfirmation,
+  buildOrderSupportWhatsAppMessage,
+  openWhatsAppDirect,
+} from '../utils/whatsapp.ts';
 import { AddressFieldsGroup } from './AddressFieldsGroup.tsx';
 
 export interface CheckoutSalePayload {
@@ -43,6 +64,8 @@ export interface CheckoutSalePayload {
   buyerDetails: {
     name: string;
     phone: string;
+    whatsapp: string;
+    whatsappSameAsPhone: boolean;
     city: string;
     area?: string;
     mohalla?: string;
@@ -74,9 +97,19 @@ interface CheckoutModalProps {
   onUpdateCartQty?: (productId: string, qty: number, selectedSize?: string) => void;
   onRemoveFromCart?: (productId: string, selectedSize?: string) => void;
   onClearCart?: () => void;
+  onOpenTrackOrder?: (orderNumber?: string, phone?: string) => void;
+  onOpenOptionalRegister?: (prefill: GuestRegistrationPrefill) => void;
   onCompleteSale: (
     saleData: CheckoutSalePayload
-  ) => Promise<{ ok: boolean; error?: string } | void> | void;
+  ) =>
+    | Promise<{
+        ok: boolean;
+        error?: string;
+        order?: CheckoutOrderSummary;
+        guestClaimToken?: string;
+        whatsappNotification?: WhatsAppNotificationStatus;
+      } | void>
+    | void;
 }
 
 export const CheckoutModal: React.FC<CheckoutModalProps> = ({
@@ -92,6 +125,8 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
   onUpdateCartQty,
   onRemoveFromCart,
   onClearCart,
+  onOpenTrackOrder,
+  onOpenOptionalRegister,
   onCompleteSale,
 }) => {
   const cityConfigs: DeliveryCityConfig[] = ensureCityAreasShape(
@@ -162,6 +197,15 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
   const [buyerPhone, setBuyerPhone] = useState<string>(
     () => matchedLoggedCustomer?.phone || (currentUser?.isAuthenticated ? currentUser.phone || '' : '') || ''
   );
+  const [whatsappSameAsPhone, setWhatsappSameAsPhone] = useState<boolean>(
+    () => matchedLoggedCustomer?.whatsappSameAsPhone ?? currentUser?.whatsappSameAsPhone ?? true
+  );
+  const [buyerWhatsapp, setBuyerWhatsapp] = useState<string>(
+    () =>
+      matchedLoggedCustomer?.whatsapp ||
+      (currentUser?.isAuthenticated ? currentUser.whatsapp || currentUser.phone || '' : '') ||
+      ''
+  );
   const [buyerCity, setBuyerCity] = useState<string>(defaultActiveCity);
   const [buyerArea, setBuyerArea] = useState<string>(() => {
     if (matchedLoggedCustomer?.area) return matchedLoggedCustomer.area;
@@ -175,6 +219,12 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
   const [notes, setNotes] = useState<string>('');
   const [resellerCode, setResellerCode] = useState<string>('');
   const [sendWhatsApp, setSendWhatsApp] = useState<boolean>(true);
+  const [confirmedCheckout, setConfirmedCheckout] = useState<{
+    order: CheckoutOrderSummary;
+    guestClaimToken?: string;
+    whatsappNotification?: WhatsAppNotificationStatus;
+  } | null>(null);
+  const [copiedOrderNo, setCopiedOrderNo] = useState(false);
 
   const isCreditAuthorizedSeller =
     !isCustomerView &&
@@ -201,7 +251,11 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
 
   // Sync POS selection into basic checkout form
   useEffect(() => {
-    if (!isOpen) return;
+    if (!isOpen) {
+      setConfirmedCheckout(null);
+      setCopiedOrderNo(false);
+      return;
+    }
     setFormError('');
     if (isCustomerView || !isCreditAuthorizedSeller) {
       if (saleType === 'time_credit' || saleType === 'partial') {
@@ -244,6 +298,9 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
         setSelectedCustomerId(matchedLoggedCustomer.id);
         setBuyerName(matchedLoggedCustomer.name || '');
         setBuyerPhone(matchedLoggedCustomer.phone || '');
+        const same = matchedLoggedCustomer.whatsappSameAsPhone ?? true;
+        setWhatsappSameAsPhone(same);
+        setBuyerWhatsapp(matchedLoggedCustomer.whatsapp || matchedLoggedCustomer.phone || '');
         const resolvedLoc = resolvePreferredCityAndArea(
           matchedLoggedCustomer.city,
           matchedLoggedCustomer.area
@@ -255,8 +312,12 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
         setBuyerAddress(matchedLoggedCustomer.address || matchedLoggedCustomer.area || '');
       } else {
         setSelectedCustomerId('new_checkout_buyer');
-        setBuyerName(currentUser?.isAuthenticated ? currentUser.name : '');
-        setBuyerPhone(currentUser?.isAuthenticated ? currentUser.phone || '' : '');
+        if (currentUser?.isAuthenticated) {
+          setBuyerName(currentUser.name || '');
+          setBuyerPhone(currentUser.phone || '');
+          setWhatsappSameAsPhone(currentUser.whatsappSameAsPhone ?? true);
+          setBuyerWhatsapp(currentUser.whatsapp || currentUser.phone || '');
+        }
         setBuyerCity(defaultActiveCity);
         setBuyerArea(defaultActiveArea);
       }
@@ -265,6 +326,8 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
       if (cust) {
         setBuyerName(cust.name || '');
         setBuyerPhone(cust.phone || '');
+        setWhatsappSameAsPhone(cust.whatsappSameAsPhone ?? true);
+        setBuyerWhatsapp(cust.whatsapp || cust.phone || '');
         const resolvedLoc = resolvePreferredCityAndArea(cust.city, cust.area);
         setBuyerCity(resolvedLoc.city);
         setBuyerArea(resolvedLoc.area);
@@ -279,6 +342,211 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
   }, [isOpen, isCustomerView, isCreditAuthorizedSeller, selectedCustomerId, matchedLoggedCustomer, currentUser, customers, hasExpressInCart]);
 
   if (!isOpen) return null;
+
+  const supportPhone = profile.phone || '03125256266';
+
+  if (confirmedCheckout) {
+    const ord = confirmedCheckout.order;
+    const waStatus = confirmedCheckout.whatsappNotification;
+    const currency = profile.currencySymbol || 'Rs.';
+    const isGuestUser = currentUser?.isAuthenticated !== true;
+
+    return (
+      <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/75 backdrop-blur-xs p-3 sm:p-4 overflow-y-auto">
+        <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl w-full max-w-lg overflow-hidden shadow-2xl my-6 max-h-[92vh] flex flex-col">
+          <div className="bg-emerald-600 px-4 py-3.5 flex items-center justify-between text-white shrink-0">
+            <div className="flex items-center gap-2.5">
+              <CheckCircle2 className="w-6 h-6 shrink-0" />
+              <div>
+                <h2 className="text-base font-extrabold tracking-tight leading-tight">
+                  Order Placed Successfully!
+                </h2>
+                <span className="text-[11px] font-semibold text-emerald-100 block">
+                  آپ کا آرڈر درج ہو گیا ہے · Thank you, {ord.customerName}
+                </span>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                setConfirmedCheckout(null);
+                onClose();
+              }}
+              aria-label="Close confirmation dialog"
+              className="p-1 text-emerald-100 hover:text-white rounded-lg hover:bg-emerald-700 cursor-pointer"
+            >
+              <X className="w-5 h-5" />
+            </button>
+          </div>
+
+          <div className="p-4 sm:p-6 space-y-4 overflow-y-auto text-xs">
+            {/* Order # & Tracking Summary */}
+            <div className="p-3.5 rounded-xl bg-slate-50 dark:bg-slate-850 border border-slate-200 dark:border-slate-800 space-y-2">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-slate-500 dark:text-slate-400 font-semibold">Order Number:</span>
+                <div className="flex items-center gap-1.5">
+                  <span className="font-mono font-black text-sm text-slate-900 dark:text-white">
+                    #{ord.orderNumber}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      navigator.clipboard?.writeText(ord.orderNumber);
+                      setCopiedOrderNo(true);
+                      setTimeout(() => setCopiedOrderNo(false), 1800);
+                    }}
+                    className="px-1.5 py-0.5 rounded bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-200 text-[10px] font-bold inline-flex items-center gap-1 cursor-pointer"
+                  >
+                    {copiedOrderNo ? <Check className="w-3 h-3 text-emerald-600" /> : <Copy className="w-3 h-3" />}
+                    <span>{copiedOrderNo ? 'Copied' : 'Copy'}</span>
+                  </button>
+                </div>
+              </div>
+
+              {ord.trackingNumber && (
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-slate-500 dark:text-slate-400 font-semibold">Courier Tracking ID:</span>
+                  <span className="font-mono font-bold text-slate-800 dark:text-slate-200">
+                    {ord.trackingNumber}
+                  </span>
+                </div>
+              )}
+
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-slate-500 dark:text-slate-400 font-semibold">Total Payable:</span>
+                <span className="font-mono font-black text-sm tabular-nums text-amber-700 dark:text-amber-300">
+                  {currency}{Number(ord.totalAmount || 0).toLocaleString('en-PK')}
+                </span>
+              </div>
+
+              <div className="flex items-center justify-between gap-2 pt-1 border-t border-slate-200 dark:border-slate-800">
+                <span className="text-slate-500 dark:text-slate-400 font-semibold">Delivering To:</span>
+                <span className="text-right font-semibold text-slate-800 dark:text-slate-200 max-w-[260px]">
+                  {ord.address}, {ord.city}{ord.area ? ` (${ord.area})` : ''}
+                </span>
+              </div>
+            </div>
+
+            {/* Truthful WhatsApp Confirmation Box */}
+            <div className="p-3.5 rounded-xl bg-emerald-50 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-800 space-y-2.5">
+              <div className="flex items-start gap-2">
+                <MessageCircle className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                <div className="space-y-0.5">
+                  <div className="font-extrabold text-emerald-900 dark:text-emerald-200">
+                    {waStatus?.automatedSent
+                      ? `WhatsApp Confirmation Sent to ${ord.whatsapp}`
+                      : 'WhatsApp Order Confirmation'}
+                  </div>
+                  <p className="text-[11px] text-emerald-800/90 dark:text-emerald-200/80 leading-relaxed">
+                    {waStatus?.automatedSent
+                      ? `An automated confirmation was dispatched to ${ord.whatsapp}. You can also open your WhatsApp receipt below.`
+                      : waStatus?.error
+                      ? `${waStatus.error} Tap below to open your confirmation directly on WhatsApp (${ord.whatsapp}).`
+                      : `Open your instant order confirmation receipt on WhatsApp (${ord.whatsapp || ord.phone}) or message Customer Support anytime.`}
+                  </p>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  onClick={() =>
+                    openWhatsAppDirect(
+                      ord.whatsapp || ord.phone,
+                      buildGuestOrderWhatsAppConfirmation(ord, profile)
+                    )
+                  }
+                  className="py-2 px-3 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white font-bold flex items-center justify-center gap-1.5 whitespace-nowrap cursor-pointer"
+                >
+                  <MessageCircle className="w-3.5 h-3.5" />
+                  <span>Open WhatsApp Receipt</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const ordNo = ord.orderNumber;
+                    const ph = ord.whatsapp || ord.phone;
+                    setConfirmedCheckout(null);
+                    onClose();
+                    onOpenTrackOrder?.(ordNo, ph);
+                  }}
+                  className="py-2 px-3 rounded-lg bg-slate-900 hover:bg-slate-800 dark:bg-[#FFD200] dark:hover:bg-amber-400 text-white dark:text-slate-950 font-bold flex items-center justify-center gap-1.5 whitespace-nowrap cursor-pointer"
+                >
+                  <Truck className="w-3.5 h-3.5" />
+                  <span>Track Order</span>
+                </button>
+              </div>
+            </div>
+
+            {/* Optional Account Registration Offer (Strictly Optional for Guests) */}
+            {isGuestUser && onOpenOptionalRegister && (
+              <div className="p-3.5 rounded-xl bg-amber-50/80 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800/70 space-y-2">
+                <div className="flex items-start justify-between gap-2">
+                  <div>
+                    <h3 className="font-extrabold text-slate-900 dark:text-white text-xs">
+                      Save Address &amp; Order History? (Optional)
+                    </h3>
+                    <p className="text-[11px] text-slate-600 dark:text-slate-300 mt-0.5">
+                      No account is needed to buy or track orders. Create an optional customer account to save delivery addresses and view past orders anytime.
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const prefill: GuestRegistrationPrefill = {
+                      fullName: ord.customerName,
+                      phone: ord.phone,
+                      whatsapp: ord.whatsapp,
+                      whatsappSameAsPhone: ord.whatsappSameAsPhone ?? true,
+                      city: ord.city,
+                      address: ord.address,
+                      guestClaimToken: confirmedCheckout.guestClaimToken,
+                      orderNumber: ord.orderNumber,
+                    };
+                    setConfirmedCheckout(null);
+                    onClose();
+                    onOpenOptionalRegister(prefill);
+                  }}
+                  className="w-full py-2 px-3 rounded-lg bg-[#FFD200] hover:bg-amber-400 text-slate-950 font-extrabold flex items-center justify-center gap-1.5 whitespace-nowrap cursor-pointer"
+                >
+                  <UserPlus className="w-3.5 h-3.5" />
+                  <span>Create Optional Customer Account</span>
+                </button>
+              </div>
+            )}
+
+            {/* Support Alternative Footer */}
+            <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-slate-100 dark:border-slate-800">
+              <button
+                type="button"
+                onClick={() =>
+                  openWhatsAppDirect(
+                    supportPhone,
+                    buildOrderSupportWhatsAppMessage(ord.orderNumber, ord.whatsapp || ord.phone, profile)
+                  )
+                }
+                className="text-[11px] font-bold text-emerald-700 dark:text-emerald-400 hover:underline inline-flex items-center gap-1 cursor-pointer"
+              >
+                <Phone className="w-3 h-3" />
+                <span>Customer Support ({supportPhone})</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setConfirmedCheckout(null);
+                  onClose();
+                }}
+                className="px-4 py-2 rounded-lg bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-900 dark:text-white font-bold whitespace-nowrap cursor-pointer"
+              >
+                Continue Shopping
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   if (cart.length === 0) {
     return (
@@ -476,6 +744,8 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
     if (val === 'new_checkout_buyer') {
       setBuyerName('');
       setBuyerPhone('');
+      setWhatsappSameAsPhone(true);
+      setBuyerWhatsapp('');
       setBuyerCity(defaultActiveCity);
       setBuyerArea('');
       setBuyerMohalla('');
@@ -486,6 +756,8 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
       if (cust) {
         setBuyerName(cust.name);
         setBuyerPhone(cust.phone);
+        setWhatsappSameAsPhone(cust.whatsappSameAsPhone ?? true);
+        setBuyerWhatsapp(cust.whatsapp || cust.phone);
         const custCityAllowed = allowedCities.some(
           (c) => c.name.toLowerCase() === (cust.city || '').toLowerCase()
         );
@@ -508,8 +780,13 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
       return;
     }
 
+    const resolvedWhatsapp = whatsappSameAsPhone ? buyerPhone.trim() : buyerWhatsapp.trim();
     if (!buyerName.trim() || !buyerPhone.trim()) {
-      setFormError('Please enter Full Name and Mobile Number to proceed with checkout.');
+      setFormError('Please enter your Full Name and WhatsApp / Mobile Number to proceed with checkout.');
+      return;
+    }
+    if (!whatsappSameAsPhone && resolvedWhatsapp.replace(/\D/g, '').length < 10) {
+      setFormError('Please enter a valid WhatsApp number (at least 10 digits) for order confirmation.');
       return;
     }
 
@@ -532,8 +809,8 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
       return;
     }
 
-    if (saleType === 'cod' && !buyerAddress.trim()) {
-      setFormError('Please enter your complete Delivery Address for Cash on Delivery.');
+    if ((saleType === 'cod' || isCustomerView) && !buyerAddress.trim()) {
+      setFormError('Please enter your complete Delivery Address.');
       return;
     }
 
@@ -547,6 +824,8 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
         buyerDetails: {
           name: buyerName.trim(),
           phone: buyerPhone.trim(),
+          whatsapp: resolvedWhatsapp || buyerPhone.trim(),
+          whatsappSameAsPhone,
           city: buyerCity.trim() || defaultActiveCity,
           area: buyerArea.trim() || undefined,
           mohalla: buyerMohalla.trim() || undefined,
@@ -569,6 +848,14 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
 
       if (result && result.ok === false) {
         setFormError(result.error || 'Order could not be placed. Please check your details and try again.');
+      } else if (result && result.ok && result.order) {
+        setConfirmedCheckout({
+          order: result.order,
+          guestClaimToken: result.guestClaimToken,
+          whatsappNotification: result.whatsappNotification,
+        });
+      } else {
+        onClose();
       }
     } catch (err) {
       setFormError(
@@ -588,10 +875,17 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
             <ShoppingBag className="w-5 h-5" />
             <div>
               <h2 className="text-base font-extrabold tracking-tight">
-                Checkout &amp; Order Confirmation
+                {isCustomerView && !currentUser?.isAuthenticated
+                  ? 'Checkout as Guest'
+                  : 'Checkout & Order Confirmation'}
               </h2>
               <span className="text-[11px] font-bold text-slate-800 uppercase tracking-wider">
-                100DAGAR · WE BUY WE SELL | {isCustomerView ? 'Online Checkout' : 'POS Terminal'}
+                100DAGAR · WE BUY WE SELL |{' '}
+                {isCustomerView
+                  ? currentUser?.isAuthenticated
+                    ? 'Customer Checkout'
+                    : 'No Sign-In Required'
+                  : 'POS Terminal'}
               </span>
             </div>
           </div>
@@ -632,12 +926,12 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
             </div>
           )}
 
-          {/* 2. BASIC CHECKOUT FORM (Name, Mobile, City, Delivery Address, Notes) */}
+          {/* 2. BASIC CHECKOUT FORM (Name, WhatsApp/Mobile, City, Delivery Address, Notes) */}
           <div className="bg-slate-50 dark:bg-slate-850 p-4 rounded-xl border border-slate-200 dark:border-slate-800 space-y-3">
             <div className="flex items-center justify-between border-b border-slate-200 dark:border-slate-700 pb-2">
               <h3 className="font-extrabold text-slate-900 dark:text-white flex items-center gap-1.5 text-xs">
                 <User className="w-4 h-4 text-amber-500" />
-                <span>Customer &amp; Delivery Details (بنیادی آرڈر فارم)</span>
+                <span>Name, WhatsApp &amp; Delivery Details (بنیادی آرڈر فارم)</span>
               </h3>
               <span className="text-[10px] font-semibold text-slate-500">Required *</span>
             </div>
@@ -662,7 +956,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
 
               <div>
                 <label className="font-bold text-slate-700 dark:text-slate-300 block mb-1">
-                  Mobile / WhatsApp Number *
+                  WhatsApp / Mobile Number *
                 </label>
                 <div className="relative">
                   <Phone className="w-3.5 h-3.5 absolute left-3 top-2.5 text-slate-400" />
@@ -676,6 +970,35 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                   />
                 </div>
               </div>
+            </div>
+
+            {/* Dedicated WhatsApp confirmation toggle / secondary number */}
+            <div className="p-2.5 rounded-lg bg-emerald-50/70 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-800/70 space-y-2">
+              <label className="flex items-center gap-2 cursor-pointer select-none text-[11px] font-semibold text-slate-800 dark:text-slate-200">
+                <input
+                  type="checkbox"
+                  checked={whatsappSameAsPhone}
+                  onChange={(e) => {
+                    setWhatsappSameAsPhone(e.target.checked);
+                    if (e.target.checked) setBuyerWhatsapp('');
+                  }}
+                  className="w-3.5 h-3.5 rounded text-emerald-600 cursor-pointer"
+                />
+                <span>Receive WhatsApp order confirmation on this same number</span>
+              </label>
+              {!whatsappSameAsPhone && (
+                <div className="relative">
+                  <MessageCircle className="w-3.5 h-3.5 absolute left-3 top-2.5 text-emerald-600" />
+                  <input
+                    type="tel"
+                    required
+                    value={buyerWhatsapp}
+                    onChange={(e) => setBuyerWhatsapp(e.target.value)}
+                    placeholder="Enter separate WhatsApp number (03xx xxxxxxx)"
+                    className="w-full pl-8 pr-3 py-2 rounded-lg border border-emerald-300 dark:border-emerald-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white font-mono focus:ring-2 focus:ring-emerald-500 focus:outline-hidden"
+                  />
+                </div>
+              )}
             </div>
 
             <div className="space-y-2.5">
@@ -1383,7 +1706,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
               htmlFor="sendWhatsApp"
               className="text-slate-700 dark:text-slate-300 font-medium cursor-pointer"
             >
-              Send instant order receipt &amp; confirmation via WhatsApp ({buyerPhone || 'Your Phone'})
+              Send instant order confirmation via WhatsApp ({(whatsappSameAsPhone ? buyerPhone : buyerWhatsapp) || buyerPhone || 'Your WhatsApp'})
             </label>
           </div>
 
@@ -1399,13 +1722,13 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
             <button
               type="submit"
               disabled={isSubmitting}
-              className="inline-flex items-center gap-2 px-6 py-2.5 bg-amber-500 hover:bg-amber-400 disabled:opacity-60 disabled:cursor-not-allowed text-slate-950 font-bold rounded-xl shadow-md transition-colors cursor-pointer"
+              className="inline-flex items-center gap-2 px-6 py-2.5 bg-amber-500 hover:bg-amber-400 disabled:opacity-60 disabled:cursor-not-allowed text-slate-950 font-bold rounded-xl shadow-md transition-colors whitespace-nowrap cursor-pointer"
             >
               <Check className="w-4 h-4 stroke-[2.5]" />
               <span>
                 {isSubmitting
                   ? 'Placing Order...'
-                  : `Place Order (${profile.currencySymbol}${grandTotal.toLocaleString('en-PK')})`}
+                  : `${isCustomerView && !currentUser?.isAuthenticated ? 'Place Guest Order' : 'Place Order'} (${profile.currencySymbol}${grandTotal.toLocaleString('en-PK')})`}
               </span>
             </button>
           </div>

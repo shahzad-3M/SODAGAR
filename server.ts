@@ -8,6 +8,7 @@ import express, { NextFunction, Request, Response } from 'express';
 import type {
   BusinessProfile,
   CategoryRecord,
+  CheckoutOrderSummary,
   CODOrder,
   CRMActivityEvent,
   CRMCampaign,
@@ -29,11 +30,13 @@ import type {
   InvestorTransaction,
   MonthlyExpense,
   ProductItem,
+  PublicOrderTrackingResult,
   Reseller,
   ReviewRewardSubmission,
   Transaction,
   UserAccount,
   UserRole,
+  WhatsAppNotificationStatus,
 } from './src/types/index.ts';
 import {
   defaultBusinessProfile,
@@ -51,6 +54,7 @@ import {
   normalizeTextKey,
   normalizeUpcomingCategoryRecord,
   resolveExpressAreaAvailability,
+  resolveProductOrCartDeliveryCharge,
   slugifyId,
   UPCOMING_CATEGORY_ID,
   UPCOMING_CATEGORY_NAME,
@@ -215,6 +219,199 @@ function verifySessionToken(token?: string | null): SessionClaims | null {
     return parsed;
   } catch {
     return null;
+  }
+}
+
+interface GuestClaimClaims {
+  purpose: 'guest_claim';
+  customerId: string;
+  orderNumber?: string;
+  phoneDigits: string;
+  exp: number;
+}
+
+function signGuestClaimToken(claims: Omit<GuestClaimClaims, 'purpose' | 'exp'>): string {
+  const payload: GuestClaimClaims = {
+    purpose: 'guest_claim',
+    ...claims,
+    exp: Date.now() + 1000 * 60 * 60, // 60 minutes
+  };
+  const encoded = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
+  const sig = crypto.createHmac('sha256', getSessionSecret()).update(encoded).digest('base64url');
+  return `${encoded}.${sig}`;
+}
+
+function verifyGuestClaimToken(token?: string | null): GuestClaimClaims | null {
+  if (!token || !token.includes('.')) return null;
+  const parts = token.split('.');
+  if (parts.length !== 2) return null;
+  const [encoded, sig] = parts;
+  if (!encoded || !sig) return null;
+  let expected: string;
+  try {
+    expected = crypto.createHmac('sha256', getSessionSecret()).update(encoded).digest('base64url');
+  } catch {
+    return null;
+  }
+  const sigBuf = Buffer.from(sig, 'utf8');
+  const expBuf = Buffer.from(expected, 'utf8');
+  if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8')) as GuestClaimClaims;
+    if (parsed.purpose !== 'guest_claim' || !parsed.exp || Date.now() > parsed.exp) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function formatWhatsappE164Digits(rawPhone: string): string {
+  let digits = (rawPhone || '').replace(/\D/g, '');
+  if (digits.startsWith('03') && digits.length === 11) {
+    digits = `92${digits.slice(1)}`;
+  } else if (digits.startsWith('3') && digits.length === 10) {
+    digits = `92${digits}`;
+  }
+  return digits;
+}
+
+function buildWaMeLink(phone: string, text: string): string {
+  const digits = formatWhatsappE164Digits(phone);
+  return `https://wa.me/${digits}?text=${encodeURIComponent(text)}`;
+}
+
+function phonesMatchNormalized(a?: string, b?: string): boolean {
+  const da = normalizePhoneDigits(a || '');
+  const db = normalizePhoneDigits(b || '');
+  if (!da || !db) return false;
+  if (da === db) return true;
+  if (da.length >= 10 && db.length >= 10) {
+    return da.slice(-10) === db.slice(-10);
+  }
+  return false;
+}
+
+async function sendConfiguredWhatsAppNotification(params: {
+  toPhone: string;
+  text: string;
+  templateParams?: string[];
+  supportPhone: string;
+  supportText: string;
+}): Promise<WhatsAppNotificationStatus> {
+  const token = (process.env.WHATSAPP_CLOUD_API_TOKEN || '').trim();
+  const phoneNumberId = (process.env.WHATSAPP_PHONE_NUMBER_ID || '').trim();
+  const apiVersion = (process.env.WHATSAPP_API_VERSION || 'v21.0').trim();
+  const templateName = (process.env.WHATSAPP_ORDER_TEMPLATE_NAME || '').trim();
+  const templateLang = (process.env.WHATSAPP_TEMPLATE_LANG || 'en').trim();
+
+  const customerWaUrl = buildWaMeLink(params.toPhone, params.text);
+  const supportWaUrl = buildWaMeLink(params.supportPhone, params.supportText);
+
+  if (!token || !phoneNumberId) {
+    return {
+      configured: false,
+      provider: 'click_to_whatsapp',
+      automatedSent: false,
+      recipientWhatsapp: params.toPhone,
+      customerWaUrl,
+      supportPhone: params.supportPhone,
+      supportWaUrl,
+    };
+  }
+
+  const recipientE164 = formatWhatsappE164Digits(params.toPhone);
+  if (!recipientE164) {
+    return {
+      configured: true,
+      provider: 'meta_cloud_api',
+      automatedSent: false,
+      recipientWhatsapp: params.toPhone,
+      error: 'Invalid recipient WhatsApp number format.',
+      customerWaUrl,
+      supportPhone: params.supportPhone,
+      supportWaUrl,
+    };
+  }
+
+  try {
+    const bodyPayload = templateName
+      ? {
+          messaging_product: 'whatsapp',
+          to: recipientE164,
+          type: 'template',
+          template: {
+            name: templateName,
+            language: { code: templateLang },
+            ...(params.templateParams && params.templateParams.length > 0
+              ? {
+                  components: [
+                    {
+                      type: 'body',
+                      parameters: params.templateParams.map((t) => ({ type: 'text', text: String(t) })),
+                    },
+                  ],
+                }
+              : {}),
+          },
+        }
+      : {
+          messaging_product: 'whatsapp',
+          to: recipientE164,
+          type: 'text',
+          text: { body: params.text },
+        };
+
+    const apiRes = await fetch(
+      `https://graph.facebook.com/${encodeURIComponent(apiVersion)}/${encodeURIComponent(phoneNumberId)}/messages`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(bodyPayload),
+        signal: AbortSignal.timeout(6000),
+      }
+    );
+
+    if (!apiRes.ok) {
+      return {
+        configured: true,
+        provider: 'meta_cloud_api',
+        automatedSent: false,
+        recipientWhatsapp: params.toPhone,
+        error: `WhatsApp automated dispatch returned HTTP ${apiRes.status}. Use WhatsApp link or Customer Support below.`,
+        customerWaUrl,
+        supportPhone: params.supportPhone,
+        supportWaUrl,
+      };
+    }
+
+    return {
+      configured: true,
+      provider: 'meta_cloud_api',
+      automatedSent: true,
+      recipientWhatsapp: params.toPhone,
+      customerWaUrl,
+      supportPhone: params.supportPhone,
+      supportWaUrl,
+    };
+  } catch (err) {
+    return {
+      configured: true,
+      provider: 'meta_cloud_api',
+      automatedSent: false,
+      recipientWhatsapp: params.toPhone,
+      error:
+        err instanceof Error
+          ? `Automated WhatsApp delivery unavailable (${err.message}). Use WhatsApp link or Customer Support below.`
+          : 'Automated WhatsApp delivery unavailable. Use WhatsApp link or Customer Support below.',
+      customerWaUrl,
+      supportPhone: params.supportPhone,
+      supportWaUrl,
+    };
   }
 }
 
@@ -1322,8 +1519,12 @@ async function startServer() {
 
     const db = await getDb();
     const bp = await getCollectionValue<BusinessProfile>(db, 'business_profile', defaultBusinessProfile);
+    const supportPhone = bp.phone || bp.loginFormConfig?.supportContactNumber || '03125256266';
     if (bp.loginFormConfig?.allowSelfRegistration === false) {
-      res.status(403).json({ error: 'Self-registration is currently disabled. Please contact store admin.' });
+      res.status(403).json({
+        error: 'Self-registration is currently disabled. Please contact store support.',
+        supportPhone,
+      });
       return;
     }
 
@@ -1339,6 +1540,8 @@ async function startServer() {
       whatsapp,
       pin,
       generateTempPassword,
+      guestClaimToken,
+      orderNumber,
     } = (req.body || {}) as {
       name?: string;
       fullName?: string;
@@ -1351,6 +1554,8 @@ async function startServer() {
       whatsapp?: string;
       pin?: string;
       generateTempPassword?: boolean;
+      guestClaimToken?: string;
+      orderNumber?: string;
     };
 
     const cleanName = (name || fullName || '').trim();
@@ -1397,13 +1602,53 @@ async function startServer() {
     const existingCustomers = await getAllCustomersFromDb(db);
     const accounts = await getCollectionValue<UserAccount[]>(db, 'user_accounts', []);
 
-    const dupCust = existingCustomers.find((c) => normalizePhoneDigits(c.phone) === normPhone);
-    const dupAccPhone = accounts.find((u) => normalizePhoneDigits(u.phone) === normPhone);
-    if (dupCust || dupAccPhone) {
+    const dupAccPhone = accounts.find((u) => phonesMatchNormalized(u.phone, cleanPhone));
+    if (dupAccPhone) {
       res.status(409).json({
-        error: 'An account with this mobile number already exists. Please sign in or contact support.',
+        error: 'An account with this mobile number already exists. Please sign in or contact Customer Support on WhatsApp.',
+        supportPhone,
       });
       return;
+    }
+
+    const dupCust = existingCustomers.find((c) => phonesMatchNormalized(c.phone, cleanPhone));
+    if (dupCust) {
+      const existingOrders = await getCollectionValue<CODOrder[]>(db, 'cod_orders', []);
+      const existingTxs = await getCollectionValue<Transaction[]>(db, 'transactions', []);
+      const customerOrders = existingOrders.filter(
+        (o) => o.customerId === dupCust.id || phonesMatchNormalized(o.phone, cleanPhone)
+      );
+      const customerTxs = existingTxs.filter((t) => t.customerId === dupCust.id);
+      const hasPriorOrders = customerOrders.length > 0 || customerTxs.length > 0;
+
+      if (hasPriorOrders) {
+        const claims = verifyGuestClaimToken(guestClaimToken);
+        const tokenValid = Boolean(
+          claims &&
+            (claims.customerId === dupCust.id || phonesMatchNormalized(claims.phoneDigits, cleanPhone))
+        );
+        const cleanOrderNo = (orderNumber || '').trim().toUpperCase();
+        const orderMatchValid = Boolean(
+          cleanOrderNo &&
+            (customerOrders.some(
+              (o) =>
+                (o.orderNumber || '').toUpperCase() === cleanOrderNo ||
+                (o.trackingNumber || '').toUpperCase() === cleanOrderNo ||
+                (o.invoiceNumber || '').toUpperCase() === cleanOrderNo
+            ) ||
+              customerTxs.some((t) => (t.invoiceNumber || '').toUpperCase() === cleanOrderNo))
+        );
+
+        if (!tokenValid && !orderMatchValid) {
+          res.status(409).json({
+            error:
+              'This mobile number has previous guest order(s). Enter a recent Order # to link your order history, or contact Customer Support on WhatsApp.',
+            needsOrderVerification: true,
+            supportPhone,
+          });
+          return;
+        }
+      }
     }
 
     if (cleanUsernameInput) {
@@ -1418,12 +1663,13 @@ async function startServer() {
 
     if (cleanEmail) {
       const dupEmailCust = existingCustomers.find(
-        (c) => c.email && c.email.trim().toLowerCase() === cleanEmail
+        (c) => (!dupCust || c.id !== dupCust.id) && c.email && c.email.trim().toLowerCase() === cleanEmail
       );
       const dupEmailAcc = accounts.find((u) => u.email && u.email.trim().toLowerCase() === cleanEmail);
       if (dupEmailCust || dupEmailAcc) {
         res.status(409).json({
           error: 'An account with this email address already exists. Please sign in or contact support.',
+          supportPhone,
         });
         return;
       }
@@ -1435,26 +1681,39 @@ async function startServer() {
       ? new Date(Date.now() + TEMP_PASSWORD_TTL_MS).toISOString()
       : undefined;
     const now = new Date().toISOString();
-    const custId = `cust_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-    const newCust: Customer = {
-      id: custId,
-      name: cleanName,
-      phone: cleanPhone,
-      whatsapp: resolvedWhatsapp,
-      whatsappSameAsPhone: sameAsPhone,
-      whatsappConsent: true,
-      email: cleanEmail || undefined,
-      city: (city || 'Muzaffarabad').trim(),
-      address: (address || city || 'Pakistan').trim(),
-      customerType: 'individual',
-      customerSource: 'Website',
-      balance: 0,
-      totalPurchases: 0,
-      creditLimit: 5000,
-      paymentTermsDays: 7,
-      status: 'active',
-      createdAt: now.split('T')[0],
-    };
+    const custId = dupCust ? dupCust.id : `cust_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const newCust: Customer = dupCust
+      ? {
+          ...dupCust,
+          name: cleanName || dupCust.name,
+          phone: dupCust.phone || cleanPhone,
+          whatsapp: resolvedWhatsapp,
+          whatsappSameAsPhone: sameAsPhone,
+          whatsappConsent: true,
+          email: cleanEmail || dupCust.email,
+          city: (city || dupCust.city || 'Muzaffarabad').trim(),
+          address: (address || dupCust.address || city || 'Pakistan').trim(),
+          updatedAt: now,
+        }
+      : {
+          id: custId,
+          name: cleanName,
+          phone: cleanPhone,
+          whatsapp: resolvedWhatsapp,
+          whatsappSameAsPhone: sameAsPhone,
+          whatsappConsent: true,
+          email: cleanEmail || undefined,
+          city: (city || 'Muzaffarabad').trim(),
+          address: (address || city || 'Pakistan').trim(),
+          customerType: 'individual',
+          customerSource: 'Website',
+          balance: 0,
+          totalPurchases: 0,
+          creditLimit: 5000,
+          paymentTermsDays: 7,
+          status: 'active',
+          createdAt: now.split('T')[0],
+        };
 
     const hashed = hashServerSecret(effectiveSecret);
     const accId = `usr_cust_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`;
@@ -1462,7 +1721,7 @@ async function startServer() {
       id: accId,
       fullName: cleanName,
       username: resolvedUsername,
-      phone: cleanPhone,
+      phone: newCust.phone,
       whatsapp: resolvedWhatsapp,
       whatsappSameAsPhone: sameAsPhone,
       email: cleanEmail || undefined,
@@ -1482,18 +1741,32 @@ async function startServer() {
     await saveCollectionValue(db, 'user_accounts', [...accounts, newAccount]);
     await insertCrmActivityEvent(db, {
       customerId: custId,
-      phone: cleanPhone,
+      phone: newCust.phone,
       eventType: 'note_added',
-      notes: `Customer self-registered via portal (@${resolvedUsername}). Notification WhatsApp: ${resolvedWhatsapp}${
+      notes: `Customer ${dupCust ? 'linked guest history & ' : ''}registered optional account (@${resolvedUsername}). Notification WhatsApp: ${resolvedWhatsapp}${
         cleanEmail ? ` | Email: ${cleanEmail}` : ''
       }${shouldGenerateTemp ? ' (30-min random temporary password issued)' : ''}`,
+    });
+
+    const whatsappNotification = await sendConfiguredWhatsAppNotification({
+      toPhone: resolvedWhatsapp,
+      text: [
+        `Assalam-o-Alaikum ${cleanName}!`,
+        `Your optional ${bp.name || '100DAGAR'} customer account is active (@${resolvedUsername}).`,
+        ...(shouldGenerateTemp
+          ? [`Temporary Password (valid 30 mins): ${effectiveSecret}`]
+          : []),
+        `Support Helpline: ${supportPhone}`,
+      ].join('\n'),
+      supportPhone,
+      supportText: `Assalam-o-Alaikum! I need support with my ${bp.name || '100DAGAR'} customer registration (${cleanPhone}).`,
     });
 
     const userObj = {
       id: accId,
       username: resolvedUsername,
       name: cleanName,
-      phone: cleanPhone,
+      phone: newCust.phone,
       whatsapp: resolvedWhatsapp,
       whatsappSameAsPhone: sameAsPhone,
       email: cleanEmail || undefined,
@@ -1518,6 +1791,7 @@ async function startServer() {
       temporaryPasswordExpiresAt: tempPasswordExpiresAt,
       whatsappNumber: resolvedWhatsapp,
       email: cleanEmail || undefined,
+      whatsappNotification,
     });
   };
 
@@ -3919,7 +4193,7 @@ async function startServer() {
     })
   );
 
-  // 9. AUTHORITATIVE ORDER CHECKOUT WITH UPCOMING, EXPRESS-ONLY DELIVERY, PRICING & LOYALTY
+  // 9. AUTHORITATIVE ORDER CHECKOUT (GUEST-FIRST + REGISTERED + POS) WITH STOCK, DELIVERY & WHATSAPP CONFIRMATION
   app.post(
     '/api/orders/checkout',
     asyncRoute(async (req, res) => {
@@ -3933,13 +4207,16 @@ async function startServer() {
         resellerId,
         couponCode,
       } = (req.body || {}) as {
-        items?: Array<{ productId: string; quantity: number }>;
+        items?: Array<{ productId: string; quantity: number; variationId?: string; selectedSize?: string }>;
         customer?: Customer;
         transaction?: Transaction;
         codOrder?: CODOrder;
         resellerId?: string;
         couponCode?: string;
       };
+
+      const isPrivilegedSeller =
+        actor.role === 'super_admin' || actor.role === 'admin' || actor.role === 'manager' || actor.role === 'staff';
 
       if (transaction?.saleType === 'time_credit') {
         const canCredit =
@@ -3955,9 +4232,21 @@ async function startServer() {
       }
 
       const allProducts = await getAllProductsFromDb(db);
-      const requestedItems = (
+      const bp = await getCollectionValue<BusinessProfile>(db, 'business_profile', defaultBusinessProfile);
+      const cities = await getAllCitiesFromDb(db);
+      const supportPhone = bp.phone || bp.loginFormConfig?.supportContactNumber || '03125256266';
+
+      const requestedItems: Array<{
+        productId: string;
+        quantity: number;
+        variationId?: string;
+        selectedSize?: string;
+      }> = (
         items ||
-        (transaction?.items || []).map((i) => ({ productId: i.productId || '', quantity: i.quantity }))
+        (transaction?.items || []).map((i) => ({
+          productId: i.productId || '',
+          quantity: i.quantity,
+        }))
       ).filter((it) => it && Number(it.quantity) > 0);
 
       if (requestedItems.length === 0) {
@@ -3965,46 +4254,135 @@ async function startServer() {
         return;
       }
 
+      const rawBuyerName = (codOrder?.customerName || customer?.name || '').trim();
+      const rawBuyerPhone = (codOrder?.phone || customer?.phone || '').trim();
+      const rawBuyerWhatsapp = (codOrder?.whatsapp || customer?.whatsapp || rawBuyerPhone).trim();
+      const buyerCity = (codOrder?.city || customer?.city || 'Muzaffarabad').trim();
+      const buyerArea = (codOrder?.area || customer?.area || '').trim() || undefined;
+      const buyerAddress = (codOrder?.address || customer?.address || '').trim();
+
+      if (!isPrivilegedSeller) {
+        if (!rawBuyerName || rawBuyerName.length < 2) {
+          res.status(400).json({ error: 'Please enter your Full Name (at least 2 characters).' });
+          return;
+        }
+        if (rawBuyerWhatsapp.replace(/\D/g, '').length < 10 && rawBuyerPhone.replace(/\D/g, '').length < 10) {
+          res.status(400).json({ error: 'Please enter a valid WhatsApp / Mobile number (at least 10 digits).' });
+          return;
+        }
+        if (!buyerAddress || buyerAddress.length < 4) {
+          res.status(400).json({ error: 'Please enter your complete delivery address.' });
+          return;
+        }
+      }
+
       let hasExpressItem = false;
       let computedCatalogSubtotal = 0;
+      const authoritativeOrderItems: Array<{
+        productId: string;
+        description: string;
+        quantity: number;
+        unitPrice: number;
+        marketPrice: number;
+        amount: number;
+        customerSavings: number;
+        variationId?: string;
+        selectedSize?: string;
+      }> = [];
+      const resolvedCartShape: Array<{ product: ProductItem }> = [];
+
       for (const item of requestedItems) {
+        const qty = Math.max(1, Math.floor(Number(item.quantity || 1)));
         const prod = allProducts.find((p) => p.id === item.productId);
-        if (prod) {
-          if (isProductPurchaseBlocked(prod)) {
-            res.status(400).json({
-              error: `"${prod.name}" is in "${UPCOMING_CATEGORY_NAME}" (Coming Soon) and cannot be purchased or ordered until an authorized Admin/Stock Manager confirms physical arrival.`,
-            });
+        if (!prod) {
+          if (!isPrivilegedSeller) {
+            res.status(400).json({ error: 'One or more products in your cart are no longer available.' });
             return;
           }
-          if (getProductDeliveryMeta(prod).isExpress) {
-            hasExpressItem = true;
-          }
-          computedCatalogSubtotal += Number(prod.ourPrice || 0) * Math.max(1, Number(item.quantity || 1));
+          continue;
         }
+        if (isProductPurchaseBlocked(prod)) {
+          res.status(400).json({
+            error: `"${prod.name}" is in "${UPCOMING_CATEGORY_NAME}" (Coming Soon) and cannot be purchased or ordered until an authorized Admin/Stock Manager confirms physical arrival.`,
+          });
+          return;
+        }
+
+        const matchedVariation =
+          prod.variations && prod.variations.length > 0
+            ? prod.variations.find(
+                (v) =>
+                  (item.variationId && v.id === item.variationId) ||
+                  (item.selectedSize &&
+                    ((v.title && v.title === item.selectedSize) ||
+                      (v.size && v.size === item.selectedSize)))
+              )
+            : undefined;
+
+        const availStock =
+          matchedVariation && Number.isFinite(Number(matchedVariation.stockQty))
+            ? Number(matchedVariation.stockQty)
+            : Number(prod.stockQty ?? 0);
+
+        if (!isPrivilegedSeller && availStock < qty) {
+          res.status(400).json({
+            error:
+              availStock <= 0
+                ? `"${prod.name}" is currently out of stock. Contact support on WhatsApp (${supportPhone}) for restock updates.`
+                : `Only ${availStock} unit(s) of "${prod.name}" currently in stock.`,
+          });
+          return;
+        }
+
+        if (getProductDeliveryMeta(prod).isExpress) {
+          hasExpressItem = true;
+        }
+
+        const unitPrice =
+          matchedVariation && Number(matchedVariation.salePrice || 0) > 0
+            ? Number(matchedVariation.salePrice)
+            : Number(prod.ourPrice || 0);
+        const marketPrice =
+          matchedVariation && Number(matchedVariation.originalPrice || 0) > 0
+            ? Number(matchedVariation.originalPrice)
+            : Number(prod.marketPrice || unitPrice);
+        const amount = unitPrice * qty;
+        const savings = Math.max(0, marketPrice - unitPrice) * qty;
+        const sizeLabel = item.selectedSize || matchedVariation?.title || matchedVariation?.size;
+
+        computedCatalogSubtotal += amount;
+        resolvedCartShape.push({ product: prod });
+        authoritativeOrderItems.push({
+          productId: prod.id,
+          description: `${prod.name}${sizeLabel ? ` (${sizeLabel})` : ''}`,
+          quantity: qty,
+          unitPrice,
+          marketPrice,
+          amount,
+          customerSavings: savings,
+          variationId: matchedVariation?.id || item.variationId,
+          selectedSize: sizeLabel,
+        });
       }
 
       // Standard (3–6 working days) items are open nationwide across all provinces & Azad Kashmir.
       // Enforce city/sub-city unlock restriction ONLY when the order contains Express items.
-      if (codOrder?.city && hasExpressItem) {
-        const cities = await getAllCitiesFromDb(db);
+      if ((codOrder?.city || !isPrivilegedSeller) && hasExpressItem) {
         const expressAvail = resolveExpressAreaAvailability(
           cities,
-          codOrder.city,
-          codOrder.area,
+          buyerCity,
+          buyerArea,
           true
         );
         if (!expressAvail.allowed) {
           res.status(400).json({
             error:
               expressAvail.reason ||
-              `Express delivery to "${codOrder.city}${codOrder.area ? ` (${codOrder.area})` : ''}" is currently locked. Please choose an unlocked Express city & sub-city or order Standard items.`,
+              `Express delivery to "${buyerCity}${buyerArea ? ` (${buyerArea})` : ''}" is currently locked. Please choose an unlocked Express city & sub-city or order Standard items.`,
           });
           return;
         }
       }
-
-      const isPrivilegedSeller =
-        actor.role === 'super_admin' || actor.role === 'admin' || actor.role === 'manager' || actor.role === 'staff';
 
       // Validate optional CRM Coupon
       let appliedCoupon: CRMLoyaltyCoupon | undefined;
@@ -4023,9 +4401,8 @@ async function startServer() {
         }
         if (
           foundCoupon.customerId &&
-          customer?.id &&
-          foundCoupon.customerId !== customer.id &&
-          actor.customerId !== foundCoupon.customerId
+          actor.customerId !== foundCoupon.customerId &&
+          (!isPrivilegedSeller || customer?.id !== foundCoupon.customerId)
         ) {
           res.status(403).json({ error: `Coupon code "${cleanCode}" belongs to another customer account.` });
           return;
@@ -4044,34 +4421,196 @@ async function startServer() {
             : Math.round(foundCoupon.discountValue);
       }
 
+      let resolvedSummary: CheckoutOrderSummary | undefined;
+      let guestClaimToken: string | undefined;
+
       try {
         await withDbTransaction(async (txDb) => {
+          const txCustomers = await getAllCustomersFromDb(txDb);
+          const txAccounts = await getCollectionValue<UserAccount[]>(txDb, 'user_accounts', []);
+          const nowCheckoutIso = new Date().toISOString();
+
           let savedCustomer: Customer | undefined;
-          if (customer) {
-            const existingCust = (await getAllCustomersFromDb(txDb)).find((c) => c.id === customer.id);
-            savedCustomer = await upsertCustomerRow(txDb, {
-              ...customer,
-              balance:
-                existingCust && !isPrivilegedSeller
-                  ? existingCust.balance
-                  : Number.isFinite(Number(customer.balance))
+          const contactPhone = rawBuyerPhone || rawBuyerWhatsapp;
+          const contactWhatsapp = rawBuyerWhatsapp || contactPhone;
+
+          if (isPrivilegedSeller) {
+            if (customer) {
+              const existingCust = txCustomers.find((c) => c.id === customer.id);
+              savedCustomer = await upsertCustomerRow(txDb, {
+                ...customer,
+                whatsapp: customer.whatsapp || contactWhatsapp || existingCust?.whatsapp,
+                whatsappSameAsPhone:
+                  customer.whatsappSameAsPhone ?? existingCust?.whatsappSameAsPhone ?? true,
+                balance: Number.isFinite(Number(customer.balance))
                   ? Number(customer.balance)
-                  : 0,
-              totalPurchases: Number.isFinite(Number(customer.totalPurchases)) ? Number(customer.totalPurchases) : 0,
-            });
+                  : existingCust?.balance ?? 0,
+                totalPurchases: Number.isFinite(Number(customer.totalPurchases))
+                  ? Number(customer.totalPurchases)
+                  : existingCust?.totalPurchases ?? 0,
+              });
+            }
+          } else {
+            const matchedCust =
+              (actor.customerId && txCustomers.find((c) => c.id === actor.customerId)) ||
+              (contactPhone ? txCustomers.find((c) => phonesMatchNormalized(c.phone, contactPhone)) : undefined) ||
+              (contactWhatsapp
+                ? txCustomers.find((c) => phonesMatchNormalized(c.whatsapp || c.phone, contactWhatsapp))
+                : undefined);
+
+            if (matchedCust) {
+              const hasRegisteredUserAccount = txAccounts.some(
+                (acc) => acc.linkedCustomerId === matchedCust.id || phonesMatchNormalized(acc.phone, matchedCust.phone)
+              );
+              const canEditProfileFields = !hasRegisteredUserAccount || actor.customerId === matchedCust.id;
+              savedCustomer = await upsertCustomerRow(txDb, {
+                ...matchedCust,
+                name: canEditProfileFields ? rawBuyerName || matchedCust.name : matchedCust.name,
+                whatsapp: canEditProfileFields ? contactWhatsapp || matchedCust.whatsapp : matchedCust.whatsapp,
+                whatsappSameAsPhone: canEditProfileFields
+                  ? customer?.whatsappSameAsPhone ?? matchedCust.whatsappSameAsPhone
+                  : matchedCust.whatsappSameAsPhone,
+                whatsappConsent: true,
+                city: canEditProfileFields ? buyerCity || matchedCust.city : matchedCust.city,
+                area: canEditProfileFields ? buyerArea || matchedCust.area : matchedCust.area,
+                mohalla: canEditProfileFields ? customer?.mohalla || matchedCust.mohalla : matchedCust.mohalla,
+                landmark: canEditProfileFields ? customer?.landmark || matchedCust.landmark : matchedCust.landmark,
+                address: canEditProfileFields ? buyerAddress || matchedCust.address : matchedCust.address,
+                updatedAt: nowCheckoutIso,
+              });
+            } else {
+              const generatedCustId = `cust_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+              savedCustomer = await upsertCustomerRow(txDb, {
+                id: generatedCustId,
+                name: rawBuyerName,
+                phone: contactPhone,
+                whatsapp: contactWhatsapp,
+                whatsappSameAsPhone:
+                  customer?.whatsappSameAsPhone ??
+                  phonesMatchNormalized(contactPhone, contactWhatsapp),
+                whatsappConsent: true,
+                city: buyerCity,
+                area: buyerArea,
+                mohalla: customer?.mohalla,
+                landmark: customer?.landmark,
+                address: buyerAddress,
+                customerType: 'individual',
+                customerSource: 'Website',
+                balance: 0,
+                totalPurchases: 0,
+                creditLimit: 5000,
+                paymentTermsDays: 7,
+                status: 'active',
+                createdAt: nowCheckoutIso.split('T')[0],
+              });
+            }
+          }
+
+          const latestProducts = await getAllProductsFromDb(txDb);
+          for (const item of requestedItems) {
+            const prod = latestProducts.find((p) => p.id === item.productId);
+            if (!prod) continue;
+            if (!isProductPurchaseBlocked(prod)) {
+              const qty = Math.max(1, Math.floor(Number(item.quantity || 1)));
+              const matchedVar =
+                prod.variations && prod.variations.length > 0
+                  ? prod.variations.find(
+                      (v) =>
+                        (item.variationId && v.id === item.variationId) ||
+                        (item.selectedSize &&
+                          ((v.title && v.title === item.selectedSize) ||
+                            (v.size && v.size === item.selectedSize)))
+                    )
+                  : undefined;
+              const txAvailStock =
+                matchedVar && Number.isFinite(Number(matchedVar.stockQty))
+                  ? Number(matchedVar.stockQty)
+                  : Number(prod.stockQty ?? 0);
+              if (!isPrivilegedSeller && txAvailStock < qty) {
+                const err = new Error(
+                  `"${prod.name}" only has ${txAvailStock} unit(s) remaining in stock.`
+                ) as Error & { statusCode?: number };
+                err.statusCode = 400;
+                throw err;
+              }
+              const unitP =
+                matchedVar && Number(matchedVar.salePrice || 0) > 0
+                  ? Number(matchedVar.salePrice)
+                  : Number(prod.ourPrice || 0);
+              const nextVariations =
+                prod.variations && matchedVar
+                  ? prod.variations.map((v) =>
+                      v.id === matchedVar.id
+                        ? { ...v, stockQty: Math.max(0, Number(v.stockQty || 0) - qty) }
+                        : v
+                    )
+                  : prod.variations;
+              await upsertProductRow(txDb, {
+                ...prod,
+                stockQty: Math.max(0, prod.stockQty - qty),
+                variations: nextVariations,
+                salesCount: (prod.salesCount || 0) + qty,
+                totalRevenue: (prod.totalRevenue || 0) + qty * unitP,
+                totalProfit:
+                  (prod.totalProfit || 0) + qty * Math.max(0, unitP - prod.costPrice),
+              });
+            }
           }
 
           const authoritativeSubtotal =
             !isPrivilegedSeller && computedCatalogSubtotal > 0
               ? computedCatalogSubtotal
               : Number(codOrder?.subtotal || transaction?.amount || computedCatalogSubtotal);
-          const safeDeliveryFee = Math.max(0, Number(codOrder?.deliveryFee || 0));
+
+          const serverDelivery = resolveProductOrCartDeliveryCharge(
+            cities,
+            resolvedCartShape,
+            buyerCity,
+            buyerArea,
+            bp.defaultCityCenterDeliveryCharge
+          );
+          const isCounterCashPickup = !codOrder && transaction?.paymentMode === 'cash';
+          const safeDeliveryFee = !isPrivilegedSeller
+            ? isCounterCashPickup
+              ? 0
+              : serverDelivery.charge
+            : Math.max(0, Number(codOrder?.deliveryFee || 0));
+
           const authoritativeTotal = Math.max(
             0,
             authoritativeSubtotal + safeDeliveryFee - couponDiscount
           );
 
-          const nowCheckoutIso = new Date().toISOString();
+          const effectiveSaleType =
+            transaction?.saleType || (codOrder ? 'cod' : 'full');
+          const effectivePaymentMode =
+            codOrder?.paymentMode ||
+            transaction?.paymentMode ||
+            (effectiveSaleType === 'cod' ? 'cod' : 'easypaisa');
+
+          const safeItemsForPersistence =
+            authoritativeOrderItems.length > 0 && !isPrivilegedSeller
+              ? authoritativeOrderItems.map((it) => ({
+                  productId: it.productId,
+                  description: it.description,
+                  quantity: it.quantity,
+                  unitPrice: it.unitPrice,
+                  marketPrice: it.marketPrice,
+                  amount: it.amount,
+                  customerSavings: it.customerSavings,
+                }))
+              : Array.isArray(transaction?.items) && transaction.items.length > 0
+              ? transaction.items
+              : Array.isArray(codOrder?.items)
+              ? codOrder.items
+              : [];
+
+          let persistedInvoiceNumber =
+            transaction?.invoiceNumber ||
+            codOrder?.invoiceNumber ||
+            `INV-100D-${Math.floor(1000 + Math.random() * 9000)}`;
+          let persistedOrderNumber = codOrder?.orderNumber || persistedInvoiceNumber;
+          let persistedTrackingNumber = codOrder?.trackingNumber;
 
           if (transaction) {
             const currentTxs = await getCollectionValue<Transaction[]>(txDb, 'transactions', []);
@@ -4092,12 +4631,21 @@ async function startServer() {
               txCreatedAt.slice(0, 10);
             const txDueDate =
               validateAndNormalizeDateOnly(transaction.dueDate, 'transaction.dueDate') || existingTx?.dueDate;
+            persistedInvoiceNumber = transaction.invoiceNumber || persistedInvoiceNumber;
             const cleanTx: Transaction = {
               ...transaction,
-              customerId: transaction.customerId || savedCustomer?.id || '',
+              customerId: savedCustomer?.id || transaction.customerId || '',
+              invoiceNumber: persistedInvoiceNumber,
+              items: safeItemsForPersistence,
               amount: finalTxAmount,
-              paidAmount: Math.min(finalTxAmount, Math.max(0, Number(transaction.paidAmount || 0))),
-              dueBalance: Math.max(0, Number(transaction.dueBalance ?? 0)),
+              paidAmount: !isPrivilegedSeller
+                ? effectiveSaleType === 'full'
+                  ? finalTxAmount
+                  : 0
+                : Math.min(finalTxAmount, Math.max(0, Number(transaction.paidAmount || 0))),
+              dueBalance: !isPrivilegedSeller
+                ? 0
+                : Math.max(0, Number(transaction.dueBalance ?? 0)),
               date: txDate,
               dueDate: txDueDate,
               createdAt: txCreatedAt,
@@ -4112,7 +4660,6 @@ async function startServer() {
             ]);
           }
 
-          let persistedOrderNumber = transaction?.invoiceNumber;
           if (codOrder) {
             const currentOrders = await getCollectionValue<CODOrder[]>(txDb, 'cod_orders', []);
             const existingCod = currentOrders.find((o) => o.id === codOrder.id);
@@ -4125,11 +4672,23 @@ async function startServer() {
             const dispatchedAt = validateAndNormalizeDateTime(codOrder.dispatchedAt, 'codOrder.dispatchedAt');
             const deliveredAt = validateAndNormalizeDateTime(codOrder.deliveredAt, 'codOrder.deliveredAt');
             const returnedAt = validateAndNormalizeDateTime(codOrder.returnedAt, 'codOrder.returnedAt');
-            const safeItems = Array.isArray(codOrder.items) ? codOrder.items : [];
             const cleanOrder: CODOrder = {
               ...codOrder,
-              customerId: codOrder.customerId || savedCustomer?.id || transaction?.customerId,
-              items: safeItems,
+              invoiceNumber: persistedInvoiceNumber,
+              customerId: savedCustomer?.id || codOrder.customerId || transaction?.customerId,
+              customerName: rawBuyerName || codOrder.customerName,
+              phone: contactPhone || codOrder.phone,
+              whatsapp: contactWhatsapp || codOrder.whatsapp,
+              whatsappSameAsPhone:
+                codOrder.whatsappSameAsPhone ??
+                customer?.whatsappSameAsPhone ??
+                phonesMatchNormalized(contactPhone, contactWhatsapp),
+              paymentMode: effectivePaymentMode,
+              saleType: effectiveSaleType,
+              city: buyerCity || codOrder.city,
+              area: buyerArea || codOrder.area,
+              address: buyerAddress || codOrder.address,
+              items: safeItemsForPersistence,
               subtotal: authoritativeSubtotal,
               deliveryFee: safeDeliveryFee,
               totalAmount:
@@ -4142,25 +4701,13 @@ async function startServer() {
               createdAt: orderCreatedAt,
             };
             persistedOrderNumber = cleanOrder.orderNumber;
+            persistedTrackingNumber = cleanOrder.trackingNumber;
             await saveCollectionValue(txDb, 'cod_orders', [
               cleanOrder,
               ...currentOrders.filter((o) => o.id !== cleanOrder.id),
             ]);
-          }
-
-          const latestProducts = await getAllProductsFromDb(txDb);
-          for (const item of requestedItems) {
-            const prod = latestProducts.find((p) => p.id === item.productId);
-            if (prod && !isProductPurchaseBlocked(prod)) {
-              const qty = Math.max(0, Number(item.quantity || 0));
-              await upsertProductRow(txDb, {
-                ...prod,
-                stockQty: Math.max(0, prod.stockQty - qty),
-                salesCount: (prod.salesCount || 0) + qty,
-                totalRevenue: (prod.totalRevenue || 0) + qty * prod.ourPrice,
-                totalProfit: (prod.totalProfit || 0) + qty * Math.max(0, prod.ourPrice - prod.costPrice),
-              });
-            }
+          } else {
+            persistedOrderNumber = persistedInvoiceNumber;
           }
 
           if (resellerId && transaction) {
@@ -4171,7 +4718,7 @@ async function startServer() {
                 ? {
                     ...r,
                     totalReferredOrders: r.totalReferredOrders + 1,
-                    totalSales: r.totalSales + transaction.amount,
+                    totalSales: r.totalSales + authoritativeTotal,
                     totalPaidSales: r.totalPaidSales + (transaction.paidAmount || 0),
                     earnedCommission: r.earnedCommission + comm,
                   }
@@ -4188,7 +4735,6 @@ async function startServer() {
             });
           }
 
-          // Award CRM Loyalty points & record timeline event
           const targetCustomerId = savedCustomer?.id || codOrder?.customerId || transaction?.customerId;
           if (targetCustomerId) {
             const loyaltyCfg = await getCrmLoyaltyConfig(txDb);
@@ -4205,21 +4751,260 @@ async function startServer() {
             }
             await insertCrmActivityEvent(txDb, {
               customerId: targetCustomerId,
-              phone: savedCustomer?.phone || codOrder?.phone,
+              phone: contactPhone || savedCustomer?.phone,
               eventType: 'order_placed',
               orderNumber: persistedOrderNumber,
               amount: orderAmt,
-              notes: `Order placed via ${codOrder ? 'COD Storefront' : 'POS'}`,
+              notes: `Order placed via ${codOrder ? 'Guest/Online Storefront (COD)' : isPrivilegedSeller ? 'POS' : 'Guest/Online Storefront'}`,
             });
+
+            if (!actor.id) {
+              guestClaimToken = signGuestClaimToken({
+                customerId: targetCustomerId,
+                orderNumber: persistedOrderNumber,
+                phoneDigits: normalizePhoneDigits(contactPhone || contactWhatsapp),
+              });
+            }
           }
+
+          resolvedSummary = {
+            orderNumber: persistedOrderNumber,
+            invoiceNumber: persistedInvoiceNumber,
+            trackingNumber: persistedTrackingNumber,
+            status: codOrder ? codOrder.status : 'completed',
+            paymentMode: effectivePaymentMode,
+            saleType: effectiveSaleType,
+            customerName: rawBuyerName || savedCustomer?.name || 'Customer',
+            phone: contactPhone || savedCustomer?.phone || '',
+            whatsapp: contactWhatsapp || contactPhone || savedCustomer?.whatsapp || '',
+            whatsappSameAsPhone:
+              codOrder?.whatsappSameAsPhone ??
+              customer?.whatsappSameAsPhone ??
+              phonesMatchNormalized(contactPhone, contactWhatsapp),
+            city: buyerCity,
+            area: buyerArea,
+            address: buyerAddress || savedCustomer?.address || 'Pakistan',
+            subtotal: authoritativeSubtotal,
+            deliveryFee: safeDeliveryFee,
+            totalAmount: authoritativeTotal,
+            items: safeItemsForPersistence.map((it) => ({
+              productId: it.productId,
+              description: it.description,
+              quantity: it.quantity,
+              unitPrice: it.unitPrice,
+              amount: it.amount,
+            })),
+            createdAt: nowCheckoutIso,
+          };
         });
       } catch (err) {
         sendRouteError(res, err, 'Checkout persistence failed.');
         return;
       }
 
+      const cur = bp.currencySymbol || 'Rs.';
+      const waMsg = resolvedSummary
+        ? [
+            `Assalam-o-Alaikum ${resolvedSummary.customerName}!`,
+            `Your order #${resolvedSummary.orderNumber} with ${bp.name || '100DAGAR'} is confirmed.`,
+            ...(resolvedSummary.trackingNumber ? [`Tracking ID: ${resolvedSummary.trackingNumber}`] : []),
+            `Total Payable: ${cur}${resolvedSummary.totalAmount.toLocaleString('en-PK')}`,
+            `Delivery Address: ${resolvedSummary.address}, ${resolvedSummary.city}`,
+            `Need help? Contact Support: ${supportPhone}`,
+          ].join('\n')
+        : '';
+
+      const whatsappNotification = resolvedSummary
+        ? await sendConfiguredWhatsAppNotification({
+            toPhone: resolvedSummary.whatsapp || resolvedSummary.phone,
+            text: waMsg,
+            templateParams: [
+              resolvedSummary.customerName,
+              resolvedSummary.orderNumber,
+              `${cur}${resolvedSummary.totalAmount.toLocaleString('en-PK')}`,
+            ],
+            supportPhone,
+            supportText: `Assalam-o-Alaikum! I need help with Order #${resolvedSummary.orderNumber} (${resolvedSummary.whatsapp || resolvedSummary.phone}).`,
+          })
+        : undefined;
+
       broadcastSyncEvent('orders', req.header('x-client-id'));
-      res.json({ ok: true, syncVersion: getSyncVersion() });
+      res.json({
+        ok: true,
+        syncVersion: getSyncVersion(),
+        order: resolvedSummary,
+        guestClaimToken,
+        whatsappNotification,
+      });
+    })
+  );
+
+  // 9A-PUBLIC. GUEST-FIRST ORDER TRACKING (Requires matching Order # / Tracking # AND WhatsApp / Phone)
+  app.post(
+    '/api/public/track-order',
+    asyncRoute(async (req, res) => {
+      const rateKey = `track:${req.ip || 'unknown'}`;
+      const limit = checkAuthRateLimit(rateKey);
+      if (!limit.allowed) {
+        res.status(429).json({
+          error: `Too many order tracking attempts. Please try again in ${limit.retryAfterSec} seconds or contact Customer Support on WhatsApp.`,
+        });
+        return;
+      }
+
+      const { orderNumber, phone } = (req.body || {}) as {
+        orderNumber?: string;
+        phone?: string;
+      };
+      const cleanOrderNo = (orderNumber || '').trim().toUpperCase();
+      const cleanPhone = (phone || '').trim();
+
+      const db = await getDb();
+      const bp = await getCollectionValue<BusinessProfile>(db, 'business_profile', defaultBusinessProfile);
+      const supportPhone = bp.phone || bp.loginFormConfig?.supportContactNumber || '03125256266';
+      const supportWaUrl = buildWaMeLink(
+        supportPhone,
+        `Assalam-o-Alaikum! I need help tracking Order #${cleanOrderNo || '(unknown)'} (Phone/WhatsApp: ${cleanPhone || 'N/A'}).`
+      );
+
+      if (!cleanOrderNo || cleanPhone.replace(/\D/g, '').length < 7) {
+        res.status(400).json({
+          error: 'Please enter both your Order / Tracking Number and your WhatsApp / Mobile Number.',
+          supportPhone,
+          supportWaUrl,
+        });
+        return;
+      }
+
+      const codOrders = await getCollectionValue<CODOrder[]>(db, 'cod_orders', []);
+      const transactions = await getCollectionValue<Transaction[]>(db, 'transactions', []);
+      const allCustomers = await getAllCustomersFromDb(db);
+
+      const matchedCod = codOrders.find(
+        (o) =>
+          (o.orderNumber || '').trim().toUpperCase() === cleanOrderNo ||
+          (o.trackingNumber || '').trim().toUpperCase() === cleanOrderNo ||
+          (o.invoiceNumber || '').trim().toUpperCase() === cleanOrderNo
+      );
+
+      if (matchedCod) {
+        const linkedCust = matchedCod.customerId
+          ? allCustomers.find((c) => c.id === matchedCod.customerId)
+          : undefined;
+        const phoneMatched =
+          phonesMatchNormalized(matchedCod.phone, cleanPhone) ||
+          phonesMatchNormalized(matchedCod.whatsapp, cleanPhone) ||
+          phonesMatchNormalized(linkedCust?.phone, cleanPhone) ||
+          phonesMatchNormalized(linkedCust?.whatsapp, cleanPhone);
+
+        if (phoneMatched) {
+          clearAuthFailures(rateKey);
+          const statusLabelMap: Record<CODOrder['status'], string> = {
+            pending: 'Order Placed · Preparing Dispatch',
+            dispatched: 'Dispatched · In Transit',
+            delivered: 'Delivered',
+            returned: 'Returned',
+          };
+          const trackingResult: PublicOrderTrackingResult = {
+            orderNumber: matchedCod.orderNumber,
+            invoiceNumber: matchedCod.invoiceNumber,
+            trackingNumber: matchedCod.trackingNumber,
+            orderKind: 'cod',
+            status: matchedCod.status,
+            statusLabel: statusLabelMap[matchedCod.status] || 'Order Placed',
+            paymentMode: matchedCod.paymentMode || 'cod',
+            courierPartner: matchedCod.courierPartner,
+            customerName: matchedCod.customerName,
+            phone: matchedCod.phone,
+            whatsapp: matchedCod.whatsapp || matchedCod.phone,
+            city: matchedCod.city,
+            area: matchedCod.area,
+            address: matchedCod.address,
+            subtotal: matchedCod.subtotal,
+            deliveryFee: matchedCod.deliveryFee,
+            totalAmount: matchedCod.totalAmount,
+            items: (matchedCod.items || []).map((it) => ({
+              description: it.description,
+              quantity: it.quantity,
+              unitPrice: it.unitPrice,
+              amount: it.amount,
+            })),
+            createdAt: matchedCod.createdAt,
+            dispatchedAt: matchedCod.dispatchedAt,
+            deliveredAt: matchedCod.deliveredAt,
+            returnedAt: matchedCod.returnedAt,
+            supportPhone,
+            supportWaUrl,
+          };
+          res.json({ ok: true, order: trackingResult, supportPhone, supportWaUrl });
+          return;
+        }
+      }
+
+      const matchedTx = transactions.find(
+        (t) =>
+          (t.invoiceNumber || '').trim().toUpperCase() === cleanOrderNo &&
+          t.type === 'credit'
+      );
+
+      if (matchedTx) {
+        const linkedCust = allCustomers.find((c) => c.id === matchedTx.customerId);
+        const phoneMatched =
+          linkedCust &&
+          (phonesMatchNormalized(linkedCust.phone, cleanPhone) ||
+            phonesMatchNormalized(linkedCust.whatsapp, cleanPhone));
+
+        if (phoneMatched && linkedCust) {
+          clearAuthFailures(rateKey);
+          const itemsSubtotal = (matchedTx.items || []).reduce(
+            (sum, it) => sum + Number(it.amount || 0),
+            0
+          );
+          const inferredDelivery =
+            itemsSubtotal > 0 && matchedTx.amount >= itemsSubtotal
+              ? Math.max(0, matchedTx.amount - itemsSubtotal)
+              : 0;
+          const trackingResult: PublicOrderTrackingResult = {
+            orderNumber: matchedTx.invoiceNumber || cleanOrderNo,
+            invoiceNumber: matchedTx.invoiceNumber,
+            orderKind: 'prepaid',
+            status: matchedTx.status === 'cancelled' ? 'returned' : 'completed',
+            statusLabel:
+              matchedTx.status === 'cancelled'
+                ? 'Cancelled'
+                : 'Order Confirmed · Payment Recorded',
+            paymentMode: matchedTx.paymentMode,
+            customerName: linkedCust.name,
+            phone: linkedCust.phone,
+            whatsapp: linkedCust.whatsapp || linkedCust.phone,
+            city: linkedCust.city || 'Pakistan',
+            area: linkedCust.area,
+            address: linkedCust.address || linkedCust.city || 'Address on file',
+            subtotal: itemsSubtotal > 0 ? itemsSubtotal : matchedTx.amount,
+            deliveryFee: inferredDelivery,
+            totalAmount: matchedTx.amount,
+            items: (matchedTx.items || []).map((it) => ({
+              description: it.description,
+              quantity: it.quantity,
+              unitPrice: it.unitPrice,
+              amount: it.amount,
+            })),
+            createdAt: matchedTx.createdAt,
+            supportPhone,
+            supportWaUrl,
+          };
+          res.json({ ok: true, order: trackingResult, supportPhone, supportWaUrl });
+          return;
+        }
+      }
+
+      recordAuthFailure(rateKey);
+      res.status(404).json({
+        error:
+          'No order found matching that Order Number and WhatsApp/Phone number. Double-check your details or contact Customer Support on WhatsApp.',
+        supportPhone,
+        supportWaUrl,
+      });
     })
   );
 

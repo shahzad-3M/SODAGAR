@@ -7,6 +7,7 @@ import type {
   BusinessProfile,
   CartItem,
   CategoryRecord,
+  CheckoutOrderSummary,
   CODOrder,
   CODOrderStatus,
   CommissionRecord,
@@ -25,6 +26,8 @@ import type {
   ProductImportLog,
   ProductItem,
   ProductVariation,
+  PublicOrderTrackingResult,
+  RecentGuestOrderRef,
   RecurringInvoice,
   ReminderTemplate,
   Reseller,
@@ -38,6 +41,7 @@ import type {
   WalkInSale,
   WasalSettlement,
   WhatsAppNotification,
+  WhatsAppNotificationStatus,
   CRMActivityEvent,
   CRMAutomationRule,
   CRMCampaign,
@@ -1369,12 +1373,19 @@ export async function apiDeleteCityArea(
 }
 
 export async function apiSubmitCheckoutOrder(payload: {
-  items: Array<{ productId: string; quantity: number }>;
+  items: Array<{ productId: string; quantity: number; variationId?: string; selectedSize?: string }>;
   customer?: Customer;
   transaction?: Transaction;
   codOrder?: CODOrder;
   resellerId?: string;
-}): Promise<{ ok: boolean; error?: string }> {
+  couponCode?: string;
+}): Promise<{
+  ok: boolean;
+  error?: string;
+  order?: CheckoutOrderSummary;
+  guestClaimToken?: string;
+  whatsappNotification?: WhatsAppNotificationStatus;
+}> {
   try {
     const res = await apiFetch('/api/orders/checkout', {
       method: 'POST',
@@ -1382,10 +1393,96 @@ export async function apiSubmitCheckoutOrder(payload: {
       cache: 'no-store',
       body: JSON.stringify(payload),
     });
-    const parsed = await safeParseJsonResponse<{ ok?: boolean; error?: string }>(res);
-    if (!parsed.ok) return { ok: false, error: parsed.data?.error || parsed.error || 'Checkout blocked by server validation.' };
+    const parsed = await safeParseJsonResponse<{
+      ok?: boolean;
+      error?: string;
+      order?: CheckoutOrderSummary;
+      guestClaimToken?: string;
+      whatsappNotification?: WhatsAppNotificationStatus;
+    }>(res);
+    if (!parsed.ok) {
+      return {
+        ok: false,
+        error: parsed.data?.error || parsed.error || 'Checkout blocked by server validation.',
+      };
+    }
     await refreshSyncState();
-    return { ok: true };
+    return {
+      ok: true,
+      order: parsed.data?.order,
+      guestClaimToken: parsed.data?.guestClaimToken,
+      whatsappNotification: parsed.data?.whatsappNotification,
+    };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
+const RECENT_GUEST_ORDERS_KEY = '100dagar_recent_guest_orders_v1';
+
+export function getRecentGuestOrders(): RecentGuestOrderRef[] {
+  try {
+    const raw = localStorage.getItem(RECENT_GUEST_ORDERS_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.slice(0, 8) : [];
+  } catch {
+    return [];
+  }
+}
+
+export function saveRecentGuestOrder(ref: RecentGuestOrderRef): void {
+  try {
+    const existing = getRecentGuestOrders().filter(
+      (o) => o.orderNumber.toUpperCase() !== ref.orderNumber.toUpperCase()
+    );
+    localStorage.setItem(RECENT_GUEST_ORDERS_KEY, JSON.stringify([ref, ...existing].slice(0, 8)));
+  } catch {
+    // ignore storage quota failures
+  }
+}
+
+export async function apiTrackPublicOrder(
+  orderNumber: string,
+  phone: string
+): Promise<{
+  ok: boolean;
+  order?: PublicOrderTrackingResult;
+  error?: string;
+  supportPhone?: string;
+  supportWaUrl?: string;
+}> {
+  try {
+    const res = await apiFetch('/api/public/track-order', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      cache: 'no-store',
+      body: JSON.stringify({ orderNumber: orderNumber.trim(), phone: phone.trim() }),
+    });
+    const parsed = await safeParseJsonResponse<{
+      ok?: boolean;
+      order?: PublicOrderTrackingResult;
+      error?: string;
+      supportPhone?: string;
+      supportWaUrl?: string;
+    }>(res);
+    if (!parsed.ok || !parsed.data?.ok || !parsed.data.order) {
+      return {
+        ok: false,
+        error:
+          parsed.data?.error ||
+          parsed.error ||
+          'We could not find an order matching that Order Number and WhatsApp/Phone number.',
+        supportPhone: parsed.data?.supportPhone,
+        supportWaUrl: parsed.data?.supportWaUrl,
+      };
+    }
+    return {
+      ok: true,
+      order: parsed.data.order,
+      supportPhone: parsed.data.supportPhone,
+      supportWaUrl: parsed.data.supportWaUrl,
+    };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
   }
@@ -2160,6 +2257,8 @@ export async function apiRegisterCustomer(payload: {
   whatsapp?: string;
   pin?: string;
   generateTempPassword?: boolean;
+  guestClaimToken?: string;
+  orderNumber?: string;
 }): Promise<{
   ok: boolean;
   user?: Partial<AppUser>;
@@ -2170,6 +2269,9 @@ export async function apiRegisterCustomer(payload: {
   temporaryPasswordExpiresAt?: string;
   whatsappNumber?: string;
   email?: string;
+  whatsappNotification?: WhatsAppNotificationStatus;
+  needsOrderVerification?: boolean;
+  supportPhone?: string;
   error?: string;
 }> {
   try {
@@ -2194,6 +2296,9 @@ export async function apiRegisterCustomer(payload: {
         temporaryPasswordExpiresAt?: string;
         whatsappNumber?: string;
         email?: string;
+        whatsappNotification?: WhatsAppNotificationStatus;
+        needsOrderVerification?: boolean;
+        supportPhone?: string;
         error?: string;
       }>(res);
     };
@@ -2203,7 +2308,12 @@ export async function apiRegisterCustomer(payload: {
       parsed = await parseReg('/api/account/register');
     }
     if (!parsed.ok || !parsed.data?.ok) {
-      return { ok: false, error: parsed.data?.error || parsed.error || 'Registration failed.' };
+      return {
+        ok: false,
+        error: parsed.data?.error || parsed.error || 'Registration failed.',
+        needsOrderVerification: parsed.data?.needsOrderVerification,
+        supportPhone: parsed.data?.supportPhone,
+      };
     }
     if (parsed.data.sessionToken) {
       setSessionToken(parsed.data.sessionToken);
@@ -2219,6 +2329,7 @@ export async function apiRegisterCustomer(payload: {
       temporaryPasswordExpiresAt: parsed.data.temporaryPasswordExpiresAt,
       whatsappNumber: parsed.data.whatsappNumber,
       email: parsed.data.email,
+      whatsappNotification: parsed.data.whatsappNotification,
     };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : 'Network error' };

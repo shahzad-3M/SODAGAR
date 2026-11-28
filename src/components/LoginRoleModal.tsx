@@ -20,7 +20,16 @@ import {
   UserPlus,
   MapPin,
 } from 'lucide-react';
-import type { AppUser, Customer, LoginFormConfig, Reseller, UserAccount, UserRole } from '../types/index.ts';
+import type {
+  AppUser,
+  Customer,
+  GuestRegistrationPrefill,
+  LoginFormConfig,
+  Reseller,
+  UserAccount,
+  UserRole,
+  WhatsAppNotificationStatus,
+} from '../types/index.ts';
 import {
   defaultGuestUser,
   getLoginFormConfig,
@@ -61,6 +70,7 @@ interface RegistrationConfirmationState {
   email?: string;
   temporaryPassword: string;
   temporaryPasswordExpiresAt?: string;
+  whatsappNotification?: WhatsAppNotificationStatus;
   user: Partial<AppUser> & { role: UserRole };
 }
 
@@ -72,6 +82,8 @@ interface LoginRoleModalProps {
   customers?: Customer[];
   resellers?: Reseller[];
   onLogout?: () => void;
+  initialMode?: 'login' | 'register';
+  prefillRegistration?: GuestRegistrationPrefill | null;
 }
 
 export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
@@ -80,6 +92,8 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
   currentUser,
   onSelectRole,
   onLogout,
+  initialMode = 'login',
+  prefillRegistration = null,
 }) => {
   const isGuest = currentUser?.isAuthenticated !== true;
 
@@ -103,6 +117,8 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
   const [regWhatsapp, setRegWhatsapp] = useState('');
   const [regEmail, setRegEmail] = useState('');
   const [regCity, setRegCity] = useState('Muzaffarabad');
+  const [regOrderNumber, setRegOrderNumber] = useState('');
+  const [needsOrderVerifyPrompt, setNeedsOrderVerifyPrompt] = useState(false);
   const [isRegistering, setIsRegistering] = useState(false);
   const [regError, setRegError] = useState('');
 
@@ -141,6 +157,7 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
       setErrorMessage('');
       setSuccessMessage('');
       setRegError('');
+      setNeedsOrderVerifyPrompt(false);
       setChangePinError('');
       setChangePinSuccess('');
       setForgotError('');
@@ -158,11 +175,24 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
 
       if (currentUser?.isAuthenticated === true) {
         setModalMode('account');
+      } else if (prefillRegistration) {
+        setRegName(prefillRegistration.fullName || '');
+        setRegPhone(prefillRegistration.phone || '');
+        const sameWa =
+          prefillRegistration.whatsappSameAsPhone !== false ||
+          !prefillRegistration.whatsapp ||
+          prefillRegistration.whatsapp === prefillRegistration.phone;
+        setRegWhatsappSameAsPhone(sameWa);
+        setRegWhatsapp(sameWa ? '' : prefillRegistration.whatsapp || '');
+        setRegCity(prefillRegistration.city || 'Muzaffarabad');
+        setRegOrderNumber(prefillRegistration.orderNumber || '');
+        setModalMode('register');
       } else {
-        setModalMode('login');
+        setRegOrderNumber('');
+        setModalMode(initialMode === 'register' ? 'register' : 'login');
       }
     }
-  }, [isOpen, currentUser?.isAuthenticated, currentUser?.username]);
+  }, [isOpen, currentUser?.isAuthenticated, currentUser?.username, initialMode, prefillRegistration]);
 
   if (!isOpen) return null;
 
@@ -290,13 +320,20 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
       whatsappSameAsPhone: regWhatsappSameAsPhone,
       whatsapp: cleanWhatsapp,
       generateTempPassword: true,
+      guestClaimToken: prefillRegistration?.guestClaimToken,
+      orderNumber: regOrderNumber.trim() || undefined,
     });
     setIsRegistering(false);
 
     if (!regRes.ok || !regRes.user) {
+      if (regRes.needsOrderVerification) {
+        setNeedsOrderVerifyPrompt(true);
+      }
       setRegError(regRes.error || 'Registration failed. Please check your details and try again.');
       return;
     }
+
+    setNeedsOrderVerifyPrompt(false);
 
     const tempPassword = regRes.temporaryPassword || '';
     const resolvedWhatsapp = regRes.whatsappNumber || cleanWhatsapp;
@@ -323,9 +360,10 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
       email: regRes.email || cleanEmail || undefined,
       temporaryPassword: tempPassword,
       temporaryPasswordExpiresAt: regRes.temporaryPasswordExpiresAt,
+      whatsappNotification: regRes.whatsappNotification,
       user: confirmedUser,
     });
-    setWhatsappSentDone(false);
+    setWhatsappSentDone(Boolean(regRes.whatsappNotification?.automatedSent));
     setEmailOpenedDone(false);
     setCopiedTempPass(false);
     setModalMode('registration_confirmation');
@@ -609,17 +647,31 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
           <div className="p-5 sm:p-6 space-y-4">
             <div>
               <h3 className="text-sm font-bold text-slate-900 dark:text-white">
-                Enter Login Credentials
+                Sign In (Optional for Shoppers · Required for Staff &amp; Admin)
               </h3>
               <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-                {loginConfig.description}
+                Shoppers can browse and place orders as guests. Sign in for purchase history, saved addresses, or Staff/Admin access.
               </p>
             </div>
 
             {errorMessage && (
-              <div className="p-3 bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-800 rounded-lg text-xs text-red-700 dark:text-red-300 flex items-start gap-2">
-                <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
-                <span className="whitespace-pre-line">{errorMessage}</span>
+              <div className="p-3 bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-800 rounded-lg text-xs text-red-700 dark:text-red-300 space-y-2">
+                <div className="flex items-start gap-2">
+                  <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                  <span className="whitespace-pre-line">{errorMessage}</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() =>
+                    handleOpenSupport(
+                      `Assalam-o-Alaikum! I need help accessing my account (${identifier || 'no ID entered'}).`
+                    )
+                  }
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-[11px] cursor-pointer"
+                >
+                  <MessageCircle className="w-3.5 h-3.5" />
+                  <span>Contact Customer Support on WhatsApp</span>
+                </button>
               </div>
             )}
 
@@ -713,9 +765,9 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
             {loginConfig.allowSelfRegistration !== false && (
               <div className="p-3 rounded-xl bg-amber-50/70 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800/60 flex items-center justify-between gap-2">
                 <div className="text-[11px] text-slate-700 dark:text-slate-300">
-                  <span className="font-bold block">New customer? (نیا اکاؤنٹ؟)</span>
+                  <span className="font-bold block">Optional Customer Account</span>
                   <span className="text-slate-500 dark:text-slate-400">
-                    Register with WhatsApp &amp; Email confirmation.
+                    Save addresses &amp; view order history (not required to order).
                   </span>
                 </div>
                 <button
@@ -723,7 +775,7 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
                   onClick={() => setModalMode('register')}
                   className="px-3 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 font-black text-[11px] whitespace-nowrap cursor-pointer shrink-0"
                 >
-                  Register Now
+                  Create Account
                 </button>
               </div>
             )}
@@ -737,17 +789,31 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
           <div className="p-5 sm:p-6 space-y-4">
             <div>
               <h3 className="text-sm font-bold text-slate-900 dark:text-white">
-                Create Customer Account (نیا کسٹمر اکاؤنٹ)
+                Optional Customer Account (اختیاری کسٹمر اکاؤنٹ)
               </h3>
               <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-                Get instant confirmation and a temporary password for your WhatsApp &amp; Email.
+                Keep purchase history, saved addresses, and faster future orders. Guest checkout never requires registration.
               </p>
             </div>
 
             {regError && (
-              <div className="p-3 bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-800 rounded-lg text-xs text-red-700 dark:text-red-300 flex items-start gap-2">
-                <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
-                <span>{regError}</span>
+              <div className="p-3 bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-800 rounded-lg text-xs text-red-700 dark:text-red-300 space-y-2">
+                <div className="flex items-start gap-2">
+                  <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                  <span>{regError}</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() =>
+                    handleOpenSupport(
+                      `Assalam-o-Alaikum! I need help verifying/creating my customer account for phone ${regPhone || 'N/A'}.`
+                    )
+                  }
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-[11px] cursor-pointer"
+                >
+                  <MessageCircle className="w-3.5 h-3.5" />
+                  <span>Get Help via WhatsApp Support</span>
+                </button>
               </div>
             )}
 
@@ -880,8 +946,26 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
                 </div>
               </div>
 
+              {(needsOrderVerifyPrompt || Boolean(prefillRegistration?.orderNumber) || Boolean(regOrderNumber)) && (
+                <div className="p-3 rounded-xl bg-amber-50/80 dark:bg-amber-950/30 border border-amber-300 dark:border-amber-800 space-y-1.5">
+                  <label className="block text-[11px] font-bold text-amber-900 dark:text-amber-200">
+                    Recent Order / Invoice # (for linking your past guest orders)
+                  </label>
+                  <input
+                    type="text"
+                    placeholder="e.g. COD-100D-123 or INV-100D-1234"
+                    value={regOrderNumber}
+                    onChange={(e) => setRegOrderNumber(e.target.value)}
+                    className="w-full px-3 py-2 text-xs font-mono rounded-lg border border-amber-300 dark:border-amber-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-amber-400 focus:outline-hidden"
+                  />
+                  <p className="text-[10px] text-amber-800 dark:text-amber-300">
+                    If you already ordered as a guest with this number, enter any recent Order # or contact WhatsApp Support.
+                  </p>
+                </div>
+              )}
+
               <div className="p-2.5 rounded-lg bg-slate-50 dark:bg-slate-800/70 border border-slate-200 dark:border-slate-700 text-[11px] text-slate-600 dark:text-slate-300">
-                A secure temporary password will be created for your account so you can confirm on your own WhatsApp and Email right away.
+                A temporary password (valid 30 minutes) will be generated for your account. If automated WhatsApp delivery is unavailable, you can confirm directly in WhatsApp or contact Customer Support.
               </div>
 
               <button
@@ -893,7 +977,7 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
                 <span>
                   {isRegistering
                     ? 'Creating Account...'
-                    : 'Register & Get Temporary Password'}
+                    : 'Create Optional Account'}
                 </span>
               </button>
             </form>
@@ -908,10 +992,14 @@ export const LoginRoleModal: React.FC<LoginRoleModalProps> = ({
             <div className="p-3.5 bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 rounded-xl space-y-1.5">
               <div className="flex items-center gap-2 text-emerald-800 dark:text-emerald-300 font-black text-sm">
                 <CheckCircle2 className="w-4 h-4 shrink-0" />
-                <span>Registration Confirmed!</span>
+                <span>Account Created!</span>
               </div>
               <p className="text-[11px] text-emerald-900/80 dark:text-emerald-200/80 leading-relaxed">
-                Welcome <span className="font-bold">{regConfirmation.fullName}</span>. Your account is active. Send your confirmation &amp; temporary password to your own WhatsApp and Email below.
+                Welcome <span className="font-bold">{regConfirmation.fullName}</span>. Your optional customer account is active.{' '}
+                {regConfirmation.whatsappNotification?.automatedSent
+                  ? `WhatsApp confirmation was sent via configured WhatsApp API to ${regConfirmation.whatsappNumber}.`
+                  : regConfirmation.whatsappNotification?.message ||
+                    'Automated WhatsApp messaging is not configured — copy your temporary password below or open WhatsApp to save it.'}
               </p>
             </div>
 

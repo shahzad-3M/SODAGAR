@@ -167,6 +167,7 @@ export interface ProductItem {
   sizes?: string[]; // Available sizes or dimensions (e.g. Standard, Small, Medium, Large)
   sizeChart?: ProductSizeChart; // Structured multi-size measurement chart
   selectedSize?: string;
+  selectedVariationId?: string;
   variations?: ProductVariation[]; // Extracted & editable variations (size, color, SKU, price, stock, image, details)
   shortDescription?: string;
   brand?: string;
@@ -654,9 +655,14 @@ export type CODOrderStatus = 'pending' | 'dispatched' | 'delivered' | 'returned'
 export interface CODOrder {
   id: string;
   orderNumber: string;
+  invoiceNumber?: string;
   customerId?: string;
   customerName: string;
   phone: string;
+  whatsapp?: string;
+  whatsappSameAsPhone?: boolean;
+  paymentMode?: PaymentMode;
+  saleType?: SalePaymentType;
   city: string;
   area?: string;
   mohalla?: string;
@@ -1483,6 +1489,98 @@ export interface CRMGroupSignalSummary {
   buyerCount: number;
   buyers: CRMBuyerSignal[];
   reason: string;
+}
+
+export interface WhatsAppNotificationStatus {
+  configured: boolean;
+  provider?: 'meta_cloud_api' | 'click_to_whatsapp';
+  automatedSent: boolean;
+  recipientWhatsapp: string;
+  message?: string;
+  error?: string;
+  customerWaUrl?: string;
+  supportPhone: string;
+  supportWaUrl?: string;
+}
+
+export interface CheckoutOrderSummary {
+  orderNumber: string;
+  invoiceNumber?: string;
+  trackingNumber?: string;
+  status: 'pending' | 'dispatched' | 'delivered' | 'returned' | 'completed';
+  paymentMode: PaymentMode;
+  saleType: SalePaymentType;
+  customerName: string;
+  phone: string;
+  whatsapp: string;
+  whatsappSameAsPhone?: boolean;
+  city: string;
+  area?: string;
+  address: string;
+  subtotal: number;
+  deliveryFee: number;
+  totalAmount: number;
+  items: Array<{
+    productId?: string;
+    description: string;
+    quantity: number;
+    unitPrice: number;
+    amount: number;
+  }>;
+  createdAt: string;
+}
+
+export interface PublicOrderTrackingResult {
+  orderNumber: string;
+  invoiceNumber?: string;
+  trackingNumber?: string;
+  orderKind: 'cod' | 'prepaid';
+  status: 'pending' | 'dispatched' | 'delivered' | 'returned' | 'completed';
+  statusLabel: string;
+  paymentMode?: PaymentMode;
+  courierPartner?: string;
+  customerName: string;
+  phone: string;
+  whatsapp?: string;
+  city: string;
+  area?: string;
+  address: string;
+  subtotal: number;
+  deliveryFee: number;
+  totalAmount: number;
+  items: Array<{
+    description: string;
+    quantity: number;
+    unitPrice: number;
+    amount: number;
+  }>;
+  createdAt: string;
+  dispatchedAt?: string;
+  deliveredAt?: string;
+  returnedAt?: string;
+  supportPhone: string;
+  supportWaUrl?: string;
+}
+
+export interface RecentGuestOrderRef {
+  orderNumber: string;
+  trackingNumber?: string;
+  phone: string;
+  whatsapp?: string;
+  customerName: string;
+  totalAmount: number;
+  createdAt: string;
+}
+
+export interface GuestRegistrationPrefill {
+  fullName?: string;
+  phone?: string;
+  whatsapp?: string;
+  whatsappSameAsPhone?: boolean;
+  city?: string;
+  address?: string;
+  guestClaimToken?: string;
+  orderNumber?: string;
 }
 
 

@@ -60,6 +60,7 @@ interface ProductDetailsModalProps {
   isOpen: boolean;
   onClose: () => void;
   onAddToCart: (product: ProductItem, qty: number, selectedSize?: string) => void;
+  onBuyNowGuest?: (product: ProductItem, qty: number, selectedSize?: string) => void;
   profile: BusinessProfile;
   investors?: Investor[];
   currentUser?: AppUser;
@@ -80,6 +81,7 @@ export const ProductDetailsModal: React.FC<ProductDetailsModalProps> = ({
   isOpen,
   onClose,
   onAddToCart,
+  onBuyNowGuest,
   profile,
   investors,
   currentUser,
@@ -838,7 +840,7 @@ export const ProductDetailsModal: React.FC<ProductDetailsModalProps> = ({
                         type="button"
                         disabled={Number(product.stockQty ?? 0) <= 0}
                         onClick={handleAdd}
-                        className="flex-1 py-2.5 px-4 bg-[#FFD200] hover:bg-amber-400 disabled:bg-slate-200 disabled:text-slate-500 disabled:cursor-not-allowed dark:disabled:bg-slate-800 text-slate-950 font-extrabold text-xs rounded-xl shadow-xs transition-all flex items-center justify-center gap-2 cursor-pointer"
+                        className="flex-1 py-2.5 px-4 bg-[#FFD200] hover:bg-amber-400 disabled:bg-slate-200 disabled:text-slate-500 disabled:cursor-not-allowed dark:disabled:bg-slate-800 text-slate-950 font-extrabold text-xs rounded-xl shadow-xs transition-all flex items-center justify-center gap-2 whitespace-nowrap cursor-pointer"
                       >
                         {Number(product.stockQty ?? 0) <= 0 ? (
                           <span>Out of Stock · Confirm via WhatsApp</span>
@@ -855,6 +857,30 @@ export const ProductDetailsModal: React.FC<ProductDetailsModalProps> = ({
                         )}
                       </button>
                     </div>
+
+                    {onBuyNowGuest && Number(product.stockQty ?? 0) > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const effectiveProd = {
+                            ...product,
+                            ourPrice: activePrice,
+                            marketPrice: activeMarketPrice,
+                            imageUrl: activeImage || product.imageUrl,
+                          };
+                          onBuyNowGuest(effectiveProd, quantity, selectedSize || undefined);
+                          onClose();
+                        }}
+                        className="w-full py-2.5 px-4 bg-slate-900 hover:bg-slate-800 dark:bg-amber-500 dark:hover:bg-amber-400 text-white dark:text-slate-950 font-extrabold text-xs rounded-xl shadow-xs transition-colors flex items-center justify-center gap-2 whitespace-nowrap cursor-pointer"
+                      >
+                        <Zap className="w-3.5 h-3.5" />
+                        <span>
+                          {currentUser?.isAuthenticated
+                            ? 'Buy Now (Instant Checkout)'
+                            : 'Buy Now · Checkout as Guest'}
+                        </span>
+                      </button>
+                    )}
 
                     {/* Option 2: Direct Business WhatsApp Order */}
                     <button

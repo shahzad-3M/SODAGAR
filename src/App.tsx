@@ -8,11 +8,13 @@ import type {
   BusinessProfile,
   CartItem,
   CategoryRecord,
+  CheckoutOrderSummary,
   CODOrder,
   CODOrderStatus,
   Customer,
   Employee,
   GenderType,
+  GuestRegistrationPrefill,
   Investor,
   InvestorProductOffering,
   InvestorProductRequest,
@@ -32,6 +34,7 @@ import type {
   TransactionAuditEntry,
   UserRole,
   WhatsAppNotification,
+  WhatsAppNotificationStatus,
 } from './types/index.ts';
 import {
   defaultCustomerUser,
@@ -93,6 +96,7 @@ import {
   getInvestorOfferings,
   getInvestorRequests,
   apiFetchInvestorOfferings,
+  saveRecentGuestOrder,
 } from './utils/storage.ts';
 import { isProductPurchaseBlocked, normalizeTextKey } from './utils/locationCategoryHelpers.ts';
 import {
@@ -129,6 +133,7 @@ import { ReportsView } from './components/ReportsView.tsx';
 import { TransactionHistoryView } from './components/TransactionHistoryView.tsx';
 import { SettingsView } from './components/SettingsView.tsx';
 import { CheckoutModal, CheckoutSalePayload } from './components/CheckoutModal.tsx';
+import { TrackOrderModal } from './components/TrackOrderModal.tsx';
 import { AddTransactionModal } from './components/AddTransactionModal.tsx';
 import { AddCustomerModal } from './components/AddCustomerModal.tsx';
 import { ScheduleWhatsAppModal } from './components/ScheduleWhatsAppModal.tsx';
@@ -200,8 +205,25 @@ export default function App() {
   const [activeRole, setActiveRole] = useState<UserRole>(getActiveRole);
   const [currentUser, setCurrentUser] = useState<AppUser>(getCurrentUser);
   const [isRoleModalOpen, setIsRoleModalOpen] = useState(false);
+  const [roleModalInitialMode, setRoleModalInitialMode] = useState<'login' | 'register'>('login');
+  const [guestRegPrefill, setGuestRegPrefill] = useState<GuestRegistrationPrefill | null>(null);
+  const [isTrackOrderOpen, setIsTrackOrderOpen] = useState(false);
+  const [trackOrderPrefill, setTrackOrderPrefill] = useState<{ orderNumber?: string; phone?: string }>({});
 
   const openRoleModal = () => {
+    setRoleModalInitialMode('login');
+    setGuestRegPrefill(null);
+    setIsRoleModalOpen(true);
+  };
+
+  const openTrackOrderModal = (orderNumber?: string, phone?: string) => {
+    setTrackOrderPrefill({ orderNumber, phone });
+    setIsTrackOrderOpen(true);
+  };
+
+  const openOptionalRegisterModal = (prefill: GuestRegistrationPrefill) => {
+    setGuestRegPrefill(prefill);
+    setRoleModalInitialMode('register');
     setIsRoleModalOpen(true);
   };
 
@@ -230,18 +252,22 @@ export default function App() {
       setIsCategoryModalOpen(true);
       return;
     }
+    if (tab === 'track_order') {
+      openTrackOrderModal();
+      return;
+    }
 
-    // Strict Guest Restriction: When nobody is logged in, allow ONLY public catalog & read-only lucky draw showcase
+    // Guest-first browsing: allow public catalog, order tracking, & read-only lucky draw without login
     if (!currentUser?.isAuthenticated) {
       if (tab === 'customer_tickets') {
         pushToast('Please sign in first to create or view support tickets.', 'info');
         setCurrentTab('store');
-        setIsRoleModalOpen(true);
+        openRoleModal();
         return;
       }
       if (tab !== 'store' && tab !== 'lucky_draw') {
         setCurrentTab('store');
-        setIsRoleModalOpen(true);
+        openRoleModal();
         return;
       }
       setCurrentTab(tab);
@@ -598,6 +624,14 @@ export default function App() {
     }
   }, [initialAddToCartParam, products, handleAddToCart, pushToast]);
 
+  const handleBuyNowGuest = useCallback(
+    (product: ProductItem, qty = 1, selectedSize?: string) => {
+      handleAddToCart(product, qty, selectedSize);
+      setIsCheckoutOpen(true);
+    },
+    [handleAddToCart]
+  );
+
   const handleUpdateCartQty = (productId: string, qty: number, selectedSize?: string) => {
     const targetIdx = cart.findIndex(
       (it) =>
@@ -640,10 +674,16 @@ export default function App() {
     setCart([]);
   };
 
-  // COMPLETE SALE (Full Payment or Cash on Delivery with Basic Checkout Form)
+  // COMPLETE SALE (Guest Checkout, Full Payment, or Cash on Delivery)
   const handleCompleteSale = async (
     saleData: CheckoutSalePayload
-  ): Promise<{ ok: boolean; error?: string }> => {
+  ): Promise<{
+    ok: boolean;
+    error?: string;
+    order?: CheckoutOrderSummary;
+    guestClaimToken?: string;
+    whatsappNotification?: WhatsAppNotificationStatus;
+  }> => {
     if (cart.length === 0) {
       const msg = 'Cart is empty. Please add at least one product before placing an order.';
       pushToast(msg, 'error');
@@ -657,6 +697,9 @@ export default function App() {
     }
 
     const cleanPhone = saleData.buyerDetails.phone.replace(/\D/g, '');
+    const buyerWhatsapp = saleData.buyerDetails.whatsappSameAsPhone
+      ? saleData.buyerDetails.phone
+      : saleData.buyerDetails.whatsapp || saleData.buyerDetails.phone;
     let activeCustomers = [...customers];
     let customer =
       saleData.customerId && saleData.customerId !== 'new_checkout_buyer'
@@ -673,6 +716,8 @@ export default function App() {
         id: newCustId,
         name: saleData.buyerDetails.name,
         phone: saleData.buyerDetails.phone,
+        whatsapp: buyerWhatsapp,
+        whatsappSameAsPhone: saleData.buyerDetails.whatsappSameAsPhone,
         city: saleData.buyerDetails.city || 'Muzaffarabad',
         area: saleData.buyerDetails.area || saleData.buyerDetails.address,
         mohalla: saleData.buyerDetails.mohalla,
@@ -692,6 +737,8 @@ export default function App() {
       customer = {
         ...customer,
         name: saleData.buyerDetails.name || customer.name,
+        whatsapp: buyerWhatsapp || customer.whatsapp,
+        whatsappSameAsPhone: saleData.buyerDetails.whatsappSameAsPhone,
         city: saleData.buyerDetails.city || customer.city,
         area: saleData.buyerDetails.area || customer.area,
         mohalla: saleData.buyerDetails.mohalla || customer.mohalla,
@@ -739,9 +786,11 @@ export default function App() {
       effectiveSaleType === 'cod' || effectiveSaleType === 'time_credit' ? 'pending' : 'completed';
 
     const staffName =
-      activeRole === 'admin' || activeRole === 'super_admin'
-        ? currentUser.name || 'Super Admin'
-        : currentUser.name || 'Online Checkout';
+      currentUser?.isAuthenticated
+        ? activeRole === 'admin' || activeRole === 'super_admin'
+          ? currentUser.name || 'Super Admin'
+          : currentUser.name || 'Store Staff'
+        : 'Guest Checkout';
 
     let softReminderDate: string | undefined;
     let maxGraceDate: string | undefined;
@@ -811,9 +860,14 @@ export default function App() {
       newCODOrder = {
         id: `cod_${Date.now()}`,
         orderNumber: `COD-100D-${Math.floor(100 + Math.random() * 900)}`,
+        invoiceNumber,
         customerId: customer.id,
         customerName: saleData.buyerDetails.name || customer.name,
         phone: saleData.buyerDetails.phone || customer.phone,
+        whatsapp: buyerWhatsapp,
+        whatsappSameAsPhone: saleData.buyerDetails.whatsappSameAsPhone,
+        paymentMode: saleData.paymentMode,
+        saleType: effectiveSaleType,
         city: saleData.buyerDetails.city || customer.city || 'Muzaffarabad',
         area: saleData.buyerDetails.area || customer.area,
         mohalla: saleData.buyerDetails.mohalla || customer.mohalla,
@@ -837,9 +891,14 @@ export default function App() {
       ? resellers.find((r) => r.referralCode.toLowerCase() === saleData.resellerCode!.toLowerCase())
       : undefined;
 
-    // 3. Submit atomically to SQLite backend for authoritative stock & city validation + multi-device sync
+    // 3. Submit atomically to SQLite backend for authoritative stock & pricing validation + multi-device sync
     const checkoutResult = await apiSubmitCheckoutOrder({
-      items: cart.map((it) => ({ productId: it.product.id, quantity: it.quantity })),
+      items: cart.map((it) => ({
+        productId: it.product.id,
+        quantity: it.quantity,
+        variationId: it.product.selectedVariationId,
+        selectedSize: it.product.selectedSize,
+      })),
       customer: balancedCustomer,
       transaction: newTx,
       codOrder: newCODOrder,
@@ -854,29 +913,46 @@ export default function App() {
 
     handleRefreshAllData();
 
-    // 4. Clear Cart & Close Modal
+    // 4. Clear Cart (keep CheckoutModal open so it displays Order Confirmed + WhatsApp + Track Order + Optional Account)
     setCart([]);
-    setIsCheckoutOpen(false);
 
-    // 5. Send Instant WhatsApp Invoice if selected
+    if (checkoutResult.order) {
+      saveRecentGuestOrder({
+        orderNumber: checkoutResult.order.orderNumber,
+        trackingNumber: checkoutResult.order.trackingNumber,
+        phone: checkoutResult.order.whatsapp || checkoutResult.order.phone,
+        customerName: checkoutResult.order.customerName,
+        totalAmount: checkoutResult.order.totalAmount,
+        createdAt: checkoutResult.order.createdAt,
+      });
+    }
+
+    const isCustomerStorefront =
+      !currentUser?.isAuthenticated || viewMode === 'customer' || activeRole === 'customer';
+
+    // 5. Log notification or launch POS WhatsApp receipt when staff/admin places an order
     if (saleData.sendWhatsApp && customer) {
       const msg = buildSaleInvoiceMessage(customer, newTx, profile);
-      openWhatsAppDirect(customer.phone, msg);
+      if (!isCustomerStorefront && !checkoutResult.whatsappNotification?.automatedSent) {
+        openWhatsAppDirect(buyerWhatsapp || customer.phone, msg);
+      }
 
-      // Log notification
       const logNotif: WhatsAppNotification = {
         id: `notif_sale_${Date.now()}`,
         customerId: customer.id,
         customerName: customer.name,
-        phone: customer.phone,
-        amount: saleData.dueBalance > 0 ? saleData.dueBalance : totalAmount,
+        phone: buyerWhatsapp || customer.phone,
+        amount: saleData.dueBalance > 0 ? saleData.dueBalance : checkoutResult.order?.totalAmount ?? orderTotalWithDelivery,
         dueDate: saleData.dueDate,
         scheduledFor: todayStr,
         type: 'payment_receipt',
-        status: 'sent',
+        status: checkoutResult.whatsappNotification?.automatedSent || !isCustomerStorefront ? 'sent' : 'pending',
         messageText: msg,
-        sentAt: new Date().toISOString(),
-        notes: `Instant sale receipt (${saleData.saleType}) with savings breakdown`,
+        sentAt:
+          checkoutResult.whatsappNotification?.automatedSent || !isCustomerStorefront
+            ? new Date().toISOString()
+            : undefined,
+        notes: checkoutResult.whatsappNotification?.message || `Checkout order (${effectiveSaleType})`,
         createdAt: new Date().toISOString(),
       };
       const updatedNotifs = [logNotif, ...notifications];
@@ -884,11 +960,17 @@ export default function App() {
       saveWhatsAppNotifications(updatedNotifs);
     }
 
+    const confirmedOrderRef = checkoutResult.order?.orderNumber || newCODOrder?.orderNumber || invoiceNumber;
     pushToast(
-      `کامیابی سے بل #${invoiceNumber} بنام ${customer?.name || 'کسٹمر'} درج کر لیا گیا! Customer savings: ${profile.currencySymbol}${totalSavings.toLocaleString('en-PK')}. Stock updated.`,
+      `Order #${confirmedOrderRef} confirmed for ${customer?.name || 'Customer'}!`,
       'success'
     );
-    return { ok: true };
+    return {
+      ok: true,
+      order: checkoutResult.order,
+      guestClaimToken: checkoutResult.guestClaimToken,
+      whatsappNotification: checkoutResult.whatsappNotification,
+    };
   };
 
   // COD ORDERS LOGISTICS HANDLERS
@@ -1821,6 +1903,7 @@ export default function App() {
         userRole={activeRole}
         currentUser={currentUser}
         onOpenRoleModal={openRoleModal}
+        onOpenTrackOrder={() => openTrackOrderModal()}
       />
 
       {/* Security Reminder Banner: Prompt Customer to Change Default Password (USER DIRECTIVE) */}
@@ -1862,6 +1945,8 @@ export default function App() {
             onRemoveFromCart={handleRemoveFromCart}
             onClearCart={handleClearCart}
             onOpenCheckout={() => setIsCheckoutOpen(true)}
+            onOpenTrackOrder={() => openTrackOrderModal()}
+            onBuyNowGuest={handleBuyNowGuest}
             searchQuery={searchQuery}
             onSearchChange={setSearchQuery}
             selectedCategory={selectedCategory}
@@ -1870,8 +1955,8 @@ export default function App() {
               setIsWebsiteImportModalOpen(true);
             }}
             onOpenCategoryModal={() => setIsCategoryModalOpen(true)}
-            isCustomerView={viewMode === 'customer' || activeRole === 'customer'}
-            hideCostPrice={viewMode === 'customer' || activeRole === 'customer'}
+            isCustomerView={!currentUser?.isAuthenticated || viewMode === 'customer' || activeRole === 'customer'}
+            hideCostPrice={!currentUser?.isAuthenticated || viewMode === 'customer' || activeRole === 'customer'}
             userRole={activeRole}
             currentUser={currentUser}
             investors={investors}
@@ -2437,35 +2522,52 @@ export default function App() {
         </div>
       </footer>
 
-      {/* POS CHECKOUT MODAL (Credit Sale strictly gated by Seller Role Authorization) */}
+      {/* GUEST-FIRST & POS CHECKOUT MODAL */}
       <CheckoutModal
         isOpen={isCheckoutOpen}
         onClose={() => setIsCheckoutOpen(false)}
         cart={cart}
         customers={customers}
         profile={profile}
-        isCustomerView={viewMode === 'customer' || activeRole === 'customer'}
+        isCustomerView={!currentUser?.isAuthenticated || viewMode === 'customer' || activeRole === 'customer'}
         isAdmin={activeRole === 'admin' || activeRole === 'super_admin'}
         currentUser={currentUser}
         onCompleteSale={handleCompleteSale}
         onUpdateCartQty={handleUpdateCartQty}
         onRemoveFromCart={handleRemoveFromCart}
         onClearCart={handleClearCart}
+        onOpenTrackOrder={(orderNumber, phone) => openTrackOrderModal(orderNumber, phone)}
+        onOpenOptionalRegister={(prefill) => openOptionalRegisterModal(prefill)}
         onSaveProfile={(updated) => {
           setProfile(updated);
           saveBusinessProfile(updated);
         }}
       />
 
-      {/* LOGIN & USER ROLE SWITCHER MODAL */}
+      {/* GUEST ORDER TRACKING MODAL */}
+      <TrackOrderModal
+        isOpen={isTrackOrderOpen}
+        onClose={() => setIsTrackOrderOpen(false)}
+        profile={profile}
+        initialOrderNumber={trackOrderPrefill.orderNumber}
+        initialPhone={trackOrderPrefill.phone}
+      />
+
+      {/* LOGIN & OPTIONAL ACCOUNT REGISTRATION MODAL */}
       <LoginRoleModal
         isOpen={isRoleModalOpen}
-        onClose={() => setIsRoleModalOpen(false)}
+        onClose={() => {
+          setIsRoleModalOpen(false);
+          setRoleModalInitialMode('login');
+          setGuestRegPrefill(null);
+        }}
         currentUser={currentUser}
         customers={customers}
         resellers={resellers}
         onSelectRole={handleSelectRole}
         onLogout={handleLogout}
+        initialMode={roleModalInitialMode}
+        prefillRegistration={guestRegPrefill}
       />
 
       {/* STANDARD MODALS */}

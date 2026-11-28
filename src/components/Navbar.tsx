@@ -78,6 +78,7 @@ interface NavbarProps {
   onToggleViewMode: (mode: 'customer' | 'merchant') => void;
   userRole?: UserRole;
   onOpenRoleModal?: () => void;
+  onOpenTrackOrder?: () => void;
   currentUser?: AppUser;
 }
 
@@ -105,6 +106,7 @@ export const Navbar: React.FC<NavbarProps> = ({
   onToggleViewMode,
   userRole = 'customer',
   onOpenRoleModal,
+  onOpenTrackOrder,
   currentUser,
 }) => {
   const [isMoreOpen, setIsMoreOpen] = React.useState(false);
@@ -128,24 +130,28 @@ export const Navbar: React.FC<NavbarProps> = ({
   // Check authentication status (USER DIRECTIVE 5: Guest vs Authenticated User)
   const isAuthenticated = currentUser?.isAuthenticated === true;
 
-  // 1. Guest Visitor Navigation (Public browsing only - all private portals strictly hidden)
+  // 1. Guest Visitor Navigation (Guest-first shopping + Track Order without sign-in)
   const guestNavItems: NavItem[] = [
     { id: 'store', label: 'Shop & Catalog', urdu: 'مارکیٹ کیٹلاگ', icon: ShoppingBag },
+    { id: 'track_order', label: 'Track Order', urdu: 'آرڈر ٹریک کریں', icon: Truck },
   ];
   const guestDropdownItems: NavItem[] = [
+    { id: 'whatsapp_support', label: 'Customer Support (WhatsApp)', urdu: 'کسٹمر سپورٹ (واٹس ایپ)', icon: Phone },
     { id: 'customer_tickets', label: 'Support Tickets (Sign In)', urdu: 'سپورٹ ٹکٹ (لاگ ان کریں)', icon: LifeBuoy },
     { id: 'lucky_draw', label: 'Lucky Draw & Rewards', urdu: 'لکی ڈرا اور انعامات', icon: Trophy },
   ];
 
-  // 2. Authenticated Customer Navigation (Only shown when customer logs in)
+  // 2. Authenticated Customer Navigation (Only shown when customer opts to sign in)
   const customerNavItems: NavItem[] = [
     { id: 'store', label: 'Shop & Catalog', urdu: 'مارکیٹ کیٹلاگ', icon: ShoppingBag },
+    { id: 'track_order', label: 'Track Order', urdu: 'آرڈر ٹریک کریں', icon: Truck },
     { id: 'customer_portal', label: 'My Portal', urdu: 'کسٹمر پورٹل و سیکیورٹی', icon: User },
     { id: 'customer_tickets', label: 'Support Tickets', urdu: 'سپورٹ ٹکٹ', icon: LifeBuoy },
     { id: 'history', label: 'My Orders & Khata', urdu: 'کھاتہ و ہسٹری', icon: Clock },
     { id: 'reports', label: 'My Reports & Savings', urdu: 'میرا خلاصہ و بچت', icon: BarChart3 },
   ];
   const customerDropdownItems: NavItem[] = [
+    { id: 'whatsapp_support', label: 'Customer Support (WhatsApp)', urdu: 'کسٹمر سپورٹ (واٹس ایپ)', icon: Phone },
     { id: 'monthly_statement', label: 'My Monthly Statement', urdu: 'ماہانہ کسٹمر کھاتہ', icon: FileText },
     { id: 'lucky_draw', label: 'Lucky Draw & Rewards', urdu: 'لکی ڈرا اور انعامات', icon: Trophy },
   ];
@@ -446,7 +452,11 @@ export const Navbar: React.FC<NavbarProps> = ({
                     ? 'border-teal-400 bg-teal-50 dark:bg-teal-950/60 text-teal-900 dark:text-teal-200'
                     : 'border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-800 dark:text-slate-100 hover:border-amber-400'
                 }`}
-                title={isAuthenticated ? 'Account Profile & Security' : 'Sign in to access your account'}
+                title={
+                  isAuthenticated
+                    ? 'Account Profile & Security'
+                    : 'Optional for shoppers · Required for Staff & Admin'
+                }
               >
                 {!isAuthenticated ? (
                   <>
@@ -611,7 +621,13 @@ export const Navbar: React.FC<NavbarProps> = ({
                 <button
                   key={item.id}
                   type="button"
-                  onClick={() => onTabChange(item.id)}
+                  onClick={() => {
+                    if (item.id === 'track_order' && onOpenTrackOrder) {
+                      onOpenTrackOrder();
+                      return;
+                    }
+                    onTabChange(item.id);
+                  }}
                   className={`px-2.5 sm:px-3 py-1 text-xs font-semibold rounded-md transition-all whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer ${
                     isActive
                       ? 'bg-white dark:bg-slate-800 text-slate-900 dark:text-white shadow-2xs font-bold ring-1 ring-slate-300 dark:ring-slate-700'
@@ -664,6 +680,14 @@ export const Navbar: React.FC<NavbarProps> = ({
                           key={item.id}
                           type="button"
                           onClick={() => {
+                            if (item.id === 'whatsapp_support') {
+                              openWhatsAppDirect(
+                                profile.phone || '03125256266',
+                                `Assalam-o-Alaikum! I need customer support with ${profile.name || 'MadinaMarket'}.`
+                              );
+                              setIsMoreOpen(false);
+                              return;
+                            }
                             onTabChange(item.id);
                             setIsMoreOpen(false);
                           }}

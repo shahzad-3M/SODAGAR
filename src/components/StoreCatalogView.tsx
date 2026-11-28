@@ -68,6 +68,8 @@ interface StoreCatalogViewProps {
   onCategoryChange: (cat: string) => void;
   onOpenImportModal?: () => void;
   onOpenCategoryModal?: () => void;
+  onOpenTrackOrder?: () => void;
+  onBuyNowGuest?: (product: ProductItem, qty?: number, selectedSize?: string) => void;
   isCustomerView?: boolean;
   hideCostPrice?: boolean;
   userRole?: string;
@@ -95,6 +97,8 @@ export const StoreCatalogView: React.FC<StoreCatalogViewProps> = ({
   onCategoryChange,
   onOpenImportModal,
   onOpenCategoryModal,
+  onOpenTrackOrder,
+  onBuyNowGuest,
   isCustomerView = false,
   hideCostPrice = false,
   userRole = 'customer',
@@ -975,6 +979,16 @@ export const StoreCatalogView: React.FC<StoreCatalogViewProps> = ({
 
             {/* Sorting & Filter Controls */}
             <div className="flex flex-wrap items-center gap-2 text-xs">
+              {onOpenTrackOrder && (
+                <button
+                  type="button"
+                  onClick={onOpenTrackOrder}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-950/40 text-amber-900 dark:text-amber-200 hover:bg-amber-100 dark:hover:bg-amber-900/50 font-bold text-xs whitespace-nowrap cursor-pointer transition-colors"
+                >
+                  <Truck className="w-3.5 h-3.5 text-amber-600 dark:text-amber-400" />
+                  <span>Track Order</span>
+                </button>
+              )}
               <div className="flex items-center gap-1">
                 <span className="text-slate-400 text-[11px]">Sort:</span>
                 <select
@@ -992,7 +1006,7 @@ export const StoreCatalogView: React.FC<StoreCatalogViewProps> = ({
 
               <span className="text-slate-400 text-xs">|</span>
 
-              <span className="text-slate-500 text-[11px] font-mono">
+              <span className="text-slate-500 text-[11px] font-mono tabular-nums">
                 All {filteredProducts.length} items loaded
               </span>
             </div>
@@ -1147,21 +1161,27 @@ export const StoreCatalogView: React.FC<StoreCatalogViewProps> = ({
         </section>
       </div>
 
-      {/* 3. FLOATING POS DRAFT CART BAR (If cart has items) */}
+      {/* 3. FLOATING CART BAR (If cart has items) */}
       {cart.length > 0 && (
         <div className="fixed bottom-4 left-4 right-4 max-w-4xl mx-auto z-40 bg-slate-900/95 dark:bg-slate-950/95 backdrop-blur-md text-white border-2 border-amber-400 rounded-2xl p-4 shadow-2xl flex flex-wrap items-center justify-between gap-4 animate-fade-in">
           <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-amber-500 text-slate-950 flex items-center justify-center font-bold font-mono">
+            <div className="w-10 h-10 rounded-xl bg-amber-500 text-slate-950 flex items-center justify-center font-bold font-mono tabular-nums">
               {totalCartItems}
             </div>
             <div>
               <div className="flex items-center gap-2">
-                <span className="text-sm font-bold text-white">Active Sale / POS Cart</span>
-                <span className="text-[10px] font-bold bg-emerald-500 text-slate-950 px-2 py-0.5 rounded">
-                  Customer Saves: {profile.currencySymbol}{totalCartSavings.toLocaleString('en-PK')}
+                <span className="text-sm font-bold text-white">
+                  {isCustomerView
+                    ? currentUser?.isAuthenticated
+                      ? 'Your Shopping Cart'
+                      : 'Guest Cart · No Login Needed'
+                    : 'Active Sale / POS Cart'}
+                </span>
+                <span className="text-[10px] font-bold bg-emerald-500 text-slate-950 px-2 py-0.5 rounded tabular-nums">
+                  You Save: {profile.currencySymbol}{totalCartSavings.toLocaleString('en-PK')}
                 </span>
               </div>
-              <span className="text-xs text-slate-300 font-mono">
+              <span className="text-xs text-slate-300 font-mono tabular-nums">
                 Total Our Price: <b className="text-amber-400 text-sm">{profile.currencySymbol}{totalCartAmount.toLocaleString('en-PK')}</b> (Market: <span className="line-through">{profile.currencySymbol}{totalCartMarket.toLocaleString('en-PK')}</span>)
               </span>
             </div>
@@ -1170,15 +1190,19 @@ export const StoreCatalogView: React.FC<StoreCatalogViewProps> = ({
           <div className="flex items-center gap-2">
             <button
               onClick={() => setIsConfirmClearCartOpen(true)}
-              className="px-3 py-2 text-xs text-slate-400 hover:text-red-400 cursor-pointer transition-colors"
+              className="px-3 py-2 text-xs text-slate-400 hover:text-red-400 cursor-pointer transition-colors whitespace-nowrap"
             >
               Clear Cart
             </button>
             <button
               onClick={onOpenCheckout}
-              className="inline-flex items-center gap-2 px-5 py-2.5 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs rounded-xl shadow-lg transition-transform hover:scale-102 cursor-pointer"
+              className="inline-flex items-center gap-2 px-5 py-2.5 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs rounded-xl shadow-lg transition-transform hover:scale-102 cursor-pointer whitespace-nowrap"
             >
-              <span>Proceed to Checkout &amp; Payment Terms</span>
+              <span>
+                {isCustomerView && !currentUser?.isAuthenticated
+                  ? 'Checkout as Guest'
+                  : 'Proceed to Checkout'}
+              </span>
               <ArrowRight className="w-4 h-4" />
             </button>
           </div>
@@ -1229,6 +1253,7 @@ export const StoreCatalogView: React.FC<StoreCatalogViewProps> = ({
         isOpen={!!activeDetailProduct}
         onClose={() => setSelectedDetailProduct(null)}
         onAddToCart={onAddToCart}
+        onBuyNowGuest={onBuyNowGuest}
         profile={profile}
         investors={effectiveInvestors}
         currentUser={currentUser}
